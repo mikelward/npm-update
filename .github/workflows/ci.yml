@@ -1,0 +1,34 @@
+name: CI
+
+# Consumers reference the reusable workflow at `@main` -- no tag, no SHA,
+# deliberately, since bumping a pin in every repository is the cost
+# centralizing was meant to remove. So this suite runs on the pull request,
+# which is the only gate between a change and every consumer's weekly run:
+# there is no release step afterwards to catch anything. The `push` run below
+# re-checks the commit the merge produced.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Nothing here writes to the repository.
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+
+      # No install step, because there is nothing to install: the checker and
+      # its suite are dependency-free on purpose, so what runs inside a
+      # consumer's workflow is exactly what a reader reads here.
+      - name: Test
+        run: node --test *.test.js
