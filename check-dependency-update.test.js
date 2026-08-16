@@ -1,0 +1,1498 @@
+// @vitest-environment node
+//
+// The weekly dependency update runs unattended and its PR never gets a normal
+// `pull_request` CI run, so this validator is most of what stands between a
+// silent transitive major and `main`. Its failure mode is a FALSE PASS, which
+// is why every case below asserts behavior on a real lockfile shape rather
+// than the presence of a rule.
+//
+// The lockfile fixtures are hand-built and deliberately small. Each one names
+// the tree RESHAPE it represents, because the shape is the whole point: the
+// earlier versions of this check were correct on the case in front of them and
+// blind to the next one, in both directions.
+//
+// Several were originally found against a design that guessed which instance
+// "became" which and then tested the guess. That machinery is gone — pairs now
+// come from each consumer's own resolution — so those fixtures are named for
+// their tree shape rather than for the vanished mechanism they once probed.
+// They are kept because the shapes are real and still have to come out right.
+
+import { describe, expect, it } from './vitest-shim.mjs'
+
+import { existsSync, readFileSync } from 'node:fs'
+
+import {
+  NODE_ARCH,
+  NODE_PLATFORM,
+  NOT_A_NODE_TARGET,
+  lockfileFailures,
+  manifestFailures,
+  majorOf,
+  resolveEdge,
+  allFailures,
+  workspacePaths,
+} from './check-dependency-update.mjs'
+
+const pkg = (version, deps) => ({
+  version,
+  ...(deps ? { dependencies: deps } : {}),
+})
+
+const root = (deps) => ({ '': { dependencies: deps } })
+
+describe('manifestFailures', () => {
+  const base = {
+    name: 'example',
+    scripts: { test: 'vitest run' },
+    dependencies: { alpha: '^1.2.0' },
+    devDependencies: { beta: '~3.4.5' },
+  }
+
+  it('accepts a bump to a version the declared range already allowed', () => {
+    const after = { ...base, dependencies: { alpha: '^1.9.9' } }
+    expect(manifestFailures(base, after)).toEqual([])
+  })
+
+  it('accepts a pure key reordering outside the dependency sections', () => {
+    const after = { scripts: { test: 'vitest run' }, name: 'example', ...base }
+    expect(manifestFailures(base, after)).toEqual([])
+  })
+
+  it('rejects a rewritten script, which would make every reported check meaningless', () => {
+    const after = { ...base, scripts: { test: 'true' } }
+    expect(manifestFailures(base, after)).toEqual([
+      expect.stringContaining('outside its dependency sections'),
+    ])
+  })
+
+  it('rejects a major, which no declared caret range allows', () => {
+    const after = { ...base, dependencies: { alpha: '^2.0.0' } }
+    expect(manifestFailures(base, after)).toEqual([
+      expect.stringContaining('moved outside its existing range'),
+    ])
+  })
+
+  it('rejects a caret minor on a 0.x package, where caret pins the minor', () => {
+    const before = { ...base, dependencies: { alpha: '^0.6.0' } }
+    const after = { ...base, dependencies: { alpha: '^0.7.0' } }
+    expect(manifestFailures(before, after)).toEqual([
+      expect.stringContaining('moved outside its existing range'),
+    ])
+  })
+
+  it('rejects a downgrade that keeps the major', () => {
+    const before = { ...base, dependencies: { alpha: '^2.17.6' } }
+    const after = { ...base, dependencies: { alpha: '^2.0.0' } }
+    expect(manifestFailures(before, after)).toEqual([
+      expect.stringContaining('moved outside its existing range'),
+    ])
+  })
+
+  it('rejects an added or removed package', () => {
+    expect(manifestFailures(base, { ...base, dependencies: { alpha: '^1.2.0', gamma: '^1.0.0' } }))
+      .toEqual([expect.stringContaining('was ADDED')])
+    expect(manifestFailures(base, { ...base, dependencies: {} })).toEqual([
+      expect.stringContaining('was REMOVED'),
+    ])
+  })
+
+  it('rejects a swapped range operator', () => {
+    const after = { ...base, dependencies: { alpha: '~1.2.0' } }
+    expect(manifestFailures(base, after)).toEqual([
+      expect.stringContaining('changed its range operator'),
+    ])
+  })
+
+  it('stops on a range it cannot model rather than assuming it is fine', () => {
+    const after = { ...base, dependencies: { alpha: 'git+https://example.com/alpha.git' } }
+    expect(manifestFailures(base, after)).toEqual([
+      expect.stringContaining('not a plain X.Y.Z registry range'),
+    ])
+  })
+})
+
+describe('resolveEdge', () => {
+  const packages = {
+    'node_modules/foo': pkg('2.0.0'),
+    'node_modules/a': pkg('1.0.0', { foo: '*' }),
+    'node_modules/a/node_modules/foo': pkg('1.0.0'),
+    'node_modules/b': pkg('1.0.0', { foo: '*' }),
+  }
+
+  it('takes the nearest copy walking up from the dependent', () => {
+    expect(resolveEdge(packages, 'node_modules/a', 'foo')).toBe('1.0.0')
+  })
+
+  it('falls through to a hoisted copy when there is no nested one', () => {
+    expect(resolveEdge(packages, 'node_modules/b', 'foo')).toBe('2.0.0')
+    expect(resolveEdge(packages, '', 'foo')).toBe('2.0.0')
+  })
+
+  it('returns null for an edge npm did not install', () => {
+    expect(resolveEdge(packages, 'node_modules/a', 'absent')).toBeNull()
+  })
+})
+
+describe('lockfileFailures', () => {
+  it('passes a batch where everything moved within its major', () => {
+    const before = {
+      ...root({ a: '^1.0.0' }),
+      'node_modules/a': pkg('1.2.0', { foo: '^1.0.0' }),
+      'node_modules/foo': pkg('1.0.0'),
+    }
+    const after = {
+      ...root({ a: '^1.0.0' }),
+      'node_modules/a': pkg('1.3.0', { foo: '^1.0.0' }),
+      'node_modules/foo': pkg('1.4.2'),
+    }
+    expect(lockfileFailures(before, after)).toEqual([])
+  })
+
+  it('catches an in-place transitive major', () => {
+    const before = {
+      ...root({ a: '^1.0.0' }),
+      'node_modules/a': pkg('1.0.0', { foo: '*' }),
+      'node_modules/foo': pkg('1.0.0'),
+    }
+    const after = {
+      ...root({ a: '^1.0.0' }),
+      'node_modules/a': pkg('1.0.0', { foo: '*' }),
+      'node_modules/foo': pkg('2.0.0'),
+    }
+    // Asserts that it is REJECTED and which package is named, not which of the
+    // three rules produced the message. More than one rule fires here, and a
+    // test pinned to one rule's phrasing reports a wording change as a
+    // regression while a real miss elsewhere goes unnoticed.
+    expect(lockfileFailures(before, after).join('\n')).toContain('foo')
+    expect(lockfileFailures(before, after)).not.toEqual([])
+  })
+
+  // Round 32. `@tailwindcss/oxide-wasm32-wasi` declares `cpu: ["wasm32"]` and
+  // is optional — and `wasm32` is not a value `process.arch` ever takes, so npm
+  // skips it on every platform and it is on nobody's disk. Its dependencies are
+  // BUNDLED, though, and `npm update` dissolves the bundle and re-resolves them
+  // from the registry, which surfaced a 1.x -> 2.x jump (and an `@emnapi`
+  // prerelease, dragged in by a sibling whose `latest` had already moved to
+  // 2.x) in a batch that installs none of it. A crossing nobody can experience
+  // is a standing false alarm for a weekly unattended job.
+  it('ignores a crossing under a package no platform can install', () => {
+    const tree = (foo) => ({
+      ...root({ gated: '^1.0.0' }),
+      'node_modules/gated': {
+        version: '1.0.0',
+        optional: true,
+        cpu: ['wasm32'],
+        dependencies: { foo: '*' },
+      },
+      'node_modules/gated/node_modules/foo': pkg(foo),
+    })
+    expect(lockfileFailures(tree('1.0.0'), tree('2.0.0'))).toEqual([])
+  })
+
+  // The other half, and the reason this is not "skip platform-gated packages".
+  // arm64 IS a real Node arch, so a developer on one installs this for real — a
+  // major under it has to stay caught even though CI runs linux/x64. The test
+  // is "no Node target at all", not "not the runner's platform"; nothing in the
+  // check knows arm64 specifically, it just appears in `process.arch`'s domain
+  // where `wasm32` does not.
+  it('still catches a crossing under a package some platform does install', () => {
+    const tree = (foo) => ({
+      ...root({ gated: '^1.0.0' }),
+      'node_modules/gated': {
+        version: '1.0.0',
+        optional: true,
+        cpu: ['arm64'],
+        dependencies: { foo: '*' },
+      },
+      'node_modules/gated/node_modules/foo': pkg(foo),
+    })
+    expect(lockfileFailures(tree('1.0.0'), tree('2.0.0')).join('\n')).toContain('foo')
+  })
+
+  // Codex, round 32. The consumer-level skip fires too late for the parent's
+  // OWN edge: root resolves the impossible package itself, and that comparison
+  // happens before the package is ever popped as a consumer. The edge has to be
+  // pruned where it is resolved, not where it is walked.
+  it('ignores the impossible package itself crossing a major', () => {
+    const tree = (gated) => ({
+      ...root({ gated: '*' }),
+      'node_modules/gated': { version: gated, optional: true, cpu: ['wasm32'] },
+    })
+    expect(lockfileFailures(tree('1.0.0'), tree('2.0.0'))).toEqual([])
+  })
+
+  // Codex, round 32. npm's own matcher treats a lone `any` as a wildcard
+  // (`npm-install-checks`: `list.length === 1 && list[0] === 'any'`), so this
+  // package installs everywhere and must stay fully checked. Comparing the
+  // token against the arch domain alone would prune it and its whole subtree.
+  it('still catches a crossing under an `any` platform token', () => {
+    const tree = (foo) => ({
+      ...root({ gated: '^1.0.0' }),
+      'node_modules/gated': {
+        version: '1.0.0',
+        optional: true,
+        cpu: ['any'],
+        os: ['any'],
+        dependencies: { foo: '*' },
+      },
+      'node_modules/gated/node_modules/foo': pkg(foo),
+    })
+    expect(lockfileFailures(tree('1.0.0'), tree('2.0.0')).join('\n')).toContain('foo')
+  })
+
+  // A NON-optional package with an impossible cpu is a broken install, not one
+  // npm quietly skips — worth surfacing rather than pruning.
+  it('still catches a crossing under an impossible cpu that is not optional', () => {
+    const tree = (foo) => ({
+      ...root({ gated: '^1.0.0' }),
+      'node_modules/gated': { version: '1.0.0', cpu: ['wasm32'], dependencies: { foo: '*' } },
+      'node_modules/gated/node_modules/foo': pkg(foo),
+    })
+    expect(lockfileFailures(tree('1.0.0'), tree('2.0.0')).join('\n')).toContain('foo')
+  })
+
+  // npm's negation syntax means "anything except", which is satisfiable by
+  // construction — so it is never an impossible constraint.
+  it('still catches a crossing under a negated cpu constraint', () => {
+    const tree = (foo) => ({
+      ...root({ gated: '^1.0.0' }),
+      'node_modules/gated': {
+        version: '1.0.0',
+        optional: true,
+        cpu: ['!arm64'],
+        dependencies: { foo: '*' },
+      },
+      'node_modules/gated/node_modules/foo': pkg(foo),
+    })
+    expect(lockfileFailures(tree('1.0.0'), tree('2.0.0')).join('\n')).toContain('foo')
+  })
+
+  // Codex, round 32. npm's checker wraps a bare string in a one-item list
+  // (`typeof list === 'string'`), and a lockfile can record that shape, so
+  // reading "not an array" as "unconstrained" left the false alarm in place.
+  it('prunes a string cpu constraint no platform can install', () => {
+    const tree = (foo) => ({
+      ...root({ gated: '^1.0.0' }),
+      'node_modules/gated': {
+        version: '1.0.0',
+        optional: true,
+        cpu: 'wasm32',
+        dependencies: { foo: '*' },
+      },
+      'node_modules/gated/node_modules/foo': pkg(foo),
+    })
+    expect(lockfileFailures(tree('1.0.0'), tree('2.0.0'))).toEqual([])
+  })
+
+  // Codex, round 32. A negation is not automatically satisfiable: npm rejects
+  // the target outright when it matches a negated entry, so a list that both
+  // allows and denies the same arch installs nowhere. Treating the mere
+  // PRESENCE of a `!` as installable got this backwards.
+  it('prunes a contradictory negated constraint', () => {
+    const tree = (foo) => ({
+      ...root({ gated: '^1.0.0' }),
+      'node_modules/gated': {
+        version: '1.0.0',
+        optional: true,
+        cpu: ['arm64', '!arm64'],
+        dependencies: { foo: '*' },
+      },
+      'node_modules/gated/node_modules/foo': pkg(foo),
+    })
+    expect(lockfileFailures(tree('1.0.0'), tree('2.0.0'))).toEqual([])
+  })
+
+  // Codex, round 32. A package that BECOMES installable is real code entering
+  // the tree, and its subtree has to be walked — so the prune needs both sides
+  // uninstallable, not either. Pruning on the old side alone let a major under
+  // a newly-installed package through.
+  it('still catches a crossing under a package that becomes installable', () => {
+    const tree = (cpu, foo) => ({
+      ...root({ gated: '^1.0.0' }),
+      'node_modules/gated': {
+        version: '1.0.0',
+        optional: true,
+        cpu: [cpu],
+        dependencies: { foo: '*' },
+      },
+      'node_modules/gated/node_modules/foo': pkg(foo),
+    })
+    const failures = lockfileFailures(tree('wasm32', '1.0.0'), tree('x64', '2.0.0'))
+    expect(failures.join('\n')).toContain('foo')
+  })
+
+  // The same argument reversed: a package leaving the tree is still a change
+  // worth stopping on, and its subtree was installed right up until now.
+  it('still catches a crossing under a package that becomes uninstallable', () => {
+    const tree = (cpu, foo) => ({
+      ...root({ gated: '^1.0.0' }),
+      'node_modules/gated': {
+        version: '1.0.0',
+        optional: true,
+        cpu: [cpu],
+        dependencies: { foo: '*' },
+      },
+      'node_modules/gated/node_modules/foo': pkg(foo),
+    })
+    const failures = lockfileFailures(tree('x64', '1.0.0'), tree('wasm32', '2.0.0'))
+    expect(failures.join('\n')).toContain('foo')
+  })
+
+  // Codex, round 33. `haiku` is a real Node port and was missing from the
+  // platform domain, so an optional package gated to it read as impossible and
+  // was pruned along with its subtree. This is the costly direction — a missing
+  // domain entry buys a missed major, where an extra one buys one comparison.
+  it('still catches a crossing under a package gated to a rarely-named platform', () => {
+    const tree = (foo) => ({
+      ...root({ gated: '^1.0.0' }),
+      'node_modules/gated': {
+        version: '1.0.0',
+        optional: true,
+        os: ['haiku'],
+        dependencies: { foo: '*' },
+      },
+      'node_modules/gated/node_modules/foo': pkg(foo),
+    })
+    expect(lockfileFailures(tree('1.0.0'), tree('2.0.0')).join('\n')).toContain('foo')
+  })
+
+  // Codex, round 33 again, and the sharper half: `openharmony` is in all three
+  // lockfiles TODAY and is absent from `@types/node`'s union, so the types
+  // package lags what npm ships and a guard against it alone would never have
+  // caught this. The lockfile guard below is the one that would.
+  it('still catches a crossing under a package gated to a newer platform', () => {
+    const tree = (foo) => ({
+      ...root({ gated: '^1.0.0' }),
+      'node_modules/gated': {
+        version: '1.0.0',
+        optional: true,
+        os: ['openharmony'],
+        dependencies: { foo: '*' },
+      },
+      'node_modules/gated/node_modules/foo': pkg(foo),
+    })
+    expect(lockfileFailures(tree('1.0.0'), tree('2.0.0')).join('\n')).toContain('foo')
+  })
+
+  // Round 31's finding, and the one that retired the instance matcher. Nothing
+  // is added or removed here — the same two `bar` copies exist on both sides,
+  // and consumers merely REDISTRIBUTE across them: `x` stays on the nested
+  // copy, `z` stays on the hoisted one, and `y` hoists out of `a` and so
+  // switches from the first to the second. The two copies resolve different
+  // `foo` majors, so `y`'s transitive `foo` crosses 1 -> 2.
+  //
+  // A matcher pairs instances one-to-one and exclusively, so both copies pair
+  // with themselves, both are vouched for by the dependent that stayed, and
+  // `y`'s move is not any pairing. Deriving pairs from each consumer's own
+  // resolution has no such blind spot: `y` names the pair itself.
+  it('catches a crossing when consumers redistribute across surviving copies', () => {
+    const shared = {
+      'node_modules/a': pkg('1.0.0', { x: '*', y: '*' }),
+      'node_modules/a/node_modules/bar': pkg('1.0.0', { foo: '*' }),
+      'node_modules/a/node_modules/bar/node_modules/foo': pkg('1.0.0'),
+      'node_modules/a/node_modules/x': pkg('1.0.0', { bar: '*' }),
+      'node_modules/bar': pkg('1.0.0', { foo: '*' }),
+      'node_modules/foo': pkg('2.0.0'),
+      'node_modules/z': pkg('1.0.0', { bar: '*' }),
+    }
+    const before = {
+      ...root({ a: '^1.0.0', z: '^1.0.0' }),
+      ...shared,
+      'node_modules/a/node_modules/y': pkg('1.0.0', { bar: '*' }),
+    }
+    const after = {
+      ...root({ a: '^1.0.0', z: '^1.0.0' }),
+      ...shared,
+      'node_modules/y': pkg('1.0.0', { bar: '*' }),
+    }
+    expect(lockfileFailures(before, after).join('\n')).toContain(
+      'now resolves foo to a different major',
+    )
+  })
+
+  // Round 26's finding, and a regression the previous round introduced: with
+  // the two aggregate rules gone, the ONLY thing looking at a direct
+  // devDependency is the root's own edge comparison — and `devDependencies`
+  // was not in EDGE_FIELDS. A `*` range never changes, so the manifest check
+  // is silent too, and most of what this repo declares is a devDependency.
+  it('catches a direct devDependency crossing a major', () => {
+    const before = {
+      '': { dependencies: { keep: '^1.0.0' }, devDependencies: { beta: '*' } },
+      'node_modules/beta': pkg('1.0.0'),
+      'node_modules/keep': pkg('1.0.0'),
+    }
+    const after = {
+      '': { dependencies: { keep: '^1.0.0' }, devDependencies: { beta: '*' } },
+      'node_modules/beta': pkg('2.0.0'),
+      'node_modules/keep': pkg('1.0.0'),
+    }
+    expect(lockfileFailures(before, after).join('\n')).toContain('beta')
+  })
+
+  // The same omission from the other side: a subtree reachable ONLY through
+  // the root's dev dependencies. Nothing admitted `a` as a live consumer, so
+  // the whole dev-tooling tree — most of what CI actually runs — was never
+  // walked. The crossing here is transitive, so the by-path rule would not
+  // have covered it even before it was removed.
+  it('catches a major under a dev-only subtree', () => {
+    const tree = (foo) => ({
+      '': { dependencies: { keep: '^1.0.0' }, devDependencies: { a: '^1.0.0' } },
+      'node_modules/a': pkg('1.0.0', { foo: '*' }),
+      'node_modules/foo': pkg(foo),
+      'node_modules/keep': pkg('1.0.0'),
+    })
+    expect(lockfileFailures(tree('1.0.0'), tree('2.0.0')).join('\n')).toContain('foo')
+  })
+
+  // Round 28's finding, and an ordering bug inside round 25's fix rather than
+  // a new blind spot. A consumer and its child relocate together, so liveness
+  // has to be proven in chain order: root -> x -> a -> foo. Splitting a
+  // rejected hypothesis inside the same loop that proves liveness meant
+  // reaching `foo` first destroyed the pair that `a` was one pass away from
+  // making live — and once split, each half falls through to its own
+  // parent-local copy, so neither can see across `a`'s move and the crossing
+  // between them vanishes.
+  //
+  // Splitting is now deferred until the liveness pass has otherwise converged.
+  it('catches a crossing under a consumer and child that relocate together', () => {
+    const before = {
+      ...root({ x: '^1.0.0' }),
+      'node_modules/x': pkg('1.0.0', { a: '*' }),
+      'node_modules/x/node_modules/a': pkg('1.0.0', { foo: '*' }),
+      'node_modules/x/node_modules/a/node_modules/foo': pkg('1.0.0', { bar: '*' }),
+      'node_modules/bar': pkg('1.0.0'),
+    }
+    const after = {
+      ...root({ x: '^1.0.0' }),
+      'node_modules/x': pkg('1.0.0', { a: '*' }),
+      'node_modules/a': pkg('1.0.0', { foo: '*' }),
+      'node_modules/a/node_modules/foo': pkg('1.0.0', { bar: '*' }),
+      'node_modules/bar': pkg('2.0.0'),
+    }
+    expect(lockfileFailures(before, after).join('\n')).toContain('bar')
+  })
+
+  // Round 30's finding, which refuted a claim written in the code and in
+  // AGENTS.md: "containment is a partial order, so something is always
+  // eligible." Containment on ONE side is a partial order; the eligibility
+  // relation is a disjunction of two of them, and a union of partial orders
+  // can cycle. Two wrong pairings contain each other on opposite sides here —
+  // `x/nm/a` paired with `x/nm/foo/nm/a`, while its own child `x/nm/a/nm/foo`
+  // is paired with `x/nm/foo` — so nothing was eligible and the outer loop
+  // exited with both still pending.
+  //
+  // Two independent defects, both needed: the cycle stalled the split, and the
+  // unpaired halves then derived their counterpart by walking up from the
+  // instance's OLD directory, which is wrong precisely when the parent moved.
+  it('catches a crossing where two names both relocate past unrelated newcomers', () => {
+    const before = {
+      ...root({ x: '^1.0.0' }),
+      'node_modules/x': pkg('1.0.0', { a: '*' }),
+      'node_modules/x/node_modules/a': pkg('1.0.0', { foo: '*' }),
+      'node_modules/x/node_modules/a/node_modules/foo': pkg('1.0.0', { bar: '*' }),
+      'node_modules/bar': pkg('2.0.0'),
+    }
+    const after = {
+      ...root({ x: '^1.0.0' }),
+      'node_modules/x': pkg('1.0.0', { a: '*', foo: '*' }),
+      'node_modules/a': pkg('1.0.0', { foo: '*' }),
+      'node_modules/a/node_modules/foo': pkg('1.0.0', { bar: '*' }),
+      'node_modules/x/node_modules/foo': pkg('1.0.0', { a: '*' }),
+      'node_modules/x/node_modules/foo/node_modules/a': pkg('1.0.0'),
+      'node_modules/bar': pkg('1.0.0'),
+    }
+    expect(lockfileFailures(before, after).join('\n')).toContain('bar')
+  })
+
+  // The same cycle with NO leftover instances — `p` supplies a second copy of
+  // each name on both sides, so the matcher pairs everything and the correct
+  // pairing is reachable only by splitting. This is the fixture that proves
+  // the cycle fallback: above, the real `a` and `foo` copies were left over as
+  // unpaired additions and got picked up without any split, so removing the
+  // fallback did not turn it red. Two defects, two fixtures.
+  it('catches the same relocation when every copy has a same-name counterpart', () => {
+    const before = {
+      ...root({ x: '^1.0.0', p: '^1.0.0' }),
+      'node_modules/x': pkg('1.0.0', { a: '*' }),
+      'node_modules/x/node_modules/a': pkg('1.0.0', { foo: '*' }),
+      'node_modules/x/node_modules/a/node_modules/foo': pkg('1.0.0', { bar: '*' }),
+      'node_modules/p': pkg('1.0.0', { a: '*', foo: '*' }),
+      'node_modules/p/node_modules/a': pkg('1.0.0'),
+      'node_modules/p/node_modules/foo': pkg('1.0.0'),
+      'node_modules/bar': pkg('2.0.0'),
+    }
+    const after = {
+      ...root({ x: '^1.0.0', p: '^1.0.0' }),
+      'node_modules/x': pkg('1.0.0', { a: '*', foo: '*' }),
+      'node_modules/a': pkg('1.0.0', { foo: '*' }),
+      'node_modules/a/node_modules/foo': pkg('1.0.0', { bar: '*' }),
+      'node_modules/x/node_modules/foo': pkg('1.0.0', { a: '*' }),
+      'node_modules/x/node_modules/foo/node_modules/a': pkg('1.0.0'),
+      'node_modules/p': pkg('1.0.0', { a: '*', foo: '*' }),
+      'node_modules/bar': pkg('1.0.0'),
+    }
+    expect(lockfileFailures(before, after).join('\n')).toContain(
+      'now resolves bar to a different major',
+    )
+  })
+
+  // Round 29's finding, and the second ordering bug in the same mechanism —
+  // deferring the split fixed *when* it happens, this fixes *which one*. `x`'s
+  // nested `a` hoists out, but an unrelated newcomer deeper under `x` wins the
+  // matcher's location affinity, so the `a` pair is a wrong guess that cannot
+  // prove liveness. `foo` moved with `a` and cannot be proven until `a` is.
+  // Splitting `foo` first strands both halves on parent-local copies, and the
+  // crossing through the hoisted `a` is never on either side of a comparison.
+  it('catches a crossing under a relocation the matcher would mis-pair', () => {
+    const before = {
+      ...root({ x: '^1.0.0' }),
+      'node_modules/x': pkg('1.0.0', { a: '*' }),
+      'node_modules/x/node_modules/a': pkg('1.0.0', { foo: '*' }),
+      'node_modules/x/node_modules/a/node_modules/foo': pkg('1.0.0', { bar: '*' }),
+      'node_modules/bar': pkg('1.0.0'),
+    }
+    const after = {
+      ...root({ x: '^1.0.0' }),
+      'node_modules/x': pkg('1.0.0', { a: '*', q: '*' }),
+      'node_modules/a': pkg('1.0.0', { foo: '*' }),
+      'node_modules/a/node_modules/foo': pkg('1.0.0', { bar: '*' }),
+      'node_modules/x/node_modules/q': pkg('1.0.0', { a: '*' }),
+      'node_modules/x/node_modules/q/node_modules/a': pkg('1.0.0'),
+      'node_modules/bar': pkg('2.0.0'),
+    }
+    expect(lockfileFailures(before, after).join('\n')).toContain('bar')
+  })
+
+  // Round 27's finding. npm splits a workspace across two lockfile entries and
+  // `isPackage` rejects both: the versioned one sits at its repo path with no
+  // `node_modules/` segment, and the one under `node_modules` is a bare
+  // `link: true` record with no version. Nothing admitted it as a consumer, so
+  // its edges — including the dev edges the previous round went to some
+  // trouble to start walking — were never compared.
+  //
+  // These repos have no workspaces today. The fixture is here because the
+  // failure mode is silence: adding one would quietly narrow what the monthly
+  // job checks, with nothing red to say so.
+  it('walks a workspace as a consumer', () => {
+    const tree = (foo) => ({
+      '': { workspaces: ['packages/*'], dependencies: { keep: '^1.0.0' } },
+      'packages/a': { name: 'a', version: '1.0.0', devDependencies: { foo: '*' } },
+      'node_modules/a': { resolved: 'packages/a', link: true },
+      'node_modules/foo': pkg(foo),
+      'node_modules/keep': pkg('1.0.0'),
+    })
+    expect(lockfileFailures(tree('1.0.0'), tree('2.0.0')).join('\n')).toContain('foo')
+    // …and does not fire on the in-range move, so the assertion above cannot
+    // pass just because seeding the workspace made everything look like a
+    // crossing.
+    expect(lockfileFailures(tree('1.0.0'), tree('1.4.0'))).toEqual([])
+  })
+
+  // Round 17's finding. Two copies of one consumer swap majors in opposite
+  // directions, so every per-NAME aggregate is bit-for-bit identical.
+  it('catches two copies of a consumer swapping majors in opposite directions', () => {
+    const shared = {
+      ...root({ a: '^1.0.0', b: '^1.0.0' }),
+      'node_modules/a': pkg('1.0.0', { bar: '*' }),
+      'node_modules/b': pkg('1.0.0', { bar: '*' }),
+      'node_modules/a/node_modules/bar': pkg('1.0.0', { foo: '*' }),
+      'node_modules/b/node_modules/bar': pkg('1.0.0', { foo: '*' }),
+    }
+    const before = {
+      ...shared,
+      'node_modules/a/node_modules/bar/node_modules/foo': pkg('1.0.0'),
+      'node_modules/b/node_modules/bar/node_modules/foo': pkg('2.0.0'),
+    }
+    const after = {
+      ...shared,
+      'node_modules/a/node_modules/bar/node_modules/foo': pkg('2.0.0'),
+      'node_modules/b/node_modules/bar/node_modules/foo': pkg('1.0.0'),
+    }
+
+    // The aggregate this fixture is built to defeat really is unchanged.
+    const majors = (tree) =>
+      Object.entries(tree)
+        .filter(([path]) => path.endsWith('node_modules/foo'))
+        .map(([, entry]) => majorOf(entry.version))
+        .sort()
+    expect(majors(before)).toEqual(majors(after))
+
+    expect(lockfileFailures(before, after)).not.toEqual([])
+  })
+
+  // Round 16's finding, and the one that keying by path misses: the consumer
+  // changes location in the same batch as it crosses, so it shares no path to
+  // compare and its old id looks deleted.
+  it('catches a consumer that hoists as it crosses', () => {
+    const before = {
+      ...root({ a: '^1.0.0' }),
+      'node_modules/a': pkg('1.0.0', { bar: '*' }),
+      'node_modules/a/node_modules/bar': pkg('1.0.0', { foo: '*' }),
+      'node_modules/a/node_modules/foo': pkg('1.0.0'),
+      'node_modules/foo': pkg('2.0.0'),
+    }
+    const after = {
+      ...root({ a: '^1.0.0' }),
+      'node_modules/a': pkg('1.0.0', { bar: '*' }),
+      'node_modules/a/node_modules/foo': pkg('1.0.0'),
+      'node_modules/bar': pkg('1.0.0', { foo: '*' }),
+      'node_modules/foo': pkg('2.0.0'),
+    }
+    expect(lockfileFailures(before, after).join('\n')).toContain('different major')
+  })
+
+  // The case neither summary rule can see: a nested foo@1 is dropped so its
+  // dependent falls through to an already-hoisted foo@2, while another
+  // dependent keeps its own foo@1. No shared path changed major, and the major
+  // set for foo is still {1,2}. Nothing aggregate moved — but b crossed.
+  it('catches a consumer falling through to a hoisted copy while the tree summary holds still', () => {
+    const before = {
+      ...root({ a: '^1.0.0', b: '^1.0.0' }),
+      'node_modules/foo': pkg('2.0.0'),
+      'node_modules/a': pkg('1.0.0', { foo: '*' }),
+      'node_modules/a/node_modules/foo': pkg('1.0.0'),
+      'node_modules/b': pkg('1.0.0', { foo: '*' }),
+      'node_modules/b/node_modules/foo': pkg('1.0.0'),
+    }
+    const after = {
+      ...root({ a: '^1.0.0', b: '^1.0.0' }),
+      'node_modules/foo': pkg('2.0.0'),
+      'node_modules/a': pkg('1.0.0', { foo: '*' }),
+      'node_modules/a/node_modules/foo': pkg('1.0.0'),
+      'node_modules/b': pkg('1.0.0', { foo: '*' }),
+    }
+
+    // Both summaries really are identical across this update — otherwise the
+    // test would pass for a reason that has nothing to do with rule (3).
+    const pathMajors = (tree) =>
+      Object.entries(tree)
+        .filter(([path, entry]) => path.includes('node_modules/') && entry.version)
+        .map(([path, entry]) => `${path}@${majorOf(entry.version)}`)
+    const shared = pathMajors(before).filter((x) => pathMajors(after).includes(x))
+    expect(pathMajors(before).filter((x) => !shared.includes(x))).toEqual([
+      'node_modules/b/node_modules/foo@1',
+    ])
+    expect(new Set(pathMajors(after).map((x) => x.split('@').pop()))).toEqual(new Set(['1', '2']))
+
+    const failures = lockfileFailures(before, after)
+    expect(failures.join('\n')).toContain('different major')
+    expect(failures.join('\n')).toContain('foo')
+  })
+
+  it('passes a dedupe that collapses two identical copies without changing what anyone resolves', () => {
+    const before = {
+      ...root({ a: '^1.0.0', b: '^1.0.0' }),
+      'node_modules/a': pkg('1.0.0', { foo: '*' }),
+      'node_modules/a/node_modules/foo': pkg('1.0.0'),
+      'node_modules/b': pkg('1.0.0', { foo: '*' }),
+      'node_modules/b/node_modules/foo': pkg('1.0.0'),
+    }
+    const after = {
+      ...root({ a: '^1.0.0', b: '^1.0.0' }),
+      'node_modules/a': pkg('1.0.0', { foo: '*' }),
+      'node_modules/b': pkg('1.0.0', { foo: '*' }),
+      'node_modules/foo': pkg('1.0.0'),
+    }
+    expect(lockfileFailures(before, after)).toEqual([])
+  })
+
+  // The false positive that sinks a naive `name@version` identity: the
+  // consumer is bumped and hoisted in the same batch while what it resolves
+  // does not move at all.
+  it('passes a consumer that is itself bumped and hoisted with its dependency unchanged', () => {
+    const before = {
+      ...root({ a: '^1.0.0' }),
+      'node_modules/a': pkg('1.0.0', { bar: '*' }),
+      'node_modules/a/node_modules/bar': pkg('1.2.0', { foo: '*' }),
+      'node_modules/foo': pkg('1.0.0'),
+    }
+    const after = {
+      ...root({ a: '^1.0.0' }),
+      'node_modules/a': pkg('1.0.0', { bar: '*' }),
+      'node_modules/bar': pkg('1.3.0', { foo: '*' }),
+      'node_modules/foo': pkg('1.0.0'),
+    }
+    expect(lockfileFailures(before, after)).toEqual([])
+  })
+
+  // The other half of the same trap, and the one that actually bites: with a
+  // `name@version` identity this consumer goes unmatched, so its crossing is
+  // never compared and the run goes green. The failure mode is silence, not a
+  // false alarm — which is why it needs its own fixture rather than being
+  // assumed covered by the no-false-positive case above.
+  it('catches a consumer that crosses in the same batch as it is bumped and hoisted', () => {
+    const before = {
+      ...root({ a: '^1.0.0' }),
+      'node_modules/a': pkg('1.0.0', { bar: '*' }),
+      'node_modules/a/node_modules/bar': pkg('1.2.0', { foo: '*' }),
+      'node_modules/a/node_modules/foo': pkg('1.0.0'),
+      'node_modules/foo': pkg('2.0.0'),
+    }
+    const after = {
+      ...root({ a: '^1.0.0' }),
+      'node_modules/a': pkg('1.0.0', { bar: '*' }),
+      'node_modules/a/node_modules/foo': pkg('1.0.0'),
+      'node_modules/bar': pkg('1.3.0', { foo: '*' }),
+      'node_modules/foo': pkg('2.0.0'),
+    }
+    expect(lockfileFailures(before, after).join('\n')).toContain('different major')
+  })
+
+  // When two identical copies dedupe to one, the matcher pairs a single
+  // survivor and leaves the other in `removed`. Comparing only the pairs threw
+  // that report away, so if the copy that vanished resolved a different major
+  // than the survivor does, whoever depended on it crossed unnoticed. Both
+  // summaries hold still here: `c` keeps a foo@1 alive so the by-name set is
+  // {1,2} either way, and the vanished path has no after-side entry for the
+  // by-path rule to compare.
+  it('catches a crossing carried by a consumer that deduped away', () => {
+    const before = {
+      ...root({ a: '^1.0.0', b: '^1.0.0', c: '^1.0.0' }),
+      'node_modules/a': pkg('1.0.0', { bar: '*' }),
+      'node_modules/a/node_modules/bar': pkg('1.0.0', { foo: '*' }),
+      'node_modules/a/node_modules/foo': pkg('2.0.0'),
+      'node_modules/b': pkg('1.0.0', { bar: '*' }),
+      'node_modules/b/node_modules/bar': pkg('1.0.0', { foo: '*' }),
+      'node_modules/b/node_modules/foo': pkg('1.0.0'),
+      'node_modules/c': pkg('1.0.0', { foo: '*' }),
+      'node_modules/foo': pkg('1.0.0'),
+    }
+    // The two `bar` copies collapse to one hoisted copy, which resolves foo@1.
+    // a's transitive foo therefore goes 2 -> 1.
+    const after = {
+      ...root({ a: '^1.0.0', b: '^1.0.0', c: '^1.0.0' }),
+      'node_modules/a': pkg('1.0.0', { bar: '*' }),
+      'node_modules/a/node_modules/foo': pkg('2.0.0'),
+      'node_modules/b': pkg('1.0.0', { bar: '*' }),
+      'node_modules/bar': pkg('1.0.0', { foo: '*' }),
+      'node_modules/c': pkg('1.0.0', { foo: '*' }),
+      'node_modules/foo': pkg('1.0.0'),
+    }
+
+    const fooMajors = (tree) =>
+      new Set(
+        Object.entries(tree)
+          .filter(([p, e]) => p.endsWith('node_modules/foo') && e.version)
+          .map(([, e]) => majorOf(e.version)),
+      )
+    expect(fooMajors(before)).toEqual(fooMajors(after))
+
+    expect(lockfileFailures(before, after).join('\n')).toContain('different major')
+  })
+
+  // The other side of the removed-instance path, and the reason it needs a
+  // live-dependent test: a copy vanishing is not by itself a fall-through. Here
+  // `a` legitimately DROPS bar while a hoisted bar survives for `c`. Nobody
+  // lands on that hoisted copy from a's branch, so comparing the two describes
+  // a hop no consumer makes — and would reject a dropped dependency as a
+  // transitive major. `d` keeps a foo@1 alive so the by-name rule stays quiet
+  // and this fixture isolates exactly that path.
+  it('passes when a dependency is dropped rather than crossed', () => {
+    const before = {
+      ...root({ a: '^1.0.0', c: '^1.0.0', d: '^1.0.0' }),
+      'node_modules/a': pkg('1.0.0', { bar: '*' }),
+      'node_modules/a/node_modules/bar': pkg('1.0.0', { foo: '*' }),
+      'node_modules/a/node_modules/foo': pkg('1.0.0'),
+      'node_modules/c': pkg('1.0.0', { bar: '*' }),
+      'node_modules/bar': pkg('1.0.0', { foo: '*' }),
+      'node_modules/d': pkg('1.0.0', { foo: '*' }),
+      'node_modules/d/node_modules/foo': pkg('1.0.0'),
+      'node_modules/foo': pkg('2.0.0'),
+    }
+    const after = {
+      ...root({ a: '^1.0.0', c: '^1.0.0', d: '^1.0.0' }),
+      'node_modules/a': pkg('1.1.0'),
+      'node_modules/c': pkg('1.0.0', { bar: '*' }),
+      'node_modules/bar': pkg('1.0.0', { foo: '*' }),
+      'node_modules/d': pkg('1.0.0', { foo: '*' }),
+      'node_modules/d/node_modules/foo': pkg('1.0.0'),
+      'node_modules/foo': pkg('2.0.0'),
+    }
+    expect(lockfileFailures(before, after)).toEqual([])
+  })
+
+  // The mirror of the dedupe case: a copy that APPEARS. `a` used the hoisted
+  // bar@1, whose foo resolved foo@1; after the update `a` has its own nested
+  // bar@1 resolving foo@2, while the hoisted copy stays for `c`. bar never
+  // changes major and foo's set is {1,2} either way, so both summaries hold
+  // still — but a's transitive foo went 1 -> 2.
+  it('catches a crossing carried by a newly added consumer copy', () => {
+    const before = {
+      ...root({ a: '^1.0.0', c: '^1.0.0' }),
+      'node_modules/a': pkg('1.0.0', { bar: '*' }),
+      'node_modules/c': pkg('1.0.0', { bar: '*' }),
+      'node_modules/bar': pkg('1.0.0', { foo: '*' }),
+      'node_modules/foo': pkg('1.0.0'),
+      'node_modules/c/node_modules/foo': pkg('2.0.0'),
+    }
+    const after = {
+      ...root({ a: '^1.0.0', c: '^1.0.0' }),
+      'node_modules/a': pkg('1.0.0', { bar: '*' }),
+      'node_modules/a/node_modules/bar': pkg('1.0.0', { foo: '*' }),
+      'node_modules/a/node_modules/foo': pkg('2.0.0'),
+      'node_modules/c': pkg('1.0.0', { bar: '*' }),
+      'node_modules/bar': pkg('1.0.0', { foo: '*' }),
+      'node_modules/foo': pkg('1.0.0'),
+      'node_modules/c/node_modules/foo': pkg('2.0.0'),
+    }
+
+    const fooMajors = (tree) =>
+      new Set(
+        Object.entries(tree)
+          .filter(([p, e]) => p.endsWith('node_modules/foo') && e.version)
+          .map(([, e]) => majorOf(e.version)),
+      )
+    expect(fooMajors(before)).toEqual(fooMajors(after))
+
+    expect(lockfileFailures(before, after).join('\n')).toContain('different major')
+  })
+
+  // And the mirror of the dropped-dependency case. `a` ADDS a dependency on
+  // bar, which lands nested while a hoisted bar stays for `c`. The new copy
+  // resolves a different foo than the hoisted one does, but `a` never depended
+  // on bar before, so nobody crossed — there was no previous resolution to
+  // cross from. Without the was-depended test this reads as a transitive major.
+  it('passes when a dependency is newly added rather than crossed', () => {
+    const before = {
+      ...root({ a: '^1.0.0', c: '^1.0.0' }),
+      'node_modules/a': pkg('1.0.0'),
+      'node_modules/c': pkg('1.0.0', { bar: '*' }),
+      'node_modules/bar': pkg('1.0.0', { foo: '*' }),
+      'node_modules/foo': pkg('1.0.0'),
+      'node_modules/c/node_modules/foo': pkg('2.0.0'),
+    }
+    const after = {
+      ...root({ a: '^1.0.0', c: '^1.0.0' }),
+      'node_modules/a': pkg('1.1.0', { bar: '*' }),
+      'node_modules/a/node_modules/bar': pkg('1.0.0', { foo: '*' }),
+      'node_modules/a/node_modules/foo': pkg('2.0.0'),
+      'node_modules/c': pkg('1.0.0', { bar: '*' }),
+      'node_modules/bar': pkg('1.0.0', { foo: '*' }),
+      'node_modules/foo': pkg('1.0.0'),
+      'node_modules/c/node_modules/foo': pkg('2.0.0'),
+    }
+    expect(lockfileFailures(before, after)).toEqual([])
+  })
+
+  // Liveness chains, so the scan has to run to a fixed point. Two levels dedupe
+  // in the same update — both the `a` copies and the `bar` copies collapse — so
+  // the orphaned `bar` is used only by the orphaned `a`. Asking "who still
+  // depends on this" against a snapshot of the MATCHED pairs answers "nobody"
+  // and drops it, while x's transitive foo goes 2 -> 1 and every summary holds
+  // still.
+  it('catches a crossing when two levels dedupe in the same update', () => {
+    const before = {
+      ...root({ x: '^1.0.0', y: '^1.0.0', z: '^1.0.0' }),
+      'node_modules/x': pkg('1.0.0', { a: '*' }),
+      'node_modules/x/node_modules/a': pkg('1.0.0', { bar: '*' }),
+      'node_modules/x/node_modules/bar': pkg('1.0.0', { foo: '*' }),
+      'node_modules/x/node_modules/foo': pkg('2.0.0'),
+      'node_modules/y': pkg('1.0.0', { a: '*' }),
+      'node_modules/y/node_modules/a': pkg('1.0.0', { bar: '*' }),
+      'node_modules/y/node_modules/bar': pkg('1.0.0', { foo: '*' }),
+      'node_modules/y/node_modules/foo': pkg('1.0.0'),
+      'node_modules/z': pkg('1.0.0', { foo: '*' }),
+      'node_modules/z/node_modules/foo': pkg('2.0.0'),
+    }
+    const after = {
+      ...root({ x: '^1.0.0', y: '^1.0.0', z: '^1.0.0' }),
+      'node_modules/x': pkg('1.0.0', { a: '*' }),
+      'node_modules/y': pkg('1.0.0', { a: '*' }),
+      'node_modules/a': pkg('1.0.0', { bar: '*' }),
+      'node_modules/bar': pkg('1.0.0', { foo: '*' }),
+      'node_modules/foo': pkg('1.0.0'),
+      'node_modules/z': pkg('1.0.0', { foo: '*' }),
+      'node_modules/z/node_modules/foo': pkg('2.0.0'),
+    }
+
+    const fooMajors = (tree) =>
+      new Set(
+        Object.entries(tree)
+          .filter(([p, e]) => p.endsWith('node_modules/foo') && e.version)
+          .map(([, e]) => majorOf(e.version)),
+      )
+    expect(fooMajors(before)).toEqual(fooMajors(after))
+
+    expect(lockfileFailures(before, after).join('\n')).toContain('different major')
+  })
+
+  // Resolution is positional, not declarative: a package resolves whatever
+  // sits above it whether or not it asked for it. So "this instance was
+  // resolvable from that consumer" is not evidence the consumer used it. Here
+  // `q` drops bar (orphaning `a/node_modules/bar`, which only `q` ever used)
+  // while `a` independently ADDS bar and gets the hoisted copy. Checking only
+  // the far side of the pair lets a's brand-new edge supply liveness for an
+  // instance it never depended on, and the batch is rejected for a crossing
+  // nobody made.
+  it('passes when an added edge coincidentally resolves to an orphaned copy', () => {
+    const before = {
+      ...root({ a: '^1.0.0', c: '^1.0.0' }),
+      'node_modules/a': pkg('1.0.0', { q: '*' }),
+      'node_modules/a/node_modules/q': pkg('1.0.0', { bar: '*', foo: '*' }),
+      'node_modules/a/node_modules/bar': pkg('1.0.0', { foo: '*' }),
+      'node_modules/a/node_modules/foo': pkg('1.0.0'),
+      'node_modules/c': pkg('1.0.0', { bar: '*' }),
+      'node_modules/bar': pkg('1.0.0', { foo: '*' }),
+      'node_modules/foo': pkg('2.0.0'),
+    }
+    const after = {
+      ...root({ a: '^1.0.0', c: '^1.0.0' }),
+      'node_modules/a': pkg('1.1.0', { q: '*', bar: '*' }),
+      'node_modules/a/node_modules/q': pkg('1.1.0', { foo: '*' }),
+      'node_modules/a/node_modules/foo': pkg('1.0.0'),
+      'node_modules/c': pkg('1.0.0', { bar: '*' }),
+      'node_modules/bar': pkg('1.0.0', { foo: '*' }),
+      'node_modules/foo': pkg('2.0.0'),
+    }
+    expect(lockfileFailures(before, after)).toEqual([])
+  })
+
+  // The matcher pairs by version when locations differ, which is a hypothesis
+  // rather than a fact: `q` dropping bar@1 while `p` independently adds bar@1
+  // produces exactly that shape out of two copies with nothing to do with each
+  // other. Comparing them describes a move no consumer made — and since they
+  // were paired, they never reach the unpaired-instance path where liveness
+  // was already being checked.
+  it('passes when one dependency drops a copy and another adds an unrelated one', () => {
+    const before = {
+      ...root({ q: '^1.0.0', p: '^1.0.0', z: '^1.0.0' }),
+      'node_modules/q': pkg('1.0.0', { bar: '*' }),
+      'node_modules/q/node_modules/bar': pkg('1.0.0', { foo: '*' }),
+      'node_modules/q/node_modules/foo': pkg('1.0.0'),
+      'node_modules/p': pkg('1.0.0'),
+      'node_modules/z': pkg('1.0.0', { foo: '*' }),
+      'node_modules/z/node_modules/foo': pkg('1.0.0'),
+      'node_modules/foo': pkg('2.0.0'),
+    }
+    const after = {
+      ...root({ q: '^1.0.0', p: '^1.0.0', z: '^1.0.0' }),
+      'node_modules/q': pkg('1.1.0'),
+      'node_modules/p': pkg('1.1.0', { bar: '*' }),
+      'node_modules/p/node_modules/bar': pkg('1.0.0', { foo: '*' }),
+      'node_modules/z': pkg('1.0.0', { foo: '*' }),
+      'node_modules/z/node_modules/foo': pkg('1.0.0'),
+      'node_modules/foo': pkg('2.0.0'),
+    }
+    expect(lockfileFailures(before, after)).toEqual([])
+  })
+
+  // A rejected pairing must not take the instance down with it. `q`'s nested
+  // bar disappears and `q` falls through to `a/node_modules/bar`, but the
+  // matcher pairs the vanished copy with an unrelated newly added
+  // `b/node_modules/bar`. That hypothesis fails liveness — correctly — and if
+  // it is simply dropped, the vanished copy is never compared against the copy
+  // `q` actually uses now, so its foo 2 -> 1 goes unreported with both
+  // summaries unchanged.
+  it('catches a crossing where a vanished copy is not the one a consumer moved to', () => {
+    const before = {
+      ...root({ a: '^1.0.0', z: '^1.0.0' }),
+      'node_modules/a': pkg('1.0.0', { q: '*', b: '*', bar: '*' }),
+      'node_modules/a/node_modules/bar': pkg('1.0.0', { foo: '*' }),
+      'node_modules/a/node_modules/q': pkg('1.0.0', { bar: '*' }),
+      'node_modules/a/node_modules/q/node_modules/bar': pkg('1.0.0', { foo: '*' }),
+      'node_modules/a/node_modules/q/node_modules/foo': pkg('2.0.0'),
+      'node_modules/a/node_modules/b': pkg('1.0.0'),
+      'node_modules/z': pkg('1.0.0', { foo: '*' }),
+      'node_modules/z/node_modules/foo': pkg('2.0.0'),
+      'node_modules/foo': pkg('1.0.0'),
+    }
+    const after = {
+      ...root({ a: '^1.0.0', z: '^1.0.0' }),
+      'node_modules/a': pkg('1.0.0', { q: '*', b: '*', bar: '*' }),
+      'node_modules/a/node_modules/bar': pkg('1.0.0', { foo: '*' }),
+      'node_modules/a/node_modules/q': pkg('1.0.0', { bar: '*' }),
+      'node_modules/a/node_modules/b': pkg('1.1.0', { bar: '*' }),
+      'node_modules/a/node_modules/b/node_modules/bar': pkg('1.0.0', { foo: '*' }),
+      'node_modules/z': pkg('1.0.0', { foo: '*' }),
+      'node_modules/z/node_modules/foo': pkg('2.0.0'),
+      'node_modules/foo': pkg('1.0.0'),
+    }
+
+    const fooMajors = (tree) =>
+      new Set(
+        Object.entries(tree)
+          .filter(([p, e]) => p.endsWith('node_modules/foo') && e.version)
+          .map(([, e]) => majorOf(e.version)),
+      )
+    expect(fooMajors(before)).toEqual(fooMajors(after))
+
+    expect(lockfileFailures(before, after).join('\n')).toContain('different major')
+  })
+
+  it('passes a brand-new subdependency of something that moved in range', () => {
+    const before = {
+      ...root({ a: '^1.0.0' }),
+      'node_modules/a': pkg('1.2.0'),
+    }
+    const after = {
+      ...root({ a: '^1.0.0' }),
+      'node_modules/a': pkg('1.3.0', { fresh: '*' }),
+      'node_modules/fresh': pkg('4.0.0'),
+    }
+    expect(lockfileFailures(before, after)).toEqual([])
+  })
+
+  it('catches a major the root itself resolves, even with the range untouched', () => {
+    const before = {
+      ...root({ alpha: '*' }),
+      'node_modules/alpha': pkg('1.0.0'),
+    }
+    const after = {
+      ...root({ alpha: '*' }),
+      'node_modules/alpha': pkg('2.0.0'),
+    }
+    expect(lockfileFailures(before, after).join('\n')).toContain('alpha')
+    expect(lockfileFailures(before, after)).not.toEqual([])
+  })
+
+  it('ignores link and workspace records, which carry no resolved version', () => {
+    const before = {
+      ...root({ a: '^1.0.0' }),
+      'node_modules/a': { resolved: 'packages/a', link: true },
+      'packages/a': { name: 'a' },
+    }
+    expect(lockfileFailures(before, { ...before })).toEqual([])
+  })
+
+  it('stops when an edge declared on both sides resolves on only one', () => {
+    const before = {
+      ...root({ a: '^1.0.0' }),
+      'node_modules/a': pkg('1.0.0', { opt: '*' }),
+      'node_modules/opt': pkg('1.0.0'),
+    }
+    const after = {
+      ...root({ a: '^1.0.0' }),
+      'node_modules/a': pkg('1.0.0', { opt: '*' }),
+    }
+    expect(lockfileFailures(before, after).join('\n')).toContain('resolves to a copy on only one')
+  })
+})
+
+// The two shapes that retired the by-path and by-name aggregate rules. Both
+// are ordinary add-and-drop batches with no consumer keeping the edge across
+// the update, and both were rejected as transitive majors until liveness
+// became the only test.
+describe('add-and-drop is not a crossing', () => {
+  const pkgL = (version, deps) => ({
+    version,
+    ...(deps ? { dependencies: deps } : {}),
+  })
+
+  it('passes when every dependent of a stable path turns over', () => {
+    const before = {
+      ...root({ q: '^1.0.0', p: '^1.0.0' }),
+      'node_modules/q': pkgL('1.0.0', { bar: '*' }),
+      'node_modules/p': pkgL('1.0.0'),
+      'node_modules/bar': pkgL('1.0.0', { foo: '*' }),
+      'node_modules/bar/node_modules/foo': pkgL('1.0.0'),
+      'node_modules/foo': pkgL('2.0.0'),
+    }
+    const after = {
+      ...root({ q: '^1.0.0', p: '^1.0.0' }),
+      'node_modules/q': pkgL('1.1.0'),
+      'node_modules/p': pkgL('1.1.0', { bar: '*' }),
+      'node_modules/bar': pkgL('1.0.0', { foo: '*' }),
+      'node_modules/foo': pkgL('2.0.0'),
+    }
+    expect(lockfileFailures(before, after)).toEqual([])
+  })
+
+  it('passes when one package drops a major and another picks up a different one', () => {
+    const before = {
+      ...root({ q: '^1.0.0', p: '^1.0.0' }),
+      'node_modules/q': pkgL('1.0.0', { bar: '*' }),
+      'node_modules/p': pkgL('1.0.0'),
+      'node_modules/bar': pkgL('1.0.0'),
+    }
+    const after = {
+      ...root({ q: '^1.0.0', p: '^1.0.0' }),
+      'node_modules/q': pkgL('1.1.0'),
+      'node_modules/p': pkgL('1.1.0', { bar: '*' }),
+      'node_modules/bar': pkgL('2.0.0'),
+    }
+    expect(lockfileFailures(before, after)).toEqual([])
+  })
+})
+
+// The @types/node guard above is necessary but NOT sufficient, and openharmony
+// is the proof: it is in every one of these lockfiles today and is absent from
+// that union, so the types package lags what npm actually ships. This guard
+// asks the lockfile instead — every `cpu`/`os` value a real dependency declares
+// must either be a Node target we know about, or be explicitly classified as
+// not one. A new platform binding entering the tree then fails CI and gets a
+// deliberate decision, rather than defaulting to "impossible" and silently
+// pruning its subtree.
+describe('installability domains vs. this lockfile', () => {
+  // This repository deliberately ships no dependencies, so there is no
+  // lockfile here to classify: the two lockfile-bound tests below run in a
+  // CONSUMER checkout (where ./package-lock.json exists) and skip here. The
+  // syntax tests after them are pure logic and run everywhere.
+  const lockUrl = new URL('./package-lock.json', import.meta.url)
+  const lock = existsSync(lockUrl)
+    ? JSON.parse(readFileSync(lockUrl, 'utf8'))
+    : null
+
+  // npm's syntax, read the way `checkList` reads it: a leading `!` negates a
+  // target and a lone `any` is a wildcard. Both are ordinary, valid values a
+  // future batch can introduce, so the raw token has to be normalized to the
+  // TARGET before classifying it — comparing `!win32` against the domain would
+  // fail a perfectly good lockfile and turn the weekly job red for no reason,
+  // which is precisely the cry-wolf this file exists to avoid.
+  const unclassified = (packages, field, domain) => {
+    const targets = new Set()
+    for (const entry of Object.values(packages)) {
+      for (const value of [].concat(entry[field] || [])) {
+        const target = String(value).replace(/^!/, '')
+        if (target !== 'any') targets.add(target)
+      }
+    }
+    return [...targets]
+      .filter((t) => !domain.includes(t) && !NOT_A_NODE_TARGET.includes(t))
+      .sort()
+  }
+
+  it.skipIf(!lock)('classify every cpu the lockfile declares', () => {
+    expect(unclassified(lock.packages, 'cpu', NODE_ARCH)).toEqual([])
+  })
+
+  it.skipIf(!lock)('classify every os the lockfile declares', () => {
+    expect(unclassified(lock.packages, 'os', NODE_PLATFORM)).toEqual([])
+  })
+
+  // The guard's own regression test: today's lockfiles carry no negation or
+  // wildcard, so without this the normalization above would be unexercised.
+  it('accept npm negation and wildcard syntax as classified', () => {
+    const packages = {
+      'node_modules/a': { version: '1.0.0', os: ['!win32'], cpu: ['!arm'] },
+      'node_modules/b': { version: '1.0.0', os: ['any'], cpu: ['any'] },
+    }
+    expect(unclassified(packages, 'os', NODE_PLATFORM)).toEqual([])
+    expect(unclassified(packages, 'cpu', NODE_ARCH)).toEqual([])
+  })
+
+  it('still reject a target that is neither known nor classified', () => {
+    const packages = { 'node_modules/a': { version: '1.0.0', os: ['plan9'] } }
+    expect(unclassified(packages, 'os', NODE_PLATFORM)).toEqual(['plan9'])
+  })
+})
+
+// Codex's P1 on the port PR (npm-update#1): `lockBefore.packages || {}`
+// silently replaced a lockfileVersion 1 file's entire graph with an empty
+// object — no root consumer seeded, so an updated v2/v3 lockfile full of
+// transitive majors still returned success. The checker's creed is
+// fail-closed: a lockfile shape it cannot walk is a failure to report, never
+// an empty result.
+describe('allFailures on lockfiles it cannot walk', () => {
+  const manifest = { dependencies: { foo: '^1.0.0' } }
+  const v3 = {
+    lockfileVersion: 3,
+    packages: {
+      '': { dependencies: { foo: '^1.0.0' } },
+      'node_modules/foo': { version: '1.0.0' },
+    },
+  }
+  const v1 = { lockfileVersion: 1, dependencies: { foo: { version: '1.0.0' } } }
+
+  it('walks a packages-bearing pair cleanly', () => {
+    expect(
+      allFailures({ manifestBefore: manifest, manifestAfter: manifest, lockBefore: v3, lockAfter: v3 }),
+    ).toEqual([])
+  })
+
+  it('fails closed when the baseline lockfile has no packages section', () => {
+    expect(
+      allFailures({ manifestBefore: manifest, manifestAfter: manifest, lockBefore: v1, lockAfter: v3 }),
+    ).toEqual([expect.stringContaining('no "packages" section')])
+  })
+
+  it('fails closed when the updated lockfile has no packages section', () => {
+    expect(
+      allFailures({ manifestBefore: manifest, manifestAfter: manifest, lockBefore: v3, lockAfter: v1 }),
+    ).toEqual([expect.stringContaining('no "packages" section')])
+  })
+})
+
+// Round two on the same fail-closed creed, both from Codex on npm-update#1.
+// A `packages` map that EXISTS but has no object root record ("") seeds no
+// consumer, so `{}` walked as-is is the same silent pass the missing-map
+// guard just closed. And the root record is the walk's trust anchor: it is
+// supposed to mirror package.json, so a lockfile-only edit that drops an
+// edge from it makes the walk read a direct major crossing as a legitimate
+// removal — the manifest check never sees the lockfile, and the lockfile
+// walk skips dropped edges by design. The root record therefore gets
+// verified against the manifest before anything is walked.
+describe('allFailures on a rootless or manifest-disagreeing packages map', () => {
+  const manifest = { dependencies: { foo: '^1.0.0' } }
+  const lock = (rootDeps, fooVersion) => ({
+    lockfileVersion: 3,
+    packages: {
+      '': rootDeps === null ? undefined : { dependencies: rootDeps },
+      'node_modules/foo': { version: fooVersion },
+    },
+  })
+
+  it('fails closed when packages has no object root record', () => {
+    const empty = { lockfileVersion: 3, packages: {} }
+    const good = lock({ foo: '^1.0.0' }, '1.0.0')
+    expect(
+      allFailures({ manifestBefore: manifest, manifestAfter: manifest, lockBefore: empty, lockAfter: good }),
+    ).toEqual([expect.stringContaining('no root record')])
+    expect(
+      allFailures({ manifestBefore: manifest, manifestAfter: manifest, lockBefore: good, lockAfter: empty }),
+    ).toEqual([expect.stringContaining('no root record')])
+  })
+
+  it('fails when the updated root record drops an edge the manifest still declares', () => {
+    const before = lock({ foo: '^1.0.0' }, '1.0.0')
+    const after = lock({}, '2.0.0')
+    expect(
+      allFailures({ manifestBefore: manifest, manifestAfter: manifest, lockBefore: before, lockAfter: after }),
+    ).toEqual([expect.stringContaining('disagrees with package.json')])
+  })
+
+  it('fails when the root record declares an edge the manifest does not', () => {
+    const before = lock({ foo: '^1.0.0' }, '1.0.0')
+    const after = {
+      lockfileVersion: 3,
+      packages: {
+        '': { dependencies: { foo: '^1.0.0', extra: '*' } },
+        'node_modules/foo': { version: '1.0.0' },
+        'node_modules/extra': { version: '1.0.0' },
+      },
+    }
+    expect(
+      allFailures({ manifestBefore: manifest, manifestAfter: manifest, lockBefore: before, lockAfter: after }),
+    ).toEqual([expect.stringContaining('disagrees with package.json')])
+  })
+
+  it('fails when the root record holds a different range than the manifest', () => {
+    const before = lock({ foo: '^1.0.0' }, '1.0.0')
+    const after = lock({ foo: '^2.0.0' }, '2.0.0')
+    expect(
+      allFailures({ manifestBefore: manifest, manifestAfter: manifest, lockBefore: before, lockAfter: after }),
+    ).toEqual([expect.stringContaining('disagrees with package.json')])
+  })
+
+  it('passes when root record and manifest agree on every section', () => {
+    const before = lock({ foo: '^1.0.0' }, '1.0.0')
+    const after = lock({ foo: '^1.0.0' }, '1.1.0')
+    expect(
+      allFailures({ manifestBefore: manifest, manifestAfter: manifest, lockBefore: before, lockAfter: after }),
+    ).toEqual([])
+  })
+})
+
+// Codex round three, still on npm-update#1: the CLI fed allFailures only the
+// ROOT manifest, so a workspace's package.json never reached
+// manifestFailures — its scripts could be rewritten or a range moved outside
+// its declared bounds, with the workspace's lockfile record updated to
+// match, and the check still passed. The lockfile walk does not cover this:
+// it accepts added and dropped edges by design, and record agreement was
+// only verified for the root. So workspaces are discovered from the
+// lockfiles themselves and each one's manifest is validated exactly like
+// the root's — same manifest rules, same record-agreement rule.
+describe('allFailures over workspace manifests', () => {
+  const rootManifest = { dependencies: {}, workspaces: ['packages/a'] }
+  const wsManifest = (deps, extra = {}) => ({ name: 'a', version: '1.0.0', dependencies: deps, ...extra })
+  const lock = (wsDeps, fooVersion) => ({
+    lockfileVersion: 3,
+    packages: {
+      '': { dependencies: {}, workspaces: ['packages/a'] },
+      'packages/a': { name: 'a', version: '1.0.0', dependencies: wsDeps },
+      'node_modules/a': { link: true },
+      'node_modules/foo': { version: fooVersion },
+    },
+  })
+  const base = {
+    manifestBefore: rootManifest,
+    manifestAfter: rootManifest,
+    lockBefore: lock({ foo: '^1.0.0' }, '1.0.0'),
+    lockAfter: lock({ foo: '^1.0.0' }, '1.1.0'),
+  }
+  const ws = (before, after) => ({ 'packages/a': { manifestBefore: before, manifestAfter: after } })
+
+  it('discovers workspace paths from a packages map', () => {
+    expect(workspacePaths(base.lockBefore.packages)).toEqual(['packages/a'])
+  })
+
+  it('passes an agreeing workspace', () => {
+    expect(
+      allFailures({ ...base, workspaces: ws(wsManifest({ foo: '^1.0.0' }), wsManifest({ foo: '^1.0.0' })) }),
+    ).toEqual([])
+  })
+
+  it('catches a workspace script rewrite', () => {
+    expect(
+      allFailures({
+        ...base,
+        workspaces: ws(
+          wsManifest({ foo: '^1.0.0' }, { scripts: { test: 'vitest' } }),
+          wsManifest({ foo: '^1.0.0' }, { scripts: { test: 'true' } }),
+        ),
+      }),
+    ).toEqual([expect.stringContaining('packages/a/package.json')])
+  })
+
+  it('catches a workspace range moving outside its declared bounds', () => {
+    const after = { ...base, lockAfter: lock({ foo: '^2.0.0' }, '2.0.0') }
+    expect(
+      allFailures({ ...after, workspaces: ws(wsManifest({ foo: '^1.0.0' }), wsManifest({ foo: '^2.0.0' })) }),
+    ).toEqual([expect.stringContaining('packages/a/package.json')])
+  })
+
+  it('catches a workspace record disagreeing with its own manifest', () => {
+    const after = { ...base, lockAfter: lock({ foo: '^2.0.0' }, '2.0.0') }
+    expect(
+      allFailures({ ...after, workspaces: ws(wsManifest({ foo: '^1.0.0' }), wsManifest({ foo: '^1.0.0' })) }),
+    ).toEqual([expect.stringContaining("disagrees with packages/a/package.json")])
+  })
+
+  it('fails closed when a lockfile knows a workspace the caller did not supply', () => {
+    expect(allFailures(base)).toEqual([expect.stringContaining('no manifest pair was supplied')])
+  })
+
+  it('fails closed when the workspace set itself changed', () => {
+    const after = {
+      lockfileVersion: 3,
+      packages: { '': { dependencies: {} }, 'node_modules/foo': { version: '1.0.0' } },
+    }
+    expect(
+      allFailures({ ...base, lockAfter: after, workspaces: ws(wsManifest({ foo: '^1.0.0' }), wsManifest({ foo: '^1.0.0' })) }),
+    ).toEqual([expect.stringContaining('workspace set changed')])
+  })
+})
+
+// Codex round four: npm itself omits a package from a record's `dependencies`
+// map when the same name also appears in `optionalDependencies` — the
+// optional entry overrides the regular one. A literal per-section comparison
+// therefore flags a lockfile npm generated normally as "disagreeing", which
+// would fail every weekly batch of such a project: a standing cry-wolf, the
+// exact failure mode this job must not have.
+describe('record agreement under the optionalDependencies override', () => {
+  const manifest = {
+    dependencies: { foo: '^1.0.0', bar: '^1.0.0' },
+    optionalDependencies: { foo: '^1.0.0' },
+  }
+  const lock = {
+    lockfileVersion: 3,
+    packages: {
+      '': { dependencies: { bar: '^1.0.0' }, optionalDependencies: { foo: '^1.0.0' } },
+      'node_modules/foo': { version: '1.0.0' },
+      'node_modules/bar': { version: '1.0.0' },
+    },
+  }
+
+  it('accepts npm’s omission of an optionally-overridden dependency', () => {
+    expect(
+      allFailures({ manifestBefore: manifest, manifestAfter: manifest, lockBefore: lock, lockAfter: lock }),
+    ).toEqual([])
+  })
+
+  it('still catches a genuine disagreement on the overridden name', () => {
+    const wrong = JSON.parse(JSON.stringify(lock))
+    wrong.packages[''].optionalDependencies.foo = '^2.0.0'
+    expect(
+      allFailures({ manifestBefore: manifest, manifestAfter: manifest, lockBefore: lock, lockAfter: wrong }),
+    ).toEqual([expect.stringContaining('disagrees with package.json')])
+  })
+})
+
+// Codex round five: a `file:` dependency that points OUTSIDE the repository
+// (`file:../foo`) is recorded in the packages map under its relative path
+// (`../foo`), which the workspace discovery read as a workspace — and the
+// CLI then ran `git show HEAD:../foo/package.json`, which aborts on any such
+// lockfile. An in-repo local package keeps the workspace treatment (its
+// manifest is in the tree, so validating it is both possible and wanted);
+// a path outside the repository cannot be validated from here, and that is
+// a structural refusal, not a crash.
+describe('local file: packages outside the repository', () => {
+  const manifest = { dependencies: { foo: 'file:../foo' } }
+  const lock = {
+    lockfileVersion: 3,
+    packages: {
+      '': { dependencies: { foo: 'file:../foo' } },
+      '../foo': { name: 'foo', version: '1.0.0' },
+      'node_modules/foo': { link: true },
+    },
+  }
+
+  it('does not treat an out-of-repo path as a workspace', () => {
+    expect(
+      workspacePaths({ '': {}, '../foo': {}, '/opt/foo': {}, 'packages/a': {}, 'node_modules/x': {} }),
+    ).toEqual(['packages/a'])
+  })
+
+  it('keeps a dot-prefixed but in-repo directory as a workspace', () => {
+    expect(workspacePaths({ '': {}, '..foo': {} })).toEqual(['..foo'])
+  })
+
+  it('refuses an out-of-repo package as a structural failure, not a crash', () => {
+    expect(
+      allFailures({ manifestBefore: manifest, manifestAfter: manifest, lockBefore: lock, lockAfter: lock }),
+    ).toEqual([expect.stringContaining('outside this repository')])
+  })
+
+  it('refuses an absolute-path package the same way', () => {
+    const abs = JSON.parse(JSON.stringify(lock))
+    delete abs.packages['../foo']
+    abs.packages['/opt/foo'] = { name: 'foo', version: '1.0.0' }
+    expect(
+      allFailures({ manifestBefore: manifest, manifestAfter: manifest, lockBefore: abs, lockAfter: abs }),
+    ).toEqual([expect.stringContaining('outside this repository')])
+  })
+})
+
+// Codex round six: record agreement covers the root and workspaces, but a
+// REGISTRY package's record was still free to change its edge maps while
+// keeping its name and version. That combination is impossible under npm —
+// the edges come from the tarball, and the same tarball cannot change what
+// it depends on — and it is exactly how a tampered lockfile unhooks a
+// consumer from a dependency so the walk never reaches the copy that
+// crossed a major.
+describe('edge stability on unchanged registry records', () => {
+  const manifest = { dependencies: { a: '^1.0.0' } }
+  const mk = (aDeps, bVersion) => ({
+    lockfileVersion: 3,
+    packages: {
+      '': { dependencies: { a: '^1.0.0' } },
+      'node_modules/a': { version: '1.0.0', dependencies: aDeps },
+      'node_modules/b': { version: bVersion },
+    },
+  })
+
+  it('rejects a dropped edge on a same-version registry record', () => {
+    expect(
+      allFailures({
+        manifestBefore: manifest,
+        manifestAfter: manifest,
+        lockBefore: mk({ b: '^1.0.0' }, '1.0.0'),
+        lockAfter: mk({}, '2.0.0'),
+      }),
+    ).toEqual([expect.stringContaining('kept its version but its recorded dependencies changed')])
+  })
+
+  it('rejects an added edge on a same-version registry record', () => {
+    expect(
+      allFailures({
+        manifestBefore: manifest,
+        manifestAfter: manifest,
+        lockBefore: mk({}, '1.0.0'),
+        lockAfter: mk({ b: '^2.0.0' }, '2.0.0'),
+      }),
+    ).toEqual([expect.stringContaining('kept its version but its recorded dependencies changed')])
+  })
+
+  it('still accepts changed edges when the version moved', () => {
+    const before = mk({ b: '^1.0.0' }, '1.0.0')
+    const after = {
+      lockfileVersion: 3,
+      packages: {
+        '': { dependencies: { a: '^1.0.0' } },
+        'node_modules/a': { version: '1.1.0', dependencies: {} },
+      },
+    }
+    expect(
+      allFailures({ manifestBefore: manifest, manifestAfter: manifest, lockBefore: before, lockAfter: after }),
+    ).toEqual([])
+  })
+})
