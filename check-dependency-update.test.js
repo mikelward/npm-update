@@ -60,6 +60,14 @@ describe('manifestFailures', () => {
     expect(manifestFailures(base, after)).toEqual([])
   })
 
+  // `in` walks the prototype chain, so a package named like an
+  // Object.prototype property used to skip the ADDED branch and report a
+  // garbled diagnosis built from the inherited function.
+  it('reports a package named like an Object.prototype property as ADDED', () => {
+    const after = { ...base, dependencies: { ...base.dependencies, constructor: '^1.0.0' } }
+    expect(manifestFailures(base, after).join('\n')).toContain('dependencies.constructor was ADDED')
+  })
+
   it('rejects a rewritten script, which would make every reported check meaningless', () => {
     const after = { ...base, scripts: { test: 'true' } }
     expect(manifestFailures(base, after)).toEqual([
@@ -167,6 +175,73 @@ describe('lockfileFailures', () => {
     // regression while a real miss elsewhere goes unnoticed.
     expect(lockfileFailures(before, after).join('\n')).toContain('foo')
     expect(lockfileFailures(before, after)).not.toEqual([])
+  })
+
+  // Below 1.0.0 the major is not the breaking boundary — caret semantics pin
+  // the MINOR at 0.x (and the patch at 0.0.x), which is exactly what `ceil`
+  // enforces for direct dependencies. Comparing bare majors here would let a
+  // breaking transitive 0.5 -> 0.6 through as a "minor".
+  const zeroXTree = (foo) => ({
+    ...root({ a: '^1.0.0' }),
+    'node_modules/a': pkg('1.0.0', { foo: '*' }),
+    'node_modules/foo': pkg(foo),
+  })
+
+  it('catches a transitive 0.x minor step, which caret semantics make breaking', () => {
+    const failures = lockfileFailures(zeroXTree('0.5.0'), zeroXTree('0.6.0'))
+    expect(failures.join('\n')).toContain('foo')
+    expect(failures).not.toEqual([])
+  })
+
+  it('passes a 0.x patch step within the minor', () => {
+    expect(lockfileFailures(zeroXTree('0.5.0'), zeroXTree('0.5.1'))).toEqual([])
+  })
+
+  it('catches a 0.0.x step, where every release may break', () => {
+    expect(lockfileFailures(zeroXTree('0.0.1'), zeroXTree('0.0.2'))).not.toEqual([])
+  })
+
+  // Two unparseable versions used to compare as null === null — a pass, on
+  // exactly the input the walk understands least. Refusing is the direction
+  // the rest of the file already leans; an UNCHANGED odd version is fine,
+  // because identical strings cannot have crossed anything.
+  it('refuses a changed version it cannot parse instead of comparing nulls', () => {
+    const failures = lockfileFailures(zeroXTree('abc'), zeroXTree('def'))
+    expect(failures.join('\n')).toContain('cannot rule out a breaking move')
+  })
+
+  it('passes an unparseable version that did not change', () => {
+    expect(lockfileFailures(zeroXTree('abc'), zeroXTree('abc'))).toEqual([])
+  })
+
+  // The numeric core alone is not enough to accept a version — an unanchored
+  // match would let "1.2.3abc" and "1.2.3def" both stop at the same "1.2.3"
+  // prefix and compare as the SAME identity, two differently-malformed
+  // strings silently waved through as "no crossing" on exactly the input
+  // this walk trusts least.
+  it('refuses junk immediately after the numeric core instead of matching a shared prefix', () => {
+    const failures = lockfileFailures(zeroXTree('1.2.3abc'), zeroXTree('1.2.3def'))
+    expect(failures.join('\n')).toContain('cannot rule out a breaking move')
+  })
+
+  it('accepts a real prerelease or build suffix after the numeric core', () => {
+    expect(lockfileFailures(zeroXTree('1.2.3-beta.1'), zeroXTree('1.2.3-beta.2'))).toEqual([])
+    expect(lockfileFailures(zeroXTree('1.2.3+build.1'), zeroXTree('1.2.3+build.2'))).toEqual([])
+  })
+
+  // A lookahead that only checks the character immediately after the patch
+  // digit ("-" present, nothing more) still let two DIFFERENTLY malformed
+  // suffixes share an identity by both starting with that one character —
+  // "1.2.3-!!!" and "1.2.3-???" both satisfy "starts with -" and compared
+  // equal. The whole tail has to parse as a valid prerelease/build string.
+  it('refuses a malformed prerelease tail instead of matching on the leading separator', () => {
+    const failures = lockfileFailures(zeroXTree('1.2.3-!!!'), zeroXTree('1.2.3-???'))
+    expect(failures.join('\n')).toContain('cannot rule out a breaking move')
+  })
+
+  it('refuses a leading zero in the numeric core, which npm never publishes', () => {
+    const failures = lockfileFailures(zeroXTree('01.2.3'), zeroXTree('01.2.4'))
+    expect(failures.join('\n')).toContain('cannot rule out a breaking move')
   })
 
   // Round 32. `@tailwindcss/oxide-wasm32-wasi` declares `cpu: ["wasm32"]` and
@@ -1441,6 +1516,46 @@ describe('local file: packages outside the repository', () => {
     expect(
       allFailures({ manifestBefore: manifest, manifestAfter: manifest, lockBefore: abs, lockAfter: abs }),
     ).toEqual([expect.stringContaining('outside this repository')])
+  })
+
+  // A `..` does not have to lead the path to leave the repository, and a
+  // tampered lockfile can spell separators the Windows way. Both shapes
+  // used to pass the structural refusal and only failed later, by luck,
+  // when git refused the interior `..`.
+  it('treats interior .. segments and backslash paths as outside the repository', () => {
+    expect(
+      workspacePaths({
+        '': {},
+        'a/../../etc': {},
+        '..\\foo': {},
+        '\\\\server\\share': {},
+        'packages/a': {},
+      }),
+    ).toEqual(['packages/a'])
+  })
+})
+
+// The resolved-copy test has to match `node_modules` as a whole path
+// segment. As a substring test it also caught an in-repo directory merely
+// NAMED like it, which then counted as neither a workspace nor a resolved
+// copy: excluded from record agreement, never walked, vouched for by
+// nothing — the silent-skip shape the workspace comments warn about.
+describe('directories merely named like node_modules', () => {
+  it('treats such a directory as a workspace, not a resolved copy', () => {
+    expect(
+      workspacePaths({ '': {}, 'fake_node_modules/lib': {}, 'node_modules/x': {} }),
+    ).toEqual(['fake_node_modules/lib'])
+  })
+
+  it('walks its edges like any other consumer', () => {
+    const tree = (foo) => ({
+      '': { dependencies: {} },
+      'fake_node_modules/lib': { name: 'lib', version: '1.0.0', dependencies: { foo: '*' } },
+      'node_modules/foo': pkg(foo),
+    })
+    const failures = lockfileFailures(tree('1.0.0'), tree('2.0.0'))
+    expect(failures.join('\n')).toContain('foo')
+    expect(failures).not.toEqual([])
   })
 })
 

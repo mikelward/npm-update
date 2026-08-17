@@ -114,11 +114,14 @@ export function manifestFailures(before, after) {
     const a = before[section] || {};
     const b = after[section] || {};
     for (const name of [...new Set([...Object.keys(a), ...Object.keys(b)])].sort()) {
-      if (!(name in a)) {
+      // Object.hasOwn, not `in`: a package named like an Object.prototype
+      // property ("constructor") would otherwise take the wrong branch and
+      // report a garbled diagnosis.
+      if (!Object.hasOwn(a, name)) {
         out.push(`${section}.${name} was ADDED; npm update does not add packages.`);
         continue;
       }
-      if (!(name in b)) {
+      if (!Object.hasOwn(b, name)) {
         out.push(`${section}.${name} was REMOVED; npm update does not remove packages.`);
         continue;
       }
@@ -156,6 +159,39 @@ export const majorOf = (version) => {
   const m = /^\d+/.exec(String(version));
   return m ? m[0] : null;
 };
+
+// A full semver.org-grammar match (the reference regex from the spec's own
+// appendix), anchored at both ends. A lookahead that only checked the
+// character immediately after the patch digit ("-" or "+" present, nothing
+// more) still let two DIFFERENTLY malformed suffixes share an identity —
+// "1.2.3-!!!" and "1.2.3-???" both satisfied that lookahead and compared
+// equal. Requiring the WHOLE string to parse as a valid prerelease/build
+// tail (and the numeric core to carry no leading zeros, which npm's own
+// registry never publishes) closes that: either side is genuinely
+// malformed refuses instead of comparing equal to another kind of garbage.
+const SEMVER =
+  /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*)?(?:\+[0-9a-zA-Z-]+(?:\.[0-9a-zA-Z-]+)*)?$/;
+
+// The compatibility identity npm's caret semantics assign a version: the
+// major — except at 0.x, where the MINOR is the breaking boundary, and at
+// 0.0.x, where every release is. This mirrors `ceil` above; comparing bare
+// majors here while `ceil` pins the minor for direct 0.x deps would let a
+// breaking transitive 0.5 -> 0.6 through as a "minor". null when the
+// version is not a complete, valid semver string, so the caller refuses
+// rather than guesses.
+export const breakingIdentityOf = (version) => {
+  const m = SEMVER.exec(String(version));
+  if (!m) return null;
+  const [x, y, z] = m.slice(1);
+  return +x > 0 ? x : +y > 0 ? `${x}.${y}` : `${x}.${y}.${z}`;
+};
+
+// A packages key is a resolved copy only when `node_modules` appears as a
+// whole path segment with something under it. A substring test would also
+// catch an in-repo directory merely NAMED like it (`fake_node_modules/lib`),
+// classifying it as neither workspace nor resolved copy — excluded from
+// validation and never walked, a silent gap.
+const RESOLVED_COPY = /(^|\/)node_modules\//;
 
 /**
  * Resolve one dependency edge the way npm does: from the dependent directory,
@@ -355,7 +391,7 @@ export function lockfileFailures(beforePackages, afterPackages) {
     // The root, plus every workspace: a `packages` key with no `node_modules/`
     // segment is one or the other. Everything else is a resolved copy and
     // belongs to the matcher.
-    if (path.includes("node_modules/")) continue;
+    if (RESOLVED_COPY.test(path)) continue;
     const before = beforePackages[path];
     const after = afterPackages[path];
     if (!before || !after) continue;
@@ -434,7 +470,7 @@ export function lockfileFailures(beforePackages, afterPackages) {
     // which legitimately move at a constant version, and record agreement
     // in allFailures already binds them to those manifests.
     if (
-      pair.before.path.includes("node_modules/") &&
+      RESOLVED_COPY.test(pair.before.path) &&
       pair.before.name === pair.after.name &&
       pair.before.version === pair.after.version
     ) {
@@ -491,10 +527,25 @@ export function lockfileFailures(beforePackages, afterPackages) {
         );
         continue;
       }
-      if (majorOf(was.version) !== majorOf(now.version)) {
-        out.push(
-          `${label(pair.before)} now resolves ${dep} to a different major: ${was.version} -> ${now.version}. Even a transitive major is a deliberate migration, not a monthly batch.`,
-        );
+      if (was.version !== now.version) {
+        const wasId = breakingIdentityOf(was.version);
+        const nowId = breakingIdentityOf(now.version);
+        if (wasId === null || nowId === null) {
+          // Fail closed on a version this job cannot model, exactly as the
+          // manifest side refuses exotic ranges: comparing two nulls would
+          // wave the move through, which is the wrong direction to guess.
+          out.push(
+            `${label(pair.before)} now resolves ${dep} to a version this job cannot parse (${was.version} -> ${now.version}), so it cannot rule out a breaking move.`,
+          );
+        } else if (wasId !== nowId) {
+          const kind =
+            majorOf(was.version) !== majorOf(now.version)
+              ? "different major"
+              : "breaking 0.x step (caret pins the minor at 0.x)";
+          out.push(
+            `${label(pair.before)} now resolves ${dep} to a ${kind}: ${was.version} -> ${now.version}. Even a transitive breaking move is a deliberate migration, not a monthly batch.`,
+          );
+        }
       }
       // Whatever this consumer resolves to is a live pair by construction, so
       // its own edges are next.
@@ -512,12 +563,14 @@ export function lockfileFailures(beforePackages, afterPackages) {
 // on a sibling directory (`../foo`) or an absolute path. Its manifest is
 // not in this tree, so nothing here can validate it — it is neither a
 // workspace nor a registry package. `..foo` is a legal (if odd) in-repo
-// directory name, so the test is the `../` prefix, not the leading dots.
+// directory name, so the test is for a whole `..` SEGMENT, not leading
+// dots — and it looks at every segment, either separator, because
+// `a/../../etc` and `..\foo` escape just as surely as `../foo` does.
 export function isOutsideRepository(path) {
   return (
-    path === ".." ||
-    path.startsWith("../") ||
+    path.split(/[\\/]/).includes("..") ||
     path.startsWith("/") ||
+    path.startsWith("\\") ||
     /^[A-Za-z]:[\\/]/.test(path)
   );
 }
@@ -534,7 +587,7 @@ export function workspacePaths(packages) {
     .filter(
       (path) =>
         path !== ROOT &&
-        !path.includes("node_modules/") &&
+        !RESOLVED_COPY.test(path) &&
         !isOutsideRepository(path),
     )
     .sort();
