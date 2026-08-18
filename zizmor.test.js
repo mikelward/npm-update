@@ -85,9 +85,13 @@ describe("zizmor workflow", () => {
     // Pins the whole grant, so the scan can never grow a scope quietly.
     // The top-level block must also be the ONLY one: GitHub lets a
     // job-level mapping replace it wholesale, so a second block anywhere
-    // is a widening no matter how it is scoped.
+    // is a widening no matter how it is scoped. `\s*:` rather than a bare
+    // `:` — YAML tolerates whitespace before the colon on a plain-scalar
+    // key (`permissions : write-all` parses the same as `permissions:
+    // write-all`), so a bare-colon match misses a job-level override
+    // spelled that way.
     expect(workflow).toMatch(/\npermissions:\n {2}contents: read\njobs:/);
-    expect([...workflow.matchAll(/^ *permissions:/gm)]).toHaveLength(1);
+    expect([...workflow.matchAll(/^ *permissions\s*:/gm)]).toHaveLength(1);
   });
 
   it("re-runs when anything it scans changes", () => {
