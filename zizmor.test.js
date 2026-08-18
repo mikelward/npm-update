@@ -96,11 +96,15 @@ describe("zizmor workflow", () => {
     // one contiguous block by construction, not by scanning for any
     // `paths:` occurrence — renaming `pull_request:` to another trigger (or
     // reordering the block) breaks this exact-structure match, so a
-    // `paths:` line can't survive attached to the wrong trigger. Read from
-    // the comment-stripped text, same as the run-field checks above — a
-    // commented-out line must not count as live.
+    // `paths:` line can't survive attached to the wrong trigger. Anchored
+    // through to `permissions:`, the next top-level key — otherwise the
+    // match only requires the block to START this way, so an extra key
+    // slipped into the `pull_request:` mapping (`types: [closed]`, which
+    // would silently stop the scan from running on open/sync) would still
+    // satisfy it. Read from the comment-stripped text, same as the
+    // run-field checks above — a commented-out line must not count as live.
     expect(workflowRun).toMatch(
-      /^on:\n {2}push:\n {4}branches: \[main\]\n {4}paths: \['\.github\/\*\*'\]\n {2}pull_request:\n {4}paths: \['\.github\/\*\*'\]\n/m,
+      /^on:\n {2}push:\n {4}branches: \[main\]\n {4}paths: \['\.github\/\*\*'\]\n {2}pull_request:\n {4}paths: \['\.github\/\*\*'\]\npermissions:\n/m,
     );
   });
 });
