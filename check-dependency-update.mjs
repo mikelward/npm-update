@@ -725,10 +725,14 @@ export function installedVersions(packages) {
  *
  * Copies at a path present on both sides also compare individually, so two
  * consumers trading versions — every multiset unchanged — still get their
- * per-path moves listed. The one deliberate silence: a copy RELOCATING at
- * the same version, npm reshaping the tree without moving any version
- * anywhere. What is on disk is identical, and which consumer resolves which
- * identical copy is the validator's walk above, not a PR-body fact.
+ * per-path moves listed. The deliberate boundary: this is an inventory of
+ * what is ON DISK, not of who resolves what. A copy relocating at the same
+ * version keeps the inventory identical and gets no line, even though a
+ * relocation can shuffle which surviving same-major copy each consumer
+ * resolves. Re-deriving per-consumer resolution here would duplicate the
+ * validator's walk above — the walk that already runs on every batch and
+ * hard-fails the redistribution that carries risk, a changed major. The
+ * summary states its granularity rather than pretending to more.
  *
  * Purely informational — nothing here gates anything, and a lockfile shape
  * the walk cannot read degrades to a manifest-only listing with a note
@@ -846,9 +850,10 @@ export function updateSummary({ manifestBefore, manifestAfter, lockBefore, lockA
     // one copy moving 1.1.0 -> 1.2.0 while another moves back. A version
     // changing at a path present on BOTH sides is a real move at a stable
     // location, so those compare individually, labeled by path. A copy
-    // RELOCATING at the same version stays silent on purpose: nothing about
-    // what is on disk changed, and which consumer resolves which identical
-    // copy is the validator's business, not a PR body's.
+    // RELOCATING at the same version stays silent on purpose: the on-disk
+    // inventory is identical, and the consumer-resolution shifts a
+    // relocation can cause are the validator's walk — which hard-fails the
+    // ones that matter, a changed major. See the doc comment's boundary.
     const moves = [];
     for (const [path, version] of before) {
       const v = after.get(path);
