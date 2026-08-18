@@ -21,8 +21,8 @@ has stopped biting.
 ## The extraction
 
 - **The per-repo copies are still live.** gedmap, newshacker, and readmo run
-  their own `scripts/check-dependency-update.mjs` and
-  `.github/workflows/dependency-update.yml` until they consume this repository
+  their own `scripts/check-npm-update.mjs` and
+  `.github/workflows/npm-update.yml` until they consume this repository
   instead. Until a consumer has switched, a fix to the checker lands in its
   copy too — the extraction must not become the place where the copies start
   drifting, since drift is the problem it exists to end.

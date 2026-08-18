@@ -60,7 +60,7 @@ describe("the lane policy", () => {
     // The other direction is the one that matters: a pattern loosened to
     // match any of these would skip the suite that validates them.
     for (const path of [
-      "check-dependency-update.mjs",
+      "check-npm-update.mjs",
       "vitest-shim.mjs",
       "lanes-policy.test.js",
       ".github/workflows/ci.yml",

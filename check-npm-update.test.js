@@ -37,7 +37,7 @@ import {
   allFailures,
   updateSummary,
   workspacePaths,
-} from './check-dependency-update.mjs'
+} from './check-npm-update.mjs'
 
 const pkg = (version, deps) => ({
   version,
@@ -1946,7 +1946,7 @@ describe('updateSummary', () => {
 // `HEAD:package.json` would look identical to every pure-function test while
 // failing from any nested directory.
 describe('the CLI run from a nested npm tree', () => {
-  const CLI = fileURLToPath(new URL('./check-dependency-update.mjs', import.meta.url))
+  const CLI = fileURLToPath(new URL('./check-npm-update.mjs', import.meta.url))
 
   const lockFor = (version) => JSON.stringify({
     name: 'app',

@@ -16,7 +16,7 @@
 //      suite, repeatedly, and each fix reopened the previous one.
 //
 // Everything here is a pure function over parsed JSON, exported for
-// check-dependency-update.test.ts. The CLI at the bottom is the only part that
+// check-npm-update.test.js. The CLI at the bottom is the only part that
 // touches git or the filesystem. Run with no arguments to validate; run with
 // `summary` to print the PR-body section that names every package the batch
 // moved — generated here, in the same clean context as the validation, so the
