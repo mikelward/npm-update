@@ -897,8 +897,13 @@ export function updateSummary({ manifestBefore, manifestAfter, lockBefore, lockA
 }
 
 function gatherInputs() {
+  // The `./` prefix makes the pathspec relative to the working directory,
+  // so the same script serves a repository whose npm tree lives in a
+  // subdirectory (a Cloud Functions backend, say) — run it from that
+  // directory. At the repository root, `HEAD:./x` names the same object
+  // as `HEAD:x`, so nothing changes for the existing consumers.
   const show = (path) =>
-    JSON.parse(execFileSync("git", ["show", `HEAD:${path}`], { encoding: "utf8" }));
+    JSON.parse(execFileSync("git", ["show", `HEAD:./${path}`], { encoding: "utf8" }));
   const read = (path) => JSON.parse(readFileSync(path, "utf8"));
 
   const lockBefore = show("package-lock.json");
