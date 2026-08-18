@@ -39,7 +39,9 @@ Below the bar, no TODO.md entry yet — add one when each is picked up:
   timezone, travelmo, twilmo, undnd, visadays, weatherchange, weathermo.
   Of these, redfeed and theme-plainlight also use npm with no weekly
   dependency workflow.
-- **Private, unaudited from that session:** simmo, mikelward, bolus,
-  ha-config.
+- **Private repositories:** four could not be audited from that session,
+  and their names stay out of this public file per AGENTS.md's privacy
+  rule — audit them from a session with access and record their gaps in
+  their own TODO.md files.
 
 Forks and archived repositories are out of scope.
