@@ -436,13 +436,24 @@ jobs:
 
       # The canonical checker, from THIS repository rather than the consumer's
       # own tree — that is the point of the extraction: one copy instead of a
-      # hand-synced one per consumer. `@main` is the release, matching every
-      # other sibling action/workflow this fleet consumes at a mutable ref.
+      # hand-synced one per consumer. Pinned to `job.workflow_sha` — the exact
+      # commit of THIS reusable workflow as it was resolved when the caller
+      # invoked it (added to the job context 2026-04-23) — rather than a
+      # second, independent `ref: main` lookup. A plain `main` here is a
+      # different resolution from the one that already picked which revision
+      # of npm-update.yml itself is running: `main` can advance between those
+      # two moments, pairing an older workflow revision with a newer checker
+      # (or the reverse), and a consumer piloting this workflow from a branch
+      # per AGENTS.md "Piloting happens BEFORE the merge" would still get
+      # `main`'s checker instead of the branch's — silently testing the wrong
+      # thing. `job.workflow_sha` is the same commit either way, so the
+      # workflow and the checker it loads are always the one pair that was
+      # actually reviewed and tested together.
       - name: Check out the canonical checker
         uses: actions/checkout@v7
         with:
           repository: mikelward/npm-update
-          ref: main
+          ref: ${{ job.workflow_sha }}
           path: npm-update-hub
           persist-credentials: false
 

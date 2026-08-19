@@ -173,15 +173,29 @@ describe("npm-update reusable workflow", () => {
   });
 
   it("validates the manifest contents from a job that ran no dependency code", () => {
-    // The canonical checker is fetched from THIS repository at @main, into
-    // a subdirectory, and invoked from there — not a consumer-local
+    // The canonical checker is fetched from THIS repository, into a
+    // subdirectory, and invoked from there — not a consumer-local
     // scripts/check-npm-update.mjs, which is what made this a copy per
     // consumer in the first place.
     expect(publish).toContain("repository: mikelward/npm-update");
-    expect(publish).toMatch(/ref: main\b/);
     expect(publish).toContain("Re-validate the dependency diff from a clean context");
     expect(publish).toContain("node npm-update-hub/check-npm-update.mjs");
     expect(publish).not.toMatch(/^\s*run: npm (ci|install)\b/m);
+  });
+
+  it("pins the canonical checker checkout to the resolved reusable-workflow commit, not mutable main", () => {
+    // `main` can advance between the moment the caller resolved which
+    // revision of THIS workflow to run and the moment this later step does
+    // its own, independent ref lookup — pairing an older workflow revision
+    // with a newer checker (or the reverse). job.workflow_sha is the exact
+    // commit this reusable workflow was invoked at, so it and the checker
+    // it loads are always the one pair that was actually reviewed together
+    // — including when a consumer pilots this workflow from a branch
+    // (AGENTS.md "Piloting happens BEFORE the merge"), where a bare `main`
+    // would silently fetch main's checker instead of the branch's own.
+    const checkerStep = publish.slice(publish.indexOf("Check out the canonical checker"));
+    expect(checkerStep).toMatch(/^\s*ref:.*job\.workflow_sha.*$/m);
+    expect(checkerStep.slice(0, 400)).not.toMatch(/ref:\s*main\b/);
   });
 
   it("names the updated packages in the PR body before committing", () => {
