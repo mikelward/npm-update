@@ -318,7 +318,26 @@ jobs:
           # suite ran against it. Ignored paths (node_modules, dist, coverage)
           # are excluded by porcelain already; the two allowed extras are files
           # this job writes itself.
-          unexpected=$(git status --porcelain --untracked-files=all \
+          #
+          # git status runs as its OWN bare assignment, not inside the pipe
+          # below — `set -e` catches a bare `var=$(cmd)` assignment that
+          # fails, but a blanket `|| true` on the end of a longer pipe would
+          # swallow a git-status failure (a corrupted .git — a malicious
+          # lifecycle script run earlier in this same job could induce one,
+          # e.g. by removing .git/HEAD or .git/objects; a merely-missing
+          # index doesn't reach this path, since git just rebuilds one and
+          # git status still succeeds) exactly as readily as it swallows
+          # grep's ordinary no-matches exit 1 — verified against a repo with
+          # .git/HEAD removed ("fatal: not a git repository", exit 128): the
+          # old single-pipe form produced an EMPTY $unexpected with a zero
+          # exit, i.e. a corrupted git state read as "nothing unexpected,"
+          # passing the one check this step exists to enforce.
+          # sed isn't given the same treatment: it has no external input or
+          # adversarial surface here (a fixed substitution over text git
+          # status already produced), so its own failure isn't independently
+          # reachable the way git status's is.
+          status_all=$(git status --porcelain --untracked-files=all)
+          unexpected=$(printf '%s\n' "$status_all" \
             | sed 's/^...//' \
             | grep -Ev '^(package\.json|package-lock\.json|checks\.md|deps-stat\.txt)$' || true)
           if [ -n "$unexpected" ]; then
@@ -344,7 +363,12 @@ jobs:
           # The allowlist is build OUTPUTS. A repo whose build leaves other
           # ignored paths behind needs its own copy of this workflow until this
           # list becomes an input — see AGENTS.md "The extraction".
-          planted=$(git status --porcelain --ignored \
+          #
+          # Same reason as the git status call above: run bare, not inside
+          # the pipe that ends in `|| true`, so a genuine git-status failure
+          # trips `set -e` instead of being read as "no planted files."
+          status_ignored=$(git status --porcelain --ignored)
+          planted=$(printf '%s\n' "$status_ignored" \
             | grep '^!! ' \
             | sed 's/^!! //' \
             | grep -Ev '^(node_modules/|dist/|dist-ssr/|dev-dist/|coverage/|[^/]*\.tsbuildinfo)$' || true)
@@ -556,10 +580,27 @@ jobs:
           # would otherwise pick the identical fallback name a second time and
           # the non-force push would be rejected. run_attempt increments on
           # every retry, so the pair is unique across retries of one run too.
-          if git ls-remote --exit-code --heads "$remote" "$branch" >/dev/null 2>&1; then
+          # --exit-code's documented contract (git ls-remote -h) is exit 2
+          # for "no matching ref" — the ordinary, expected case here — and
+          # exit 0 when the branch exists. Any OTHER nonzero (128 on a real
+          # auth/network failure, verified against an actual bad-token
+          # request) means this lookup couldn't answer the question at all,
+          # not that the branch is absent; treating it as "absent" would
+          # keep the primary name and let the non-force push below fail
+          # blind on a branch that may genuinely already exist, or paper
+          # over a connectivity problem the push and PR-open calls just
+          # below depend on too. rc=$? right after `|| rc=$?`, not a
+          # separate statement, so set -e doesn't kill the script before
+          # the code is captured.
+          ls_remote_rc=0
+          git ls-remote --exit-code --heads "$remote" "$branch" >/dev/null 2>&1 || ls_remote_rc=$?
+          if [ "$ls_remote_rc" -eq 0 ]; then
             branch="$branch-run${RUN_NUMBER}-${RUN_ATTEMPT}"
             echo "Today's branch already exists; using $branch instead." \
               >> "$GITHUB_STEP_SUMMARY"
+          elif [ "$ls_remote_rc" -ne 2 ]; then
+            echo "::error::Could not check whether $branch already exists on the remote (git ls-remote exited $ls_remote_rc, expected 0 or 2) — stopping rather than guessing."
+            exit 1
           fi
 
           # Belt and braces. This runner is fresh and nothing has run on it, so
