@@ -141,6 +141,21 @@ function parseWorkflowYaml(text) {
     if (s.startsWith("&") || s.startsWith("*")) {
       throw new Error(`yaml-lite: anchors/aliases are not supported (got ${JSON.stringify(s)})`);
     }
+    if (s.startsWith("{") && s.endsWith("}")) {
+      // An empty flow mapping ("permissions: {}", least-privilege workflows'
+      // standard idiom, is this repo's own real usage) is unambiguous and
+      // costs nothing to support. A NON-empty one ("{ a: 1, b: 2 }") is out
+      // of this parser's scope (see the file header) — reachable both as a
+      // plain mapping value and as a sequence item's scalar ("- { a: 1 }"
+      // falls through the "- key: value" check above, since its rest starts
+      // with "{" rather than a bare key, straight into this function).
+      // Throwing for the non-empty case covers both call sites from one
+      // place instead of guessing at its structure and returning something
+      // wrong.
+      const inner = s.slice(1, -1).trim();
+      if (inner === "") return {};
+      throw new Error(`yaml-lite: flow mappings are not supported (got ${JSON.stringify(s)})`);
+    }
     if (/^-?\d+$/.test(s)) return parseInt(s, 10);
     if (/^-?\d+\.\d+$/.test(s)) return parseFloat(s);
     if (s.startsWith("'") && s.endsWith("'") && s.length >= 2) {

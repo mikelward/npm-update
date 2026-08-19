@@ -316,27 +316,69 @@ describe("npm-update reusable workflow", () => {
     // ALREADY-PARSED `run` string sidesteps that whole class of fragility —
     // there is no block boundary to guess at, because the parser found it.
     let runStepCount = 0;
-    let commentLinesSeen = 0;
     for (const step of allSteps) {
       if (typeof step.run !== "string") continue;
       runStepCount++;
       // Comment lines (bash `#`, never executed) may reference the literal
       // `${{ }}` syntax to explain WHY the code below routes it through
-      // env: instead — several of the fixes in this very file do exactly
-      // that. Only executable lines are checked.
+      // env: instead. Only executable lines are checked here — the sibling
+      // test right below this one covers the one shape of comment text
+      // that this carve-out must NOT excuse (an empty expression, which
+      // GitHub evaluates regardless of bash comment semantics).
       for (const line of step.run.split("\n")) {
-        if (/^\s*#/.test(line)) {
-          if (line.includes("${{")) commentLinesSeen++;
-          continue;
-        }
+        if (/^\s*#/.test(line)) continue;
         expect(line).not.toMatch(/\$\{\{/);
       }
     }
     expect(runStepCount).toBeGreaterThan(10);
-    // Proves the comment carve-out is actually exercised, not just present
-    // for a case that never occurs — a carve-out nothing hits could hide a
-    // real gap in the check.
-    expect(commentLinesSeen).toBeGreaterThan(0);
+  });
+
+  it("the comment carve-out above doesn't mask a real splice on a non-comment line", () => {
+    // Proves the carve-out is doing the narrow thing it claims — skipping
+    // ONLY genuine `#`-comment lines — rather than silently swallowing
+    // something broader. A synthetic fixture rather than a real step's run:
+    // text, so this stays true regardless of whether the real workflow
+    // still happens to carry a comment mentioning the syntax (it doesn't,
+    // right now — the one that did was reworded to avoid the literal empty
+    // expression the sibling test below guards against).
+    const fixtureDoc = parseWorkflowYaml(
+      "jobs:\n  x:\n    steps:\n      - run: |\n          # references ${{ steps.x.outputs.y }} in prose\n          echo ok\n",
+    );
+    const lines = fixtureDoc.jobs.x.steps[0].run.split("\n");
+    // Sanity: the fixture really does carry a `${{` on a comment line and
+    // NOT on any executable line — otherwise this test would pass no
+    // matter what the sweep logic below does.
+    expect(lines.some((l) => /^\s*#/.test(l) && l.includes("${{"))).toBe(true);
+    expect(lines.some((l) => !/^\s*#/.test(l) && l.trim() !== "" && l.includes("${{"))).toBe(false);
+    // The sweep's own skip-comment-lines logic, applied to this fixture:
+    // must not throw/flag anything, since the only `${{` present is on a
+    // skipped comment line.
+    for (const line of lines) {
+      if (/^\s*#/.test(line)) continue;
+      expect(line).not.toMatch(/\$\{\{/);
+    }
+  });
+
+  it("never contains an empty (or whitespace-only) expression anywhere in a run: script, comments included", () => {
+    // A DIFFERENT failure mode than the sweep above, and deliberately NOT
+    // skipping comment lines this time: GitHub evaluates `${{ ... }}`
+    // syntax across a run: step's ENTIRE string value before the shell
+    // ever runs, including text that bash would treat as a `#` comment —
+    // comments are only special to bash, not to GitHub's own
+    // expression-substitution pass over the YAML string. A comment
+    // mentioning the literal syntax as `${{ }}` (empty) is exactly the
+    // false pass the comment carve-out above would otherwise hide: it
+    // reads as an actual (if degenerate) expression to GitHub, which can
+    // reject the whole workflow file as invalid — breaking every consumer
+    // on `@main`, not just this one job. Only an empty/all-whitespace
+    // expression is checked here, not every occurrence of the syntax,
+    // because a comment naming a REAL field (`${{ steps.x.outputs.y }}`)
+    // still evaluates to something and doesn't break parsing — degenerate
+    // and merely-confusing are different bugs.
+    for (const step of allSteps) {
+      if (typeof step.run !== "string") continue;
+      expect(step.run).not.toMatch(/\$\{\{\s*\}\}/);
+    }
   });
 
   it("routes the identified injection-risk values through env:, not a with: input", () => {
