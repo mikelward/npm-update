@@ -56,6 +56,8 @@ jobs:
       base: ${{ steps.base.outputs.sha }}
       pkg_sha: ${{ steps.changed.outputs.pkg_sha }}
       lock_sha: ${{ steps.changed.outputs.lock_sha }}
+      checks_sha: ${{ steps.checks.outputs.checks_sha }}
+      deps_stat_sha: ${{ steps.checks.outputs.deps_stat_sha }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -172,6 +174,19 @@ jobs:
             # afterwards can reach back and change it.
             echo "pkg_sha=$(sha256sum package.json | cut -d" " -f1)" >> "$GITHUB_OUTPUT"
             echo "lock_sha=$(sha256sum package-lock.json | cut -d" " -f1)" >> "$GITHUB_OUTPUT"
+            # deps-stat.txt itself gets the SAME treatment below, one step
+            # output at a time: the file above is a predictable, allowlisted
+            # path (the tree-verification step has to accept it, since this
+            # job writes it legitimately), so a lifecycle or build script
+            # later in this job could overwrite it with arbitrary content
+            # that then lands in the PR body unnoticed. Captured here too, so
+            # the check-suite step below can rewrite the file from this
+            # trusted copy once every check has finished running.
+            {
+              echo 'deps_stat<<DEPS_STAT_EOF'
+              cat deps-stat.txt
+              echo 'DEPS_STAT_EOF'
+            } >> "$GITHUB_OUTPUT"
             git diff --stat -- package.json package-lock.json >> "$GITHUB_STEP_SUMMARY"
           fi
 
@@ -187,19 +202,36 @@ jobs:
       - name: Run the full check suite
         if: steps.changed.outputs.changed == 'true'
         id: checks
+        env:
+          # Passed as an env var, not interpolated directly into the script
+          # below via ${{ }} — the same template-injection shape as any other
+          # untrusted-looking expression, even though this particular value
+          # is trusted (captured before any dependency code ran). Safe habit,
+          # cheap to keep.
+          DEPS_STAT: ${{ steps.changed.outputs.deps_stat }}
         run: |
           set +e
           failed=0
-          : > checks.md
+          # Accumulated in a shell variable, not appended to checks.md as
+          # each check finishes. checks.md is a predictable, allowlisted
+          # path (the tree-verification step below has to accept it, since
+          # this job writes it legitimately) — appending to it DURING the
+          # loop would let a lifecycle or build script overwrite or extend
+          # it with arbitrary content while later checks still trusted it,
+          # and that content lands in the PR body unread. Keeping the report
+          # in memory until every check has finished, then writing the file
+          # ONCE below, means nothing dependency code does mid-loop can
+          # survive into the file at all.
+          report=""
           check() {
             echo "::group::$1"
             eval "$1"
             rc=$?
             echo '::endgroup::'
             if [ $rc -eq 0 ]; then
-              echo "- ✅ \`$1\`" >> checks.md
+              report="${report}- ✅ \`$1\`"$'\n'
             else
-              echo "- ❌ \`$1\` (exit $rc)" >> checks.md
+              report="${report}- ❌ \`$1\` (exit $rc)"$'\n'
               failed=1
             fi
           }
@@ -214,6 +246,30 @@ jobs:
           check 'npm run lint'
           check 'npm test'
           check 'npm run build'
+          # Both report files written for the first time HERE, now that every
+          # check has run — checks.md from the in-memory report above,
+          # deps-stat.txt from the step output captured before any dependency
+          # code ran. Either write clobbers whatever a lifecycle or build
+          # script may have planted at these paths during the checks above.
+          printf '%s' "$report" > checks.md
+          # \n restored: the multiline GITHUB_OUTPUT capture that produced
+          # $DEPS_STAT strips exactly the one trailing newline `git diff
+          # --stat` always ends with (the value is the joined content
+          # lines, with no newline after the last one). Losing it here would
+          # put the PR body's closing ``` fence on the diffstat's last line
+          # instead of its own, breaking the code block for everything after.
+          printf '%s\n' "$DEPS_STAT" > deps-stat.txt
+          # Both files just got their real, final content — fingerprint them
+          # now, the same way pkg_sha/lock_sha were fingerprinted right after
+          # the resolve step. Every check above ran dependency code in THIS
+          # job; a lifecycle script's background process could still be
+          # alive and rewrite either file on disk before upload-artifact
+          # reads it. A step OUTPUT is out of that process's reach (it lives
+          # in the runner's control plane, not the filesystem), and the
+          # publish job — a fresh runner that never executes dependency code
+          # — verifies the downloaded artifact against it below.
+          echo "checks_sha=$(sha256sum checks.md | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          echo "deps_stat_sha=$(sha256sum deps-stat.txt | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
           cat checks.md >> "$GITHUB_STEP_SUMMARY"
           if [ $failed -eq 0 ]; then
             echo 'passed=true' >> "$GITHUB_OUTPUT"
@@ -368,6 +424,16 @@ jobs:
             || { echo '::error::package.json does not match what the update job resolved.'; exit 1; }
           [ "$(sha256sum package-lock.json | cut -d" " -f1)" = "${{ needs.update.outputs.lock_sha }}" ] \
             || { echo '::error::package-lock.json does not match what the update job resolved.'; exit 1; }
+          # checks.md and deps-stat.txt get the same treatment: both are
+          # written into the PR body below, unread, and both crossed through
+          # the same machine that ran dependency code before reaching this
+          # artifact — a background process there could have rewritten
+          # either after the update job's own fingerprinting step ran and
+          # before upload-artifact captured them.
+          [ "$(sha256sum checks.md | cut -d" " -f1)" = "${{ needs.update.outputs.checks_sha }}" ] \
+            || { echo '::error::checks.md does not match what the update job wrote.'; exit 1; }
+          [ "$(sha256sum deps-stat.txt | cut -d" " -f1)" = "${{ needs.update.outputs.deps_stat_sha }}" ] \
+            || { echo '::error::deps-stat.txt does not match what the update job wrote.'; exit 1; }
 
       # The authoritative check on what this commit contains, and the reason
       # it lives HERE: everything the update job asserted about the manifests,
