@@ -378,13 +378,30 @@ function parseWorkflowYaml(text) {
       if (rest.trim() === "") {
         const next = peek();
         result.push(next && next.indent > indent ? parseNode(next.indent) : null);
-      } else if (/^("(?:[^"\\]|\\.)*"|'(?:[^']|'')*'|[A-Za-z0-9_.\-]+):( |$)/.test(rest)) {
-        // "- key: value" — an inline mapping item. Its siblings (if any)
-        // are indented past the dash itself, i.e. past where `rest` starts.
-        const siblingIndent = indent + (line.content.length - rest.length);
-        result.push(parseInlineMappingItem(rest, siblingIndent, line.rawIndex));
       } else {
-        result.push(parseScalar(rest));
+        // "- " only ever strips exactly ONE separation space (the ": "
+        // between dash and content is fixed, but YAML allows more than one
+        // there — "-   run: echo hi" is valid, three spaces after the
+        // dash). Any leftover leading whitespace made the mapping regex
+        // below (anchored with ^, no leading-whitespace tolerance) fail to
+        // match a real "key: value" item, so it fell through to parseScalar
+        // and returned the whole thing as a plain string ("run: echo hi")
+        // instead of a mapping. Verified against yaml.safe_load, which
+        // parses it as {'run': 'echo hi'}. restTrimmed is used only to
+        // classify and to parse the mapping's first line; siblingIndent is
+        // computed from restTrimmed's own length (not rest's), so it still
+        // lands exactly where the key actually starts, however many
+        // separation spaces preceded it.
+        const restTrimmed = rest.replace(/^ +/, "");
+        if (/^("(?:[^"\\]|\\.)*"|'(?:[^']|'')*'|[A-Za-z0-9_.\-]+):( |$)/.test(restTrimmed)) {
+          // "- key: value" — an inline mapping item. Its siblings (if any)
+          // are indented past the dash itself, i.e. past where the key
+          // actually starts.
+          const siblingIndent = indent + (line.content.length - restTrimmed.length);
+          result.push(parseInlineMappingItem(restTrimmed, siblingIndent, line.rawIndex));
+        } else {
+          result.push(parseScalar(rest));
+        }
       }
     }
     return result;
