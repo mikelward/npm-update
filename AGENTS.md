@@ -62,7 +62,13 @@ has stopped biting.
   consumer's workflow runs is the source here, which is what makes an unpinned
   `@main` reference reviewable by reading it. `vitest-shim.mjs` exists so the
   suite ported from the consumers runs under `node --test` without installing
-  anything; extending the shim beats adding a test framework.
+  anything; extending the shim beats adding a test framework. `yaml-lite.js`
+  (ported from `mikelward/ci-commit-artifact`, dependency-free itself) is the
+  same kind of addition — a minimal YAML-subset parser for the specific class
+  of check a regex over raw text can't do reliably, like "no `${{ }}`
+  expression is spliced into any `run:` script anywhere in the workflow." Use
+  it there and leave the rest of the suite's regex-based assertions alone;
+  they're not fragile the way that one was.
 
 ## Testing
 

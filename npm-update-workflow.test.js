@@ -6,12 +6,23 @@
 // this file only knows what the reusable workflow itself does.
 //
 // Ported from gedmap's original self-contained npm-update.test.js, which
-// tested the workflow before extraction. Asserted with regexes, not a YAML
-// parser, for the same reason check-npm-update.mjs's own tests are: this
-// repository ships neither on purpose.
+// tested the workflow before extraction. Most assertions here are regexes
+// over the raw text rather than a real YAML parser, matching
+// check-npm-update.mjs's own style — cheap, direct, and this repository
+// still ships no dependencies to run one with. yaml-lite.js (ported from
+// mikelward/ci-commit-artifact) is the one exception: it exists
+// specifically for checks a regex can't do reliably, like "no `${{ }}`
+// expression is spliced into any run: script anywhere in the workflow" —
+// telling a run: line from an env: declaration or a with: input by regex
+// alone took several rounds of narrow exclusions and was still one
+// legitimate YAML shape away from a false positive. Reach for it the same
+// way: only where the regex approach has already shown it can't tell the
+// difference reliably, not as a wholesale replacement for the tests below
+// that already work.
 
 import { describe, it, expect } from "./vitest-shim.mjs";
 import { existsSync, readFileSync } from "node:fs";
+import { parseWorkflowYaml } from "./yaml-lite.js";
 
 const workflow = readFileSync(".github/workflows/npm-update.yml", "utf8");
 
@@ -20,6 +31,9 @@ const update = workflow.slice(
   workflow.indexOf("  publish:"),
 );
 const publish = workflow.slice(workflow.indexOf("  publish:"));
+
+const doc = parseWorkflowYaml(workflow);
+const allSteps = [...doc.jobs.update.steps, ...doc.jobs.publish.steps];
 
 describe("npm-update reusable workflow", () => {
   it("is a workflow_call reusable workflow with no privileges of its own", () => {
@@ -90,6 +104,20 @@ describe("npm-update reusable workflow", () => {
     expect(update).toMatch(/sha256sum package-lock\.json/);
     expect(update).toContain('"lock_sha=');
     expect(publish).toContain("needs.update.outputs.lock_sha");
+  });
+
+  it("routes the manifest fingerprints through env: in the update job's own verify step too", () => {
+    // steps.changed.outputs.pkg_sha/lock_sha are compared against a fresh
+    // sha256sum in the SAME job that ran dependency code, so this isn't
+    // closing an injection that job's own code couldn't reach some other
+    // way — it's the same zizmor-clean habit kept uniform rather than only
+    // applied where the blast radius differs. The structural sweep above
+    // already proves this step's run: has no splice at all; this confirms
+    // the specific env: entries these two comparisons rely on are present.
+    expect(update).toContain("PKG_SHA: ${{ steps.changed.outputs.pkg_sha }}");
+    expect(update).toContain("LOCK_SHA: ${{ steps.changed.outputs.lock_sha }}");
+    expect(update).toContain('!= "$PKG_SHA"');
+    expect(update).toContain('!= "$LOCK_SHA"');
   });
 
   it("fingerprints checks.md and deps-stat.txt the same way, and verifies both in the publish job", () => {
@@ -265,22 +293,74 @@ describe("npm-update reusable workflow", () => {
     );
   });
 
-  it("never splices an update-job output straight into a run: script", () => {
-    // `needs.update.outputs.*` all originate in a job that runs `npm update`
-    // — arbitrary dependency lifecycle code. `${{ }}` substitution happens
-    // at workflow-parse time, before the shell runs, so splicing one of
-    // these directly into script text turns an untrusted string into literal
-    // shell source: a value containing a quote and shell operators escapes
-    // whatever comparison it was meant to be part of and runs with this
-    // job's write-scoped GH_TOKEN. Every one of these outputs must only
-    // reach a `run:` step via an `env:` variable (inert data, never parsed
-    // as script) — this asserts none of them appear directly after `run: |`.
-    // `ref: ${{ needs.update.outputs.base }}` is the one exception: that's
-    // an actions/checkout `with:` input, not shell, so it's excluded.
-    const runBlocks = publish.match(/run: \|\n(?:.*\n)*?(?=\n {6}-|\n {2}\S|$)/g) ?? [];
-    for (const block of runBlocks) {
-      expect(block).not.toMatch(/\$\{\{\s*needs\.update\.outputs\./);
+  it("never splices ANY ${{ }} expression into any step's run: script, in either job", () => {
+    // `${{ }}` substitution happens at workflow-parse time, before the
+    // shell runs — splicing ANY expression directly into script text turns
+    // its value into literal shell source. Some sources here are genuinely
+    // untrusted (needs.update.outputs.* — see the trust-model tests below),
+    // others merely trusted-but-still-risky-as-a-habit
+    // (github.event.repository.default_branch, github.repository,
+    // github.repository_owner) — a spliced value in the second group also
+    // breaks on a shell-special character the source could legitimately
+    // contain (an apostrophe in a branch name, an owner login), which is a
+    // correctness bug independent of trust. Every expression must instead
+    // reach its shell only through an env: variable (inert data, never
+    // parsed as script).
+    //
+    // Using the real parser rather than a regex over raw text is the point
+    // here: a regex trying to tell "this line is inside a run: block" from
+    // "this line is an env: declaration or a with: input" needed several
+    // rounds of narrow, ad hoc exclusions (ref:, group:, an ALL-CAPS env
+    // key…) and was still only ever one new YAML shape away from a false
+    // positive. Walking doc.jobs.*.steps and reading each step's own
+    // ALREADY-PARSED `run` string sidesteps that whole class of fragility —
+    // there is no block boundary to guess at, because the parser found it.
+    let runStepCount = 0;
+    let commentLinesSeen = 0;
+    for (const step of allSteps) {
+      if (typeof step.run !== "string") continue;
+      runStepCount++;
+      // Comment lines (bash `#`, never executed) may reference the literal
+      // `${{ }}` syntax to explain WHY the code below routes it through
+      // env: instead — several of the fixes in this very file do exactly
+      // that. Only executable lines are checked.
+      for (const line of step.run.split("\n")) {
+        if (/^\s*#/.test(line)) {
+          if (line.includes("${{")) commentLinesSeen++;
+          continue;
+        }
+        expect(line).not.toMatch(/\$\{\{/);
+      }
     }
+    expect(runStepCount).toBeGreaterThan(10);
+    // Proves the comment carve-out is actually exercised, not just present
+    // for a case that never occurs — a carve-out nothing hits could hide a
+    // real gap in the check.
+    expect(commentLinesSeen).toBeGreaterThan(0);
+  });
+
+  it("routes the identified injection-risk values through env:, not a with: input", () => {
+    // The structural sweep above proves NO run: script splices an
+    // expression, anywhere — this proves the specific values known to have
+    // needed fixing still reach their step the intended way, so a future
+    // refactor that quietly drops one of these env: entries (while somehow
+    // still passing the sweep above, e.g. by deleting the shell usage too)
+    // doesn't go unnoticed. `publish` legitimately contains
+    // `needs.update.outputs.*` in its env: declarations (that's the safe
+    // location), so this checks for those declarations directly rather
+    // than asserting their absence from the whole job text.
+    expect(publish).toContain("PASSED: ${{ needs.update.outputs.passed }}");
+    expect(publish).toContain("EXPECTED_BASE: ${{ needs.update.outputs.base }}");
+    expect(publish).toContain("PKG_SHA: ${{ needs.update.outputs.pkg_sha }}");
+    expect(publish).toContain("LOCK_SHA: ${{ needs.update.outputs.lock_sha }}");
+    expect(workflow).toContain("DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}");
+    expect(workflow).toContain('branch="$DEFAULT_BRANCH"');
+    expect(workflow).toContain('--base "$DEFAULT_BRANCH"');
+    expect(workflow).toContain("${GITHUB_REPOSITORY}");
+    expect(workflow).toContain('reviewer="$GITHUB_REPOSITORY_OWNER"');
+    expect(workflow).toContain("RUN_NUMBER: ${{ github.run_number }}");
+    expect(workflow).toContain("RUN_ATTEMPT: ${{ github.run_attempt }}");
+    expect(workflow).toContain('branch="$branch-run${RUN_NUMBER}-${RUN_ATTEMPT}"');
   });
 
   it("fails closed on an unexpected 'passed' value instead of falling through", () => {
@@ -323,9 +403,13 @@ describe("npm-update reusable workflow", () => {
   it("puts the PR in front of a human, derived from the consumer's own owner", () => {
     expect(publish).toContain("--add-assignee");
     expect(publish).toContain("--add-reviewer");
-    // Derived from the caller's repository_owner, not a hard-coded handle,
-    // so this file stays identical across every consumer.
-    expect(publish).toContain("github.repository_owner");
+    // Derived from the runner's own $GITHUB_REPOSITORY_OWNER, not a
+    // hard-coded handle, so this file stays identical across every
+    // consumer — and never a spliced ${{ github.repository_owner }},
+    // which zizmor flags and which breaks on an owner login containing a
+    // shell-special character.
+    expect(publish).toContain('reviewer="$GITHUB_REPOSITORY_OWNER"');
+    expect(publish).not.toMatch(/\$\{\{\s*github\.repository_owner\s*\}\}/);
     expect(publish).toMatch(/if ! gh pr edit .*--add-assignee/);
   });
 
@@ -339,9 +423,7 @@ describe("npm-update reusable workflow", () => {
     // retried more than once would pick this fallback's identical name a
     // second time and the non-force push would be rejected. run_attempt
     // increments on each retry, so the pair stays unique.
-    expect(publish).toContain(
-      '"$branch-run${{ github.run_number }}-${{ github.run_attempt }}"',
-    );
+    expect(publish).toContain('"$branch-run${RUN_NUMBER}-${RUN_ATTEMPT}"');
   });
 
   it("keeps the validator and its tests present in this repository", () => {
