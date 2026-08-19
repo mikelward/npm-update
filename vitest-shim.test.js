@@ -85,6 +85,25 @@ describe("expect", () => {
     fails(() => expect(3).toBeLessThan(2));
   });
 
+  it("compares numerically with toBeGreaterThan", () => {
+    expect(2).toBeGreaterThan(1);
+    fails(() => expect(2).toBeGreaterThan(2));
+    fails(() => expect(1).toBeGreaterThan(2));
+  });
+
+  it("compares numerically with toBeGreaterThanOrEqual", () => {
+    expect(2).toBeGreaterThanOrEqual(1);
+    expect(2).toBeGreaterThanOrEqual(2);
+    fails(() => expect(1).toBeGreaterThanOrEqual(2));
+  });
+
+  it("refuses containment with not.toContain", () => {
+    expect("abcdef").not.toContain("xyz");
+    expect([1, 2, 3]).not.toContain(9);
+    fails(() => expect("abcdef").not.toContain("cde"));
+    fails(() => expect([1, 2, 3]).not.toContain(2));
+  });
+
   it("matches named fields only with toMatchObject", () => {
     expect({ a: 1, b: 2 }).toMatchObject({ a: 1 });
     expect({ a: { b: 1, c: 2 } }).toMatchObject({ a: { b: 1 } });
