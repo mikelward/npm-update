@@ -92,6 +92,41 @@ describe("npm-update reusable workflow", () => {
     expect(publish).toContain("needs.update.outputs.lock_sha");
   });
 
+  it("fingerprints checks.md and deps-stat.txt the same way, and verifies both in the publish job", () => {
+    // Both files are written into the PR body unread, and both cross
+    // through the same machine that ran dependency code — a background
+    // process there could rewrite either between the write and
+    // upload-artifact reading it, same risk the manifest fingerprints
+    // guard against.
+    expect(update).toContain('"checks_sha=');
+    expect(update).toContain('"deps_stat_sha=');
+    expect(update).toMatch(/sha256sum checks\.md/);
+    expect(update).toMatch(/sha256sum deps-stat\.txt/);
+    expect(publish).toContain("needs.update.outputs.checks_sha");
+    expect(publish).toContain("needs.update.outputs.deps_stat_sha");
+    expect(publish).toContain("checks.md does not match what the update job wrote");
+    expect(publish).toContain("deps-stat.txt does not match what the update job wrote");
+  });
+
+  it("fingerprints checks.md and deps-stat.txt only after every check has finished, not before", () => {
+    const lastCheckIdx = update.lastIndexOf("check 'npm run build'");
+    const checksShaIdx = update.indexOf("checks_sha=$(sha256sum");
+    const depsStatShaIdx = update.indexOf("deps_stat_sha=$(sha256sum");
+    expect(lastCheckIdx).toBeGreaterThan(-1);
+    expect(checksShaIdx).toBeGreaterThan(lastCheckIdx);
+    expect(depsStatShaIdx).toBeGreaterThan(lastCheckIdx);
+  });
+
+  it("restores the trailing newline the multiline GITHUB_OUTPUT capture strips from deps-stat.txt", () => {
+    // `git diff --stat` always ends its output with a newline, but the
+    // deps_stat<<EOF ... EOF multiline capture in GITHUB_OUTPUT joins
+    // content lines without a trailing one — printf '%s' would silently
+    // drop it a second time, putting the PR body's closing ``` fence on the
+    // diffstat's own last line instead of after it.
+    expect(update).toContain('printf \'%s\\n\' "$DEPS_STAT" > deps-stat.txt');
+    expect(update).not.toContain('printf \'%s\' "$DEPS_STAT" > deps-stat.txt');
+  });
+
   it("validates the manifest contents from a job that ran no dependency code", () => {
     // The canonical checker is fetched from THIS repository at @main, into
     // a subdirectory, and invoked from there — not a consumer-local
@@ -170,6 +205,33 @@ describe("npm-update reusable workflow", () => {
   it("never force-pushes", () => {
     expect(publish).not.toMatch(/git push[^\n]*(--force|(?<!\w)-f(?!\w))/);
     expect(publish).toContain("git ls-remote");
+  });
+
+  it("writes checks.md and deps-stat.txt only after every check has finished", () => {
+    // Both are predictable, allowlisted paths in the tree-verification step
+    // below (this job legitimately writes them) -- so incremental writes to
+    // either one DURING the checks could be overwritten or extended by a
+    // lifecycle or build script, and that content lands straight in the PR
+    // body. checks.md must come from an in-memory report, written once,
+    // after all four checks; deps-stat.txt must be captured as a step
+    // output BEFORE any check runs and rewritten from that trusted value at
+    // the same point, not left as the plain file a script could reach.
+    expect(update).not.toContain(">> checks.md");
+    const lastCheckIdx = update.lastIndexOf("check 'npm run build'");
+    const checksWriteIdx = update.indexOf('printf \'%s\' "$report" > checks.md');
+    const statWriteIdx = update.indexOf('printf \'%s\\n\' "$DEPS_STAT" > deps-stat.txt');
+    expect(lastCheckIdx).toBeGreaterThan(-1);
+    expect(checksWriteIdx).toBeGreaterThan(lastCheckIdx);
+    expect(statWriteIdx).toBeGreaterThan(lastCheckIdx);
+    // The trusted source for deps-stat.txt's rewrite: captured as a step
+    // output in the SAME step that first computes it (before checks run),
+    // and passed to the check-suite step via env: rather than interpolated
+    // directly into the script -- the same template-injection shape as any
+    // other ${{ }} expression, even though this particular value is trusted.
+    expect(update).toContain("deps_stat<<DEPS_STAT_EOF");
+    expect(update).toContain("DEPS_STAT: ${{ steps.changed.outputs.deps_stat }}");
+    const captureIdx = update.indexOf("deps_stat<<DEPS_STAT_EOF");
+    expect(captureIdx).toBeLessThan(update.indexOf("Run the full check suite"));
   });
 
   it("keeps the write token out of the job that runs dependency code", () => {
