@@ -113,6 +113,27 @@ describe("zizmor workflow", () => {
   });
 });
 
+describe("npm-update.yml's own zizmor suppression", () => {
+  const npmUpdateWorkflow = readFileSync(".github/workflows/npm-update.yml", "utf8");
+
+  it("suppresses the adhoc-packages finding on the npm-floor step, with its rationale in the comment", () => {
+    // The only step that legitimately installs a package outside the
+    // lockfile: raising the RUNNER'S OWN npm to satisfy .npmrc's
+    // min-release-age floor, derived from engines.npm at run time rather
+    // than pinned here. Zizmor's own docs require the ignore comment to be
+    // identifiable as a genuine YAML comment, not text inside the block
+    // scalar's own string content (a comment on a line INSIDE the `run: |`
+    // block is data, not a YAML comment, and zizmor would not see it) — so
+    // this asserts it sits on its own comment line immediately before
+    // `run: |`, still part of the step's mapping, not just present
+    // somewhere in the file. Verified empirically against the real zizmor
+    // binary (v1.29.0): this exact placement suppresses the finding.
+    expect(npmUpdateWorkflow).toMatch(
+      /name: Ensure an npm that honors the \.npmrc cooldown\n\s*# zizmor: ignore\[adhoc-packages\][^\n]*\n(?:\s*#[^\n]*\n)*\s*run: \|\n\s*set -euo pipefail\n\s*floor=\$\(node -p "require\('\.\/package\.json'\)\.engines\.npm/,
+    );
+  });
+});
+
 describe("zizmor policy", () => {
   it("holds the pin-policy table exact", () => {
     // `@main` is the release for the enumerated sibling actions, official
