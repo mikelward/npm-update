@@ -69,6 +69,26 @@ test("parses a block sequence of mappings (- key: value siblings)", () => {
   assert.equal(doc.steps[1].name, "two");
 });
 
+test("parses a '- key: value' sequence item with MORE than one separation space after the dash", () => {
+  // "- " only strips exactly one separation space when computing `rest`;
+  // real YAML allows more than one there ("-   run: echo hi" is valid,
+  // verified against yaml.safe_load -> {'run': 'echo hi'}). The leftover
+  // leading whitespace previously made the inline-mapping-detection regex
+  // (anchored with ^, no leading-whitespace tolerance) fail to match, so
+  // the item fell through to parseScalar and returned the whole line as a
+  // plain string ("run: echo hi") instead of a mapping — the exact false
+  // pass a structural "does this step have a run: property" sweep would
+  // miss entirely, since the parsed item has no run property to inspect.
+  const doc = parseWorkflowYaml("steps:\n  -   run: echo hi\n");
+  assert.deepEqual(doc.steps, [{ run: "echo hi" }]);
+  // A multi-key sibling after the extra dash spacing must still land at
+  // the CORRECT indent (computed from where the key actually starts, not
+  // from the old fixed "- " offset) — regression coverage for getting the
+  // indent math right, not just the classification.
+  const doc2 = parseWorkflowYaml("steps:\n  -   name: x\n      run: echo hi\n");
+  assert.deepEqual(doc2.steps, [{ name: "x", run: "echo hi" }]);
+});
+
 test("parses a block sequence item that is itself a nested mapping block", () => {
   const doc = parseWorkflowYaml(
     "steps:\n  -\n    name: one\n    with:\n      key: value\n",
