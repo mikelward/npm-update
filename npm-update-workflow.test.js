@@ -342,6 +342,13 @@ describe("npm-update reusable workflow", () => {
     expect(!!verdictStep).toBe(true);
     expect(verdictStep.name).toContain("Derive the check verdict");
 
+    const ALL_PASSED =
+      "- ✅ `npm ci`\n- ✅ `npm run lint`\n- ✅ `npm test`\n- ✅ `npm run build`\n";
+    const ONE_FAILED =
+      "- ✅ `npm ci`\n- ✅ `npm run lint`\n- ❌ `npm test` (exit 1)\n- ✅ `npm run build`\n";
+    const ALL_FAILED =
+      "- ❌ `npm ci` (exit 1)\n- ❌ `npm run lint` (exit 1)\n- ❌ `npm test` (exit 1)\n- ❌ `npm run build` (exit 1)\n";
+
     const tmp = mkdtempSync(join(tmpdir(), "npm-update-verdict-"));
     try {
       const runCase = (content) => {
@@ -356,12 +363,31 @@ describe("npm-update reusable workflow", () => {
         const m = out.match(/^passed=(true|false)$/m);
         return m ? m[1] : null;
       };
-      expect(runCase("- ✅ `npm ci`\n- ✅ `npm run lint`\n")).toBe("true");
-      expect(runCase("- ✅ `npm ci`\n- ❌ `npm test` (exit 1)\n")).toBe("false");
-      expect(runCase("- ❌ `npm ci` (exit 1)\n")).toBe("false");
+      expect(runCase(ALL_PASSED)).toBe("true");
+      expect(runCase(ONE_FAILED)).toBe("false");
+      expect(runCase(ALL_FAILED)).toBe("false");
       // Fails closed: empty or unrecognized content is never silently "true".
       expect(runCase("")).toBe("false");
       expect(runCase("not a real report\n")).toBe("false");
+      // A real Codex finding: merely finding one recognized "- ✅ " line
+      // isn't enough — a partial file containing only the first check's
+      // success line (e.g. a later check never got appended) must not
+      // read as "passed" just because nothing in it says "failed".
+      expect(runCase("- ✅ `npm ci`\n")).toBe("false");
+      // Same failure mode from the other direction: more lines than the
+      // suite actually runs must also be rejected, not silently accepted.
+      expect(runCase(ALL_PASSED + "- ✅ `npm run extra`\n")).toBe("false");
+      // A line that doesn't match check()'s exact format at all — garbage
+      // mixed in among otherwise-valid lines, not just a wholly-garbage file.
+      expect(runCase(ALL_PASSED.slice(0, -1) + " with junk\n")).toBe("false");
+      // The last line has no trailing newline: a plain `while read` loop
+      // silently drops (and never validates) an unterminated final line,
+      // which would let exactly this kind of smuggled content through.
+      expect(
+        runCase(
+          "- ✅ `npm ci`\n- ✅ `npm run lint`\n- ✅ `npm test`\nmalicious junk line",
+        ),
+      ).toBe("false");
     } finally {
       rmSync(tmp, { recursive: true, force: true });
     }
