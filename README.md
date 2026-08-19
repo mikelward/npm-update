@@ -56,3 +56,17 @@ the checks the update job itself ran — not a crash (the dispatch is
 non-fatal and the PR body says so), but CI never starts on the PR either.
 `codex-review-check.yml` needs no such input — it dispatches with no `-f`
 at all.
+
+Declaring the input isn't the whole job — anywhere `ci.yml` itself resolves
+"which PR is this run for" (naming it in a status check, a docs-lane gate
+like mikelward/lanes, a comment) has to read `inputs.pr` too, not only
+`github.event.pull_request.number`: that field is only populated on a real
+`pull_request` event and is empty on a dispatched run, so logic that reads
+it alone silently loses the PR on every dispatch even though the dispatch
+itself succeeds. Fall back to the input:
+
+```yaml
+pr: ${{ github.event.pull_request.number || inputs.pr }}
+```
+
+gedmap's own `ci.yml` follows this pattern for its mikelward/lanes gate.
