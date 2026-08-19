@@ -514,11 +514,13 @@ jobs:
       # PR title.
       #
       # Fails closed: an empty file, a line that doesn't match the exact
-      # format check() writes, or a check count that doesn't match what
-      # actually ran are all treated as failed, never silently passed.
-      # Merely finding one recognized "- ✅ " line isn't enough on its own —
-      # a partial or malformed file could contain exactly that and nothing
-      # else, and reading it as "passed" would miss whatever's missing.
+      # format check() writes, a check identity this workflow doesn't run,
+      # or any of the four expected checks appearing zero or more than once
+      # are all treated as failed, never silently passed. Neither "at least
+      # one recognized ✅ line" nor "exactly four canonical-looking lines"
+      # is enough on its own — a malformed report could satisfy either while
+      # substituting or duplicating a successful record in place of a real
+      # one (four copies of "- ✅ `npm ci`" passes a bare count check).
       - name: Derive the check verdict from checks.md, not the untrusted job's own report
         id: verdict
         run: |
@@ -528,13 +530,15 @@ jobs:
             echo 'passed=false' >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          # A named constant, not re-derived from the check '...' calls
-          # above: if that list ever grows or shrinks without this being
-          # updated too, the count check below fails closed (a clear, if
-          # noisy, error) rather than silently accepting a report that
-          # doesn't match what actually ran.
-          EXPECTED_CHECK_COUNT=4
-          count=0
+          # The exact commands check() runs above, not just a count. A named
+          # list rather than re-derived from the check '...' calls: if that
+          # list ever changes without this being updated too, an
+          # unrecognized identity below fails closed (a clear, if noisy,
+          # error) rather than silently accepting a report that doesn't
+          # match what actually ran.
+          EXPECTED_CHECKS=('npm ci' 'npm run lint' 'npm test' 'npm run build')
+          declare -A seen_count
+          for c in "${EXPECTED_CHECKS[@]}"; do seen_count["$c"]=0; done
           failed=0
           # `|| [ -n "$line" ]` picks up a final line with no trailing
           # newline — checks.md as this workflow writes it always ends in
@@ -543,22 +547,32 @@ jobs:
           # last line. Verified directly before writing this.
           while IFS= read -r line || [ -n "$line" ]; do
             [ -z "$line" ] && continue
-            count=$((count + 1))
-            if [[ "$line" =~ ^-\ ❌\ \`[^\`]+\`\ \(exit\ [0-9]+\)$ ]]; then
-              failed=1
-            elif [[ "$line" =~ ^-\ ✅\ \`[^\`]+\`$ ]]; then
-              :
+            if [[ "$line" =~ ^-\ ❌\ \`([^\`]+)\`\ \(exit\ [0-9]+\)$ ]]; then
+              cmd="${BASH_REMATCH[1]}"
+              is_failed=1
+            elif [[ "$line" =~ ^-\ ✅\ \`([^\`]+)\`$ ]]; then
+              cmd="${BASH_REMATCH[1]}"
+              is_failed=0
             else
               echo "::error::checks.md has a line that doesn't match the canonical check format — treating as failed rather than guessing: $line"
               echo 'passed=false' >> "$GITHUB_OUTPUT"
               exit 0
             fi
+            if [ -z "${seen_count[$cmd]+set}" ]; then
+              echo "::error::checks.md reports a check this workflow doesn't run — treating as failed rather than guessing: $cmd"
+              echo 'passed=false' >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            seen_count["$cmd"]=$((seen_count["$cmd"] + 1))
+            [ "$is_failed" -eq 1 ] && failed=1
           done < checks.md
-          if [ "$count" -ne "$EXPECTED_CHECK_COUNT" ]; then
-            echo "::error::checks.md reports $count check(s), expected $EXPECTED_CHECK_COUNT — treating as failed rather than guessing."
-            echo 'passed=false' >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
+          for c in "${EXPECTED_CHECKS[@]}"; do
+            if [ "${seen_count[$c]}" -ne 1 ]; then
+              echo "::error::checks.md reports '$c' ${seen_count[$c]} time(s), expected exactly 1 — treating as failed rather than guessing."
+              echo 'passed=false' >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          done
           if [ "$failed" -eq 1 ]; then
             echo 'passed=false' >> "$GITHUB_OUTPUT"
           else
