@@ -31,6 +31,31 @@ has stopped biting.
   reviewer, so a finding against a change made three times is the same finding
   three times, and two more chances to fix it in only some of them.
 
+## Trust model
+
+- **The update job runs untrusted code; the publish job is what actually
+  vouches for a commit.** `npm update` executes arbitrary lifecycle scripts
+  from whatever the batch resolves, so `update` never holds the write token
+  and `publish` — a fresh runner that installs nothing — is the only job that
+  pushes, gated on re-deriving the manifest diff itself and checking the
+  fingerprints `update` recorded before any install ran.
+- **`checks.md`, `deps-stat.txt`, and the `passed` gate share a residual gap
+  the manifests don't have.** All three are computed and fingerprinted
+  *inside* the same untrusted step that runs `npm update` — unlike
+  `package.json`/`package-lock.json`, whose fingerprints `publish`
+  independently verifies against a clean checkout. A sufficiently
+  sophisticated lifecycle script could in principle leave a detached
+  background process that waits for that step to write these files and their
+  fingerprints, then overwrites both together before the step's shell exits
+  (the runner only captures `GITHUB_OUTPUT` at that point). This can't get
+  malicious *code* merged — the manifests it would need to forge are checked
+  independently — but it could misrepresent the PR body's report or force
+  `passed=true` past the auto-merge gate on checks that actually failed.
+  Known, not yet closed: see `TODO.md`. Until it is, read `passed` and the PR
+  body's check results as evidence from the batch, not proof independently
+  established — the same posture the sibling per-repo copies already took
+  before this repository existed.
+
 ## What this repository must not grow
 
 - **No dependencies. No `package.json`, no lockfile, no build step.** What a
