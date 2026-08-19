@@ -418,11 +418,25 @@ jobs:
       # came across as job outputs, which live in the runner's control plane
       # rather than on that machine's disk.
       - name: Check the artifact against the pre-check fingerprints
+        env:
+          # These four fingerprints are job outputs from `update`, a job that
+          # runs `npm update` and therefore executes arbitrary dependency
+          # lifecycle code. `${{ }}` substitution happens at the workflow-parse
+          # level, before the shell ever runs — splicing an untrusted output
+          # straight into the script text (as this step used to) means a
+          # value containing a quote is script injection with this job's
+          # write-scoped token, not just a comparison that happens to fail.
+          # Routed through env: so they only ever reach the shell as inert
+          # data via a variable expansion.
+          PKG_SHA: ${{ needs.update.outputs.pkg_sha }}
+          LOCK_SHA: ${{ needs.update.outputs.lock_sha }}
+          CHECKS_SHA: ${{ needs.update.outputs.checks_sha }}
+          DEPS_STAT_SHA: ${{ needs.update.outputs.deps_stat_sha }}
         run: |
           set -euo pipefail
-          [ "$(sha256sum package.json | cut -d" " -f1)" = "${{ needs.update.outputs.pkg_sha }}" ] \
+          [ "$(sha256sum package.json | cut -d" " -f1)" = "$PKG_SHA" ] \
             || { echo '::error::package.json does not match what the update job resolved.'; exit 1; }
-          [ "$(sha256sum package-lock.json | cut -d" " -f1)" = "${{ needs.update.outputs.lock_sha }}" ] \
+          [ "$(sha256sum package-lock.json | cut -d" " -f1)" = "$LOCK_SHA" ] \
             || { echo '::error::package-lock.json does not match what the update job resolved.'; exit 1; }
           # checks.md and deps-stat.txt get the same treatment: both are
           # written into the PR body below, unread, and both crossed through
@@ -430,9 +444,9 @@ jobs:
           # artifact — a background process there could have rewritten
           # either after the update job's own fingerprinting step ran and
           # before upload-artifact captured them.
-          [ "$(sha256sum checks.md | cut -d" " -f1)" = "${{ needs.update.outputs.checks_sha }}" ] \
+          [ "$(sha256sum checks.md | cut -d" " -f1)" = "$CHECKS_SHA" ] \
             || { echo '::error::checks.md does not match what the update job wrote.'; exit 1; }
-          [ "$(sha256sum deps-stat.txt | cut -d" " -f1)" = "${{ needs.update.outputs.deps_stat_sha }}" ] \
+          [ "$(sha256sum deps-stat.txt | cut -d" " -f1)" = "$DEPS_STAT_SHA" ] \
             || { echo '::error::deps-stat.txt does not match what the update job wrote.'; exit 1; }
 
       # The authoritative check on what this commit contains, and the reason
@@ -454,20 +468,35 @@ jobs:
       - name: Stop if the default branch moved while the checks ran
         env:
           GH_TOKEN: ${{ github.token }}
+          # Another `update`-job output — same injection concern as the
+          # fingerprint step above, routed through env: for the same reason.
+          EXPECTED_BASE: ${{ needs.update.outputs.base }}
         run: |
           set -euo pipefail
           branch='${{ github.event.repository.default_branch }}'
           current=$(gh api "repos/${{ github.repository }}/commits/$branch" --jq .sha)
-          if [ "$current" != '${{ needs.update.outputs.base }}' ]; then
-            echo "::error::$branch moved from ${{ needs.update.outputs.base }} to $current while the checks ran, so the verified manifests and the branch they would land on no longer match. Re-run the workflow."
+          if [ "$current" != "$EXPECTED_BASE" ]; then
+            echo "::error::$branch moved from $EXPECTED_BASE to $current while the checks ran, so the verified manifests and the branch they would land on no longer match. Re-run the workflow."
             exit 1
           fi
 
       - name: Open the pull request
         env:
           GH_TOKEN: ${{ github.token }}
+          # A third `update`-job output — routed through env: for the same
+          # injection reason as the fingerprints and EXPECTED_BASE above.
+          # `passed` also drives the auto-merge decision later in this same
+          # step, so it gets an explicit allowlist check on top: anything
+          # other than the literal strings "true" or "false" fails the job
+          # rather than being treated as one or the other by accident.
+          PASSED: ${{ needs.update.outputs.passed }}
         run: |
           set -euo pipefail
+          case "$PASSED" in
+            true|false) ;;
+            *) echo "::error::unexpected 'passed' output: $PASSED"; exit 1 ;;
+          esac
+
           # Keyed on the RUN DATE, not the month. The job runs weekly, so a
           # month-scoped name would collide with the previous Saturday's branch
           # and every run but the first would fall into the run-scoped fallback
@@ -476,7 +505,7 @@ jobs:
           today=$(date -u +%Y-%m-%d)
           branch="deps/update-$today"
 
-          if [ '${{ needs.update.outputs.passed }}' = 'true' ]; then
+          if [ "$PASSED" = 'true' ]; then
             title="deps: Update dependencies ($today)"
             verdict='All checks passed in the job that produced this branch.'
           else
@@ -689,7 +718,7 @@ jobs:
           # above: the PR already exists, and repos without auto-merge
           # allowed just fall back to manual — and on a failing batch, that
           # fallback (no auto-merge armed) is the correct outcome anyway.
-          if [ '${{ needs.update.outputs.passed }}' = 'true' ]; then
+          if [ "$PASSED" = 'true' ]; then
             if ! gh pr merge --auto --rebase "$pr"; then
               echo "Could not arm auto-merge — the PR is open and waits for a manual merge." \
                 >> "$GITHUB_STEP_SUMMARY"

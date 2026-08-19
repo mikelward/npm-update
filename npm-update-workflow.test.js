@@ -261,8 +261,33 @@ describe("npm-update reusable workflow", () => {
     // the gate was deleted, because the file's FIRST passed-check, for the
     // title/verdict branch far above, satisfied a bare lastIndexOf lookup).
     expect(publish).toMatch(
-      /\n {10}if \[ '\$\{\{ needs\.update\.outputs\.passed \}\}' = 'true' \]; then\n {12}if ! gh pr merge --auto --rebase "\$pr"; then\n/,
+      /\n {10}if \[ "\$PASSED" = 'true' \]; then\n {12}if ! gh pr merge --auto --rebase "\$pr"; then\n/,
     );
+  });
+
+  it("never splices an update-job output straight into a run: script", () => {
+    // `needs.update.outputs.*` all originate in a job that runs `npm update`
+    // — arbitrary dependency lifecycle code. `${{ }}` substitution happens
+    // at workflow-parse time, before the shell runs, so splicing one of
+    // these directly into script text turns an untrusted string into literal
+    // shell source: a value containing a quote and shell operators escapes
+    // whatever comparison it was meant to be part of and runs with this
+    // job's write-scoped GH_TOKEN. Every one of these outputs must only
+    // reach a `run:` step via an `env:` variable (inert data, never parsed
+    // as script) — this asserts none of them appear directly after `run: |`.
+    // `ref: ${{ needs.update.outputs.base }}` is the one exception: that's
+    // an actions/checkout `with:` input, not shell, so it's excluded.
+    const runBlocks = publish.match(/run: \|\n(?:.*\n)*?(?=\n {6}-|\n {2}\S|$)/g) ?? [];
+    for (const block of runBlocks) {
+      expect(block).not.toMatch(/\$\{\{\s*needs\.update\.outputs\./);
+    }
+  });
+
+  it("fails closed on an unexpected 'passed' value instead of falling through", () => {
+    // PASSED only ever legitimately holds "true" or "false" — anything else
+    // (including empty, from a value that failed to write) is treated as an
+    // attack or a bug, not silently coerced to the failing branch.
+    expect(publish).toMatch(/case "\$PASSED" in\n\s*true\|false\) ;;\n\s*\*\) echo "::error::[^"]*"; exit 1 ;;\n\s*esac/);
   });
 
   it("starts CI on the branch it opens, scoped to the publish job only", () => {
