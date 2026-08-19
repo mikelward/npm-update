@@ -104,10 +104,22 @@ export function expect(actual, message) {
     toHaveLength: (want) => assert.strictEqual(actual?.length, want, message),
     toBeLessThan: (want) =>
       assert.ok(actual < want, message ?? `expected ${show(actual)} to be less than ${show(want)}`),
+    toBeGreaterThan: (want) =>
+      assert.ok(actual > want, message ?? `expected ${show(actual)} to be greater than ${show(want)}`),
+    toBeGreaterThanOrEqual: (want) =>
+      assert.ok(
+        actual >= want,
+        message ?? `expected ${show(actual)} to be greater than or equal to ${show(want)}`,
+      ),
     toMatchObject: (want) => assert.deepStrictEqual(overlap(actual, want), want, message),
     not: {
       toMatch: (want) => assert.doesNotMatch(String(actual), want, message),
       toEqual: (want) => assert.notDeepStrictEqual(actual, resolveMatchers(actual, want), message),
+      toContain: (want) =>
+        assert.ok(
+          !actual.includes(want),
+          message ?? `expected ${show(actual)} not to contain ${show(want)}`,
+        ),
     },
     rejects: {
       toThrow: async (want) => {
