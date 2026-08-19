@@ -38,6 +38,25 @@ const publish = workflow.slice(workflow.indexOf("  publish:"));
 const doc = parseWorkflowYaml(workflow);
 const allSteps = [...doc.jobs.update.steps, ...doc.jobs.publish.steps];
 
+// A regex over raw run: text can't tell "npm ci actually executes here"
+// from "the string 'npm ci' appears as quoted comparison data" (the
+// verdict step's EXPECTED_CHECKS list) or from a comment mentioning it --
+// exactly the false-positive/false-negative risk the file-header comment
+// above warns regex-based checks are prone to. Stripping bash comments and
+// single-quoted string contents before matching keeps "does this job
+// actually run npm ci/install" precise without needing yaml-lite.js to
+// understand bash itself.
+function withoutBashCommentsAndQuotedStrings(text) {
+  return text
+    .split("\n")
+    .map((line) => {
+      const hashIdx = line.indexOf("#");
+      const withoutComment = hashIdx === -1 ? line : line.slice(0, hashIdx);
+      return withoutComment.replace(/'[^']*'/g, "");
+    })
+    .join("\n");
+}
+
 describe("npm-update reusable workflow", () => {
   it("is a workflow_call reusable workflow with no privileges of its own", () => {
     // No schedule or workflow_dispatch here — a consumer's caller carries
@@ -242,10 +261,14 @@ describe("npm-update reusable workflow", () => {
   });
 
   it("clears the runner env after every step that runs dependency code", () => {
-    const installs = workflow.split("npm ci").length - 1;
+    // Scoped to `update`, not the whole workflow: `publish` never runs npm
+    // ci/install at all (asserted below), but its verdict step legitimately
+    // mentions the string "npm ci" as quoted comparison data, which isn't
+    // an install this rule needs to count.
+    const installs = update.split("npm ci").length - 1;
     expect(installs).toBeGreaterThanOrEqual(2);
-    expect(workflow.split(': > "$GITHUB_PATH"').length - 1).toBe(installs);
-    expect(workflow.split(': > "$GITHUB_ENV"').length - 1).toBe(installs);
+    expect(update.split(': > "$GITHUB_PATH"').length - 1).toBe(installs);
+    expect(update.split(': > "$GITHUB_ENV"').length - 1).toBe(installs);
   });
 
   it("publishes the exact commit it tested, not the branch tip", () => {
@@ -312,7 +335,12 @@ describe("npm-update reusable workflow", () => {
 
   it("keeps the write token out of the job that runs dependency code", () => {
     expect(publish).toContain("contents: write");
-    expect(publish).not.toMatch(/\bnpm (?:ci|install)\b/);
+    // publish must never EXECUTE npm ci/install -- but the verdict step's
+    // EXPECTED_CHECKS list legitimately quotes "npm ci" as comparison data
+    // to validate against, not as a command, so this strips bash comments
+    // and single-quoted strings before checking (see the helper above).
+    const publishRunText = doc.jobs.publish.steps.map((s) => s.run || "").join("\n");
+    expect(withoutBashCommentsAndQuotedStrings(publishRunText)).not.toMatch(/\bnpm (?:ci|install)\b/);
     expect(publish).not.toContain("setup-node");
     expect(update).toContain("npm update --save");
     expect(update).not.toContain("contents: write");
@@ -386,6 +414,20 @@ describe("npm-update reusable workflow", () => {
       expect(
         runCase(
           "- ✅ `npm ci`\n- ✅ `npm run lint`\n- ✅ `npm test`\nmalicious junk line",
+        ),
+      ).toBe("false");
+      // A second real Codex finding, on the count-only version of this
+      // check: four copies of the SAME successful record satisfy "every
+      // line matches the canonical format" and "exactly four lines" while
+      // three of the four real checks never actually reported anything.
+      // Each of the four expected commands now has to appear exactly once,
+      // not just four canonical-looking lines in total.
+      expect(runCase("- ✅ `npm ci`\n".repeat(4))).toBe("false");
+      // A canonical-looking line for a command this workflow doesn't run
+      // at all must also be rejected, not treated as an extra fifth check.
+      expect(
+        runCase(
+          "- ✅ `npm ci`\n- ✅ `npm run lint`\n- ✅ `npm test`\n- ✅ `rm -rf /`\n",
         ),
       ).toBe("false");
     } finally {
