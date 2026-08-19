@@ -99,6 +99,23 @@ describe("npm-update reusable workflow", () => {
     }
   });
 
+  it("runs both git status calls as their own bare assignment, not inside a pipe that ends in || true", () => {
+    // set -e catches a bare `var=$(cmd)` assignment that fails, but a
+    // blanket `|| true` on the end of a LONGER pipe (git status | sed |
+    // grep || true) swallows a git-status failure exactly as readily as it
+    // swallows grep's ordinary no-matches exit 1 — verified with a real git
+    // sandbox (a repo with .git/HEAD removed, "fatal: not a git
+    // repository", exit 128 — a merely-missing index doesn't reproduce
+    // this, since git just rebuilds one and git status still succeeds): the
+    // old single-pipe form produced an empty $unexpected with a zero exit,
+    // i.e. a corrupted git state read as "nothing unexpected," passing the
+    // one check this step exists to enforce. Splitting git status into its
+    // own assignment means set -e kills the script immediately if it
+    // fails, before the grep-tolerant pipe ever runs.
+    expect(update).toMatch(/status_all=\$\(git status --porcelain --untracked-files=all\)\n\s*unexpected=\$\(printf '%s\\n' "\$status_all"/);
+    expect(update).toMatch(/status_ignored=\$\(git status --porcelain --ignored\)\n\s*planted=\$\(printf '%s\\n' "\$status_ignored"/);
+  });
+
   it("fingerprints the manifests somewhere dependency code cannot reach", () => {
     expect(workflow).not.toContain("/tmp/dep-snapshot");
     expect(update).toMatch(/sha256sum package-lock\.json/);
@@ -233,6 +250,20 @@ describe("npm-update reusable workflow", () => {
   it("never force-pushes", () => {
     expect(publish).not.toMatch(/git push[^\n]*(--force|(?<!\w)-f(?!\w))/);
     expect(publish).toContain("git ls-remote");
+  });
+
+  it("distinguishes 'branch genuinely absent' (ls-remote exit 2) from a real lookup failure, rather than treating any nonzero the same", () => {
+    // git ls-remote -h documents --exit-code as exiting 2 specifically for
+    // "no matching refs" — verified directly (git ls-remote -h) rather than
+    // assumed. Any OTHER nonzero (128 on a real auth/network failure,
+    // reproduced against an actual bad-token request) means the lookup
+    // couldn't answer the question at all; treating that identically to
+    // "branch absent" would keep the primary branch name and let the
+    // non-force push fail blind, or silently push ahead through a
+    // connectivity problem the very next steps depend on too.
+    expect(publish).toMatch(/ls_remote_rc=0\n\s*git ls-remote --exit-code --heads "\$remote" "\$branch"[^\n]*\|\| ls_remote_rc=\$\?/);
+    expect(publish).toMatch(/if \[ "\$ls_remote_rc" -eq 0 \]; then/);
+    expect(publish).toMatch(/elif \[ "\$ls_remote_rc" -ne 2 \]; then\n\s*echo "::error::[^\n]*"\n\s*exit 1/);
   });
 
   it("writes checks.md and deps-stat.txt only after every check has finished", () => {
