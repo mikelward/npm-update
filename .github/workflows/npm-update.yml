@@ -296,6 +296,14 @@ jobs:
       # is a decision for a human.
       - name: Verify only dependency files changed
         if: steps.changed.outputs.changed == 'true'
+        env:
+          # This job already runs dependency code by this point, so routing
+          # these through env: isn't closing an injection this job's own
+          # code couldn't already reach some other way — it's the same
+          # zizmor-clean habit kept uniform across the whole workflow rather
+          # than only where the blast radius differs.
+          PKG_SHA: ${{ steps.changed.outputs.pkg_sha }}
+          LOCK_SHA: ${{ steps.changed.outputs.lock_sha }}
         run: |
           set -euo pipefail
 
@@ -345,8 +353,8 @@ jobs:
           # Compared against the fingerprints the resolve step recorded as step
           # outputs — values that live outside this filesystem, so unlike a
           # snapshot file they cannot be rewritten alongside what they guard.
-          if [ "$(sha256sum package.json | cut -d" " -f1)" != "${{ steps.changed.outputs.pkg_sha }}" ] \
-             || [ "$(sha256sum package-lock.json | cut -d" " -f1)" != "${{ steps.changed.outputs.lock_sha }}" ]; then
+          if [ "$(sha256sum package.json | cut -d" " -f1)" != "$PKG_SHA" ] \
+             || [ "$(sha256sum package-lock.json | cut -d" " -f1)" != "$LOCK_SHA" ]; then
             echo '::error::A dependency file changed AFTER npm resolved it — something in the check run rewrote it. Not opening a PR.'
             exit 1
           fi
@@ -471,10 +479,16 @@ jobs:
           # Another `update`-job output — same injection concern as the
           # fingerprint step above, routed through env: for the same reason.
           EXPECTED_BASE: ${{ needs.update.outputs.base }}
+          # default_branch isn't PR-influenced, but zizmor flags any `${{ }}`
+          # spliced into a run: script regardless of trust level, and this
+          # workflow already routes trusted values through env: elsewhere
+          # for exactly that reason (see DEPS_STAT above) — same habit,
+          # cheap to keep.
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
-          branch='${{ github.event.repository.default_branch }}'
-          current=$(gh api "repos/${{ github.repository }}/commits/$branch" --jq .sha)
+          branch="$DEFAULT_BRANCH"
+          current=$(gh api "repos/${GITHUB_REPOSITORY}/commits/$branch" --jq .sha)
           if [ "$current" != "$EXPECTED_BASE" ]; then
             echo "::error::$branch moved from $EXPECTED_BASE to $current while the checks ran, so the verified manifests and the branch they would land on no longer match. Re-run the workflow."
             exit 1
@@ -490,6 +504,18 @@ jobs:
           # other than the literal strings "true" or "false" fails the job
           # rather than being treated as one or the other by accident.
           PASSED: ${{ needs.update.outputs.passed }}
+          # Not PR-influenced, but a spliced ${{ }} breaks on a branch name
+          # containing an apostrophe (a valid git ref, e.g. feature/o'hare)
+          # by ending the shell's single-quoted string early — a real
+          # correctness bug, not just an injection-style habit. env: avoids
+          # both.
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          # Purely numeric run identifiers, but routed the same way for the
+          # same "safe habit, cheap to keep" reason as everything else in
+          # this file — caught by yaml-lite's structural sweep, which
+          # doesn't special-case any splice as "probably fine".
+          RUN_NUMBER: ${{ github.run_number }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
           set -euo pipefail
           case "$PASSED" in
@@ -513,7 +539,7 @@ jobs:
             verdict='**One or more checks failed.** Do not merge until they are fixed — the failures are real, not flakes to route around.'
           fi
 
-          remote="https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
+          remote="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
 
           # Never force-push. The PR body tells reviewers to push fixes to this
           # branch — which is also how CI starts running on it — so a re-run on
@@ -526,7 +552,7 @@ jobs:
           # the non-force push would be rejected. run_attempt increments on
           # every retry, so the pair is unique across retries of one run too.
           if git ls-remote --exit-code --heads "$remote" "$branch" >/dev/null 2>&1; then
-            branch="$branch-run${{ github.run_number }}-${{ github.run_attempt }}"
+            branch="$branch-run${RUN_NUMBER}-${RUN_ATTEMPT}"
             echo "Today's branch already exists; using $branch instead." \
               >> "$GITHUB_STEP_SUMMARY"
           fi
@@ -583,7 +609,7 @@ jobs:
           if [ -z "$pr" ]; then
             pr_url=$(gh pr create --title "$title" \
               --body 'Opening — the checks report lands in a moment.' \
-              --base '${{ github.event.repository.default_branch }}' --head "$branch")
+              --base "$DEFAULT_BRANCH" --head "$branch")
             pr=${pr_url##*/}
           fi
 
@@ -689,9 +715,13 @@ jobs:
           # goes unnoticed — and an unreviewed dependency PR sitting open is the
           # failure this whole design is trying to avoid.
           #
-          # The owner comes from `github.repository_owner` rather than a
+          # The owner comes from the runner's own $GITHUB_REPOSITORY_OWNER
+          # (already used above for the same reason) rather than a
           # hard-coded handle, so this file stays identical across every
-          # consumer and does not go stale if the account is ever renamed.
+          # consumer and does not go stale if the account is ever renamed —
+          # and never a spliced ${{ }}, which breaks the same way a spliced
+          # branch name would on an owner login containing a shell-special
+          # character.
           #
           # Deliberately non-fatal. A review request can be refused for reasons
           # that have nothing to do with this batch — the requestee must be a
@@ -699,7 +729,7 @@ jobs:
           # is the PR's own author — and the branch is already pushed by this
           # point. An opened-but-unassigned PR is recoverable; a failed step
           # that leaves a pushed branch with no PR is not.
-          reviewer='${{ github.repository_owner }}'
+          reviewer="$GITHUB_REPOSITORY_OWNER"
           if ! gh pr edit "$pr" --add-assignee "$reviewer" --add-reviewer "$reviewer"; then
             echo "Could not assign or request review from @$reviewer — the PR is open and needs a look." \
               >> "$GITHUB_STEP_SUMMARY"
