@@ -8,6 +8,14 @@ Deferred work, recorded here so it isn't lost.
       auto-merge). The ruleset already gates merges on `gate`, `codex` and
       conversation resolution, so arming can only remove toil — today every
       green pull request still waits for a manual merge.
+- [ ] **Finish the gate → lanes check rename** (mikelward/lanes#9). The
+      `lanes` job now runs alongside `gate` (both green here), but two
+      steps remain, outside what a session without ruleset API access can
+      do: flip the ruleset to require `lanes` instead of `gate`
+      (`repo-rules mikelward/npm-update lanes codex ...`, naming every
+      check the ruleset should require — `mikelward/scripts`' tool), then
+      delete the now-redundant `gate` job and its parity test
+      (`workflow-check-rename.test.js`) in a follow-up PR.
 
 ## The extracted workflow, when it arrives
 
