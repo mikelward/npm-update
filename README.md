@@ -70,3 +70,19 @@ pr: ${{ github.event.pull_request.number || inputs.pr }}
 ```
 
 gedmap's own `ci.yml` follows this pattern for its mikelward/lanes gate.
+
+## Auto-merge needs "up to date" required, or a merge queue
+
+Once the producer job's own checks pass, the workflow arms `gh pr merge
+--auto --rebase` — but `--auto` only waits for the checks a ruleset actually
+requires; it says nothing about whether the branch is still current when the
+merge finally happens. If the default branch moves again after CI and Codex
+finish (a genuinely later, unrelated PR landing while this one waits), a
+`--rebase` merge rebases this PR's already-tested commits onto that newer
+base at merge time — a combination nothing has run CI against. Enable
+**"Require branches to be up to date before merging"** in the ruleset (or
+route merges through a merge queue, which re-validates the rebased result
+before merging) so GitHub blocks the merge until the branch has actually
+been updated and re-checked, rather than rebasing blind. Without one of
+those two, treat the auto-merge as a convenience for the common case, not a
+guarantee that what merges is what CI tested.
