@@ -186,6 +186,23 @@ describe("npm-update reusable workflow", () => {
     expect(publish).toMatch(/if ! gh pr merge --auto --rebase "\$pr"/);
   });
 
+  it("never arms auto-merge when the producer checks failed", () => {
+    // A required check on the PR head (ci, codex) is a fresh dispatch and is
+    // not guaranteed to re-run the exact command that failed in the producer
+    // job — a consumer's ci.yml is free to run a different check set — so
+    // arming unconditionally could merge a batch the title calls "CHECKS
+    // FAILING". Matched as one contiguous block, not by searching for the
+    // gate and the merge call independently and hoping they're related: an
+    // `indexOf` pair can't tell "the merge call is inside this if" from "the
+    // gate exists somewhere earlier in the file" — which is exactly the
+    // false pass an earlier version of this test had (it kept matching after
+    // the gate was deleted, because the file's FIRST passed-check, for the
+    // title/verdict branch far above, satisfied a bare lastIndexOf lookup).
+    expect(publish).toMatch(
+      /\n {10}if \[ '\$\{\{ needs\.update\.outputs\.passed \}\}' = 'true' \]; then\n {12}if ! gh pr merge --auto --rebase "\$pr"; then\n/,
+    );
+  });
+
   it("starts CI on the branch it opens, scoped to the publish job only", () => {
     // A PR opened by GITHUB_TOKEN does not trigger `on: pull_request`, so
     // without an explicit dispatch a consumer's ci.yml never runs on this
@@ -228,6 +245,16 @@ describe("npm-update reusable workflow", () => {
   it("scopes the branch to the run date, not the month", () => {
     expect(publish).toContain("date -u +%Y-%m-%d");
     expect(publish).not.toContain("date -u +%Y-%m)");
+  });
+
+  it("keeps the rerun fallback branch unique across retries of one run", () => {
+    // run_number alone repeats across every retry of the SAME run, so a run
+    // retried more than once would pick this fallback's identical name a
+    // second time and the non-force push would be rejected. run_attempt
+    // increments on each retry, so the pair stays unique.
+    expect(publish).toContain(
+      '"$branch-run${{ github.run_number }}-${{ github.run_attempt }}"',
+    );
   });
 
   it("keeps the validator and its tests present in this repository", () => {
