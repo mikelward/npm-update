@@ -513,8 +513,12 @@ jobs:
       # boolean this workflow used to trust for the auto-merge gate and the
       # PR title.
       #
-      # Fails closed: an empty file or one with no recognized check line is
-      # treated as failed, not silently passed.
+      # Fails closed: an empty file, a line that doesn't match the exact
+      # format check() writes, or a check count that doesn't match what
+      # actually ran are all treated as failed, never silently passed.
+      # Merely finding one recognized "- ✅ " line isn't enough on its own —
+      # a partial or malformed file could contain exactly that and nothing
+      # else, and reading it as "passed" would miss whatever's missing.
       - name: Derive the check verdict from checks.md, not the untrusted job's own report
         id: verdict
         run: |
@@ -522,13 +526,43 @@ jobs:
           if [ ! -s checks.md ]; then
             echo '::error::checks.md is empty — cannot verify checks.'
             echo 'passed=false' >> "$GITHUB_OUTPUT"
-          elif grep -q '^- ❌ ' checks.md; then
+            exit 0
+          fi
+          # A named constant, not re-derived from the check '...' calls
+          # above: if that list ever grows or shrinks without this being
+          # updated too, the count check below fails closed (a clear, if
+          # noisy, error) rather than silently accepting a report that
+          # doesn't match what actually ran.
+          EXPECTED_CHECK_COUNT=4
+          count=0
+          failed=0
+          # `|| [ -n "$line" ]` picks up a final line with no trailing
+          # newline — checks.md as this workflow writes it always ends in
+          # one, but a malformed or forged file might not, and without this
+          # a plain `while read` silently drops (and never validates) that
+          # last line. Verified directly before writing this.
+          while IFS= read -r line || [ -n "$line" ]; do
+            [ -z "$line" ] && continue
+            count=$((count + 1))
+            if [[ "$line" =~ ^-\ ❌\ \`[^\`]+\`\ \(exit\ [0-9]+\)$ ]]; then
+              failed=1
+            elif [[ "$line" =~ ^-\ ✅\ \`[^\`]+\`$ ]]; then
+              :
+            else
+              echo "::error::checks.md has a line that doesn't match the canonical check format — treating as failed rather than guessing: $line"
+              echo 'passed=false' >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          done < checks.md
+          if [ "$count" -ne "$EXPECTED_CHECK_COUNT" ]; then
+            echo "::error::checks.md reports $count check(s), expected $EXPECTED_CHECK_COUNT — treating as failed rather than guessing."
             echo 'passed=false' >> "$GITHUB_OUTPUT"
-          elif grep -q '^- ✅ ' checks.md; then
-            echo 'passed=true' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$failed" -eq 1 ]; then
+            echo 'passed=false' >> "$GITHUB_OUTPUT"
           else
-            echo '::error::checks.md has no recognized check line — treating as failed rather than guessing.'
-            echo 'passed=false' >> "$GITHUB_OUTPUT"
+            echo 'passed=true' >> "$GITHUB_OUTPUT"
           fi
 
       # The authoritative check on what this commit contains, and the reason
