@@ -284,6 +284,29 @@ test("throws on a construct this parser doesn't support, rather than returning s
   assert.throws(() => parseWorkflowYaml("a: &anchor value\nb: *anchor\n"));
 });
 
+test("parses an empty flow mapping ('permissions: {}') as an empty object, the one flow-mapping shape this repo's own workflow actually uses", () => {
+  const doc = parseWorkflowYaml("permissions: {}\n");
+  assert.deepEqual(doc.permissions, {});
+});
+
+test("throws on a flow mapping as a plain mapping value, rather than returning the brace text as a string", () => {
+  // "a: { b: 1 }" isn't in this parser's scope (see the file header). An
+  // earlier version fell through to parseScalar's final `return s` and
+  // silently returned the literal string "{ b: 1 }" instead of raising —
+  // structurally wrong in a way nothing downstream would catch.
+  assert.throws(() => parseWorkflowYaml("a: { b: 1 }\n"), /flow mappings are not supported/);
+});
+
+test("throws on a flow mapping as a sequence item, not just as a plain mapping value", () => {
+  // "- { b: 1 }" reaches parseScalar through a different path than the
+  // mapping-value case above: parseSequence's "- key: value" regex doesn't
+  // match (rest starts with "{", not a bare key followed by ":"), so it
+  // falls to the same `result.push(parseScalar(rest))` branch a plain
+  // scalar sequence item takes. Both call sites need to be covered, since a
+  // fix at only one of them leaves the other silently wrong.
+  assert.throws(() => parseWorkflowYaml("a:\n  - { b: 1 }\n"), /flow mappings are not supported/);
+});
+
 test("throws on a block scalar line that dedents below the block's own indent without reaching the parent's", () => {
   // `a: |\n    x\n  y\nb: 1` is invalid YAML — "  y" is indented less than
   // the block's own established indent (4, from "    x") but still more

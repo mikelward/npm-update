@@ -719,9 +719,15 @@ jobs:
           # (already used above for the same reason) rather than a
           # hard-coded handle, so this file stays identical across every
           # consumer and does not go stale if the account is ever renamed —
-          # and never a spliced ${{ }}, which breaks the same way a spliced
-          # branch name would on an owner login containing a shell-special
-          # character.
+          # and never spliced from an expression, which breaks the same way
+          # a spliced branch name would on an owner login containing a
+          # shell-special character. (This comment avoids writing the
+          # literal double-brace expression syntax here on purpose: unlike
+          # a comment above an env: key, this line is INSIDE the run: block's
+          # own string value, and GitHub's expression substitution scans
+          # that whole string before bash ever sees it — an empty pair of
+          # braces here is a real, if unlikely, way to break every
+          # consumer's run.)
           #
           # Deliberately non-fatal. A review request can be refused for reasons
           # that have nothing to do with this batch — the requestee must be a
