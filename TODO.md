@@ -16,20 +16,6 @@ Deferred work, recorded here so it isn't lost.
       check the ruleset should require — `mikelward/scripts`' tool), then
       delete the now-redundant `gate` job and its parity test
       (`workflow-check-rename.test.js`) in a follow-up PR.
-- [ ] **Move `checks.md`/`deps-stat.txt`/`passed` verdict computation into the
-      clean `publish` job**, so it stops trusting a boolean and two
-      fingerprints all produced inside the same untrusted step that runs
-      `npm update`. Concretely: have `publish` parse the downloaded
-      `checks.md`'s own per-check pass/fail lines to derive `passed` itself
-      (or an equivalent independently-checkable signal), rather than reading
-      `needs.update.outputs.passed` and trusting `checks_sha`/`deps_stat_sha`
-      to prove that content wasn't swapped alongside its own fingerprint by a
-      background process before the `update` step's shell exited. See
-      AGENTS.md "Trust model" for what this can and can't actually reach —
-      the merged manifests are unaffected; this is about the PR body's report
-      and the auto-merge gate specifically. Raised by Codex on PR #13; the
-      manifests' own fingerprinting was judged sufficient for that PR and
-      this was deferred rather than expanding its scope.
 
 ## The extracted workflow, when it arrives
 

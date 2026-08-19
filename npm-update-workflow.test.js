@@ -21,7 +21,10 @@
 // that already work.
 
 import { describe, it, expect } from "./vitest-shim.mjs";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync, mkdtempSync, rmSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { parseWorkflowYaml } from "./yaml-lite.js";
 
 const workflow = readFileSync(".github/workflows/npm-update.yml", "utf8");
@@ -316,6 +319,68 @@ describe("npm-update reusable workflow", () => {
     expect(update).not.toContain("GH_TOKEN");
   });
 
+  it("no longer trusts the untrusted update job's own pass/fail boolean", () => {
+    // See AGENTS.md "Trust model": checks.md's content and a `passed`
+    // boolean job output were both previously produced inside the same
+    // untrusted step that runs `npm update`, so a sophisticated lifecycle
+    // script's background process could in principle forge the two
+    // together before the step's shell exits. `update` no longer reports
+    // its own verdict at all — `publish` derives it from checks.md's own
+    // (fingerprint-verified) content instead, in a dedicated step.
+    expect(update).not.toContain("passed: ${{ steps.checks.outputs.passed }}");
+    expect(update).not.toMatch(/echo 'passed=true' >> "\$GITHUB_OUTPUT"/);
+    expect(update).not.toMatch(/echo 'passed=false' >> "\$GITHUB_OUTPUT"/);
+    expect(publish).not.toContain("needs.update.outputs.passed");
+  });
+
+  it("derives the check verdict from checks.md's own content in a dedicated publish step", () => {
+    // Real execution, not just a structural regex: extracting the exact
+    // committed step and running it against fixture checks.md content
+    // proves the shell logic behaves correctly, the same discipline used
+    // for the git-status and ls-remote fixes elsewhere in this file.
+    const verdictStep = doc.jobs.publish.steps.find((s) => s.id === "verdict");
+    expect(!!verdictStep).toBe(true);
+    expect(verdictStep.name).toContain("Derive the check verdict");
+
+    const tmp = mkdtempSync(join(tmpdir(), "npm-update-verdict-"));
+    try {
+      const runCase = (content) => {
+        writeFileSync(join(tmp, "checks.md"), content);
+        const outPath = join(tmp, "out.txt");
+        writeFileSync(outPath, "");
+        execFileSync("bash", ["-c", verdictStep.run], {
+          cwd: tmp,
+          env: { ...process.env, GITHUB_OUTPUT: outPath },
+        });
+        const out = readFileSync(outPath, "utf8");
+        const m = out.match(/^passed=(true|false)$/m);
+        return m ? m[1] : null;
+      };
+      expect(runCase("- ✅ `npm ci`\n- ✅ `npm run lint`\n")).toBe("true");
+      expect(runCase("- ✅ `npm ci`\n- ❌ `npm test` (exit 1)\n")).toBe("false");
+      expect(runCase("- ❌ `npm ci` (exit 1)\n")).toBe("false");
+      // Fails closed: empty or unrecognized content is never silently "true".
+      expect(runCase("")).toBe("false");
+      expect(runCase("not a real report\n")).toBe("false");
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("positions the verdict derivation after the fingerprint check and before the clean re-validation", () => {
+    // checks.md must be both downloaded AND fingerprint-verified before
+    // anything parses its content, and the derived verdict has to exist
+    // before "Open the pull request" reads it.
+    const fingerprintIdx = publish.indexOf("Check the artifact against the pre-check fingerprints");
+    const verdictIdx = publish.indexOf("Derive the check verdict");
+    const revalidateIdx = publish.indexOf("Re-validate the dependency diff from a clean context");
+    const openPrIdx = publish.indexOf("Open the pull request");
+    expect(fingerprintIdx).toBeGreaterThan(-1);
+    expect(verdictIdx).toBeGreaterThan(fingerprintIdx);
+    expect(revalidateIdx).toBeGreaterThan(verdictIdx);
+    expect(openPrIdx).toBeGreaterThan(verdictIdx);
+  });
+
   it("arms auto-merge behind the required checks, non-fatally", () => {
     expect(publish).toContain('gh pr merge --auto --rebase "$pr"');
     expect(publish).toMatch(/if ! gh pr merge --auto --rebase "\$pr"/);
@@ -436,7 +501,7 @@ describe("npm-update reusable workflow", () => {
     // `needs.update.outputs.*` in its env: declarations (that's the safe
     // location), so this checks for those declarations directly rather
     // than asserting their absence from the whole job text.
-    expect(publish).toContain("PASSED: ${{ needs.update.outputs.passed }}");
+    expect(publish).toContain("PASSED: ${{ steps.verdict.outputs.passed }}");
     expect(publish).toContain("EXPECTED_BASE: ${{ needs.update.outputs.base }}");
     expect(publish).toContain("PKG_SHA: ${{ needs.update.outputs.pkg_sha }}");
     expect(publish).toContain("LOCK_SHA: ${{ needs.update.outputs.lock_sha }}");

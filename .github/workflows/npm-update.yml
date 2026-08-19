@@ -52,7 +52,6 @@ jobs:
       contents: read
     outputs:
       changed: ${{ steps.changed.outputs.changed }}
-      passed: ${{ steps.checks.outputs.passed }}
       base: ${{ steps.base.outputs.sha }}
       pkg_sha: ${{ steps.changed.outputs.pkg_sha }}
       lock_sha: ${{ steps.changed.outputs.lock_sha }}
@@ -216,7 +215,6 @@ jobs:
           DEPS_STAT: ${{ steps.changed.outputs.deps_stat }}
         run: |
           set +e
-          failed=0
           # Accumulated in a shell variable, not appended to checks.md as
           # each check finishes. checks.md is a predictable, allowlisted
           # path (the tree-verification step below has to accept it, since
@@ -237,7 +235,6 @@ jobs:
               report="${report}- ✅ \`$1\`"$'\n'
             else
               report="${report}- ❌ \`$1\` (exit $rc)"$'\n'
-              failed=1
             fi
           }
           # The real install, with lifecycle scripts, so everything below runs
@@ -276,11 +273,12 @@ jobs:
           echo "checks_sha=$(sha256sum checks.md | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
           echo "deps_stat_sha=$(sha256sum deps-stat.txt | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
           cat checks.md >> "$GITHUB_STEP_SUMMARY"
-          if [ $failed -eq 0 ]; then
-            echo 'passed=true' >> "$GITHUB_OUTPUT"
-          else
-            echo 'passed=false' >> "$GITHUB_OUTPUT"
-          fi
+          # No pass/fail boolean written as this step's own OUTPUT — publish
+          # derives that itself, from checks.md's own (fingerprint-verified)
+          # content, rather than trusting a second, independently-forgeable
+          # value from this same untrusted step. See AGENTS.md "Trust
+          # model" and the "Derive the check verdict" step in publish.
+          #
           # Every check above ran dependency code, so this step owes the same
           # containment as the installs: the verify step below invokes `git` and
           # `sha256sum`, and a planted pair on $GITHUB_PATH would let source
@@ -497,6 +495,42 @@ jobs:
           [ "$(sha256sum deps-stat.txt | cut -d" " -f1)" = "$DEPS_STAT_SHA" ] \
             || { echo '::error::deps-stat.txt does not match what the update job wrote.'; exit 1; }
 
+      # See AGENTS.md "Trust model": update no longer reports its own
+      # pass/fail verdict as a job output. That boolean and checks.md's
+      # content were both produced inside the same untrusted step that runs
+      # `npm update` — a sufficiently sophisticated lifecycle script's
+      # background process could in principle forge the two together before
+      # the step's shell exits, so trusting the boolean added a SECOND,
+      # independently-forgeable signal on top of the file the fingerprint
+      # check above already verifies. Deriving the verdict from checks.md's
+      # own (now fingerprint-verified) content instead collapses that to one
+      # signal: there is exactly one place a false "all checks passed" can
+      # come from, and it's the file this job just checked. Not a complete
+      # fix — a forger sophisticated enough to fake checks.md's content
+      # consistently with its own fingerprint isn't caught by this either,
+      # and neither is deps-stat.txt's content, which stays purely
+      # informational — but it removes the redundant, separately-forgeable
+      # boolean this workflow used to trust for the auto-merge gate and the
+      # PR title.
+      #
+      # Fails closed: an empty file or one with no recognized check line is
+      # treated as failed, not silently passed.
+      - name: Derive the check verdict from checks.md, not the untrusted job's own report
+        id: verdict
+        run: |
+          set -euo pipefail
+          if [ ! -s checks.md ]; then
+            echo '::error::checks.md is empty — cannot verify checks.'
+            echo 'passed=false' >> "$GITHUB_OUTPUT"
+          elif grep -q '^- ❌ ' checks.md; then
+            echo 'passed=false' >> "$GITHUB_OUTPUT"
+          elif grep -q '^- ✅ ' checks.md; then
+            echo 'passed=true' >> "$GITHUB_OUTPUT"
+          else
+            echo '::error::checks.md has no recognized check line — treating as failed rather than guessing.'
+            echo 'passed=false' >> "$GITHUB_OUTPUT"
+          fi
+
       # The authoritative check on what this commit contains, and the reason
       # it lives HERE: everything the update job asserted about the manifests,
       # it asserted on a machine where the updated packages' own code had
@@ -537,13 +571,13 @@ jobs:
       - name: Open the pull request
         env:
           GH_TOKEN: ${{ github.token }}
-          # A third `update`-job output — routed through env: for the same
-          # injection reason as the fingerprints and EXPECTED_BASE above.
+          # From THIS job's own "Derive the check verdict" step, not a
+          # `needs.update.outputs.*` value — see AGENTS.md "Trust model".
           # `passed` also drives the auto-merge decision later in this same
           # step, so it gets an explicit allowlist check on top: anything
           # other than the literal strings "true" or "false" fails the job
           # rather than being treated as one or the other by accident.
-          PASSED: ${{ needs.update.outputs.passed }}
+          PASSED: ${{ steps.verdict.outputs.passed }}
           # Not PR-influenced, but a spliced ${{ }} breaks on a branch name
           # containing an apostrophe (a valid git ref, e.g. feature/o'hare)
           # by ending the shell's single-quoted string early — a real
