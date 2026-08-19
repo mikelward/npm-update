@@ -39,22 +39,42 @@ has stopped biting.
   and `publish` — a fresh runner that installs nothing — is the only job that
   pushes, gated on re-deriving the manifest diff itself and checking the
   fingerprints `update` recorded before any install ran.
-- **`checks.md`, `deps-stat.txt`, and the `passed` gate share a residual gap
-  the manifests don't have.** All three are computed and fingerprinted
-  *inside* the same untrusted step that runs `npm update` — unlike
-  `package.json`/`package-lock.json`, whose fingerprints `publish`
-  independently verifies against a clean checkout. A sufficiently
-  sophisticated lifecycle script could in principle leave a detached
-  background process that waits for that step to write these files and their
-  fingerprints, then overwrites both together before the step's shell exits
-  (the runner only captures `GITHUB_OUTPUT` at that point). This can't get
-  malicious *code* merged — the manifests it would need to forge are checked
-  independently — but it could misrepresent the PR body's report or force
-  `passed=true` past the auto-merge gate on checks that actually failed.
-  Known, not yet closed: see `TODO.md`. Until it is, read `passed` and the PR
-  body's check results as evidence from the batch, not proof independently
-  established — the same posture the sibling per-repo copies already took
-  before this repository existed.
+- **`passed` is derived in `publish`, from `checks.md`'s own fingerprint-
+  verified content — not read as a boolean the untrusted step reported
+  about itself.** `update` no longer emits a `passed` output at all;
+  `publish`'s "Derive the check verdict from checks.md" step greps the
+  downloaded, fingerprint-checked file for a `- ❌ ` line and fails closed
+  (treats as failed) on an empty or unrecognized file, never silently
+  passing. This closes the gap where a `passed` boolean and `checks.md`'s
+  content — both produced inside the same untrusted step that runs
+  `npm update` — could diverge with nothing to catch it: before, a bug or a
+  forged `passed=true` could sail past the gate even while `checks.md`
+  itself showed a failure, since the two were computed and trusted
+  independently.
+- **`checks.md` and `deps-stat.txt` still carry a residual gap the manifests
+  don't have, and this doesn't close it.** Both files, and their
+  fingerprints, are still computed *inside* the same untrusted step that
+  runs `npm update` — unlike `package.json`/`package-lock.json`, whose
+  fingerprints `publish` independently verifies against a clean checkout.
+  A sufficiently sophisticated lifecycle script could in principle leave a
+  detached background process that waits for that step to write these
+  files and their fingerprints, then overwrites both together before the
+  step's shell exits (the runner only captures `GITHUB_OUTPUT` at that
+  point) — a fingerprint check proves the downloaded artifact matches what
+  the step wrote, not that what it wrote was genuine. This can't get
+  malicious *code* merged — the manifests it would need to forge are
+  checked independently — and deriving `passed` from `checks.md` (above)
+  means there's only ONE thing left to forge for a false pass, not two
+  independently-forgeable signals that could also disagree with each
+  other. But a forger sophisticated enough to fake `checks.md`'s content
+  consistently with its own fingerprint still isn't caught, and
+  `deps-stat.txt`'s content (purely informational — the PR body's diffstat,
+  never gates anything) is untouched either way. Closing that fully would
+  need `publish` to re-derive the verdict from a clean re-execution, not
+  just re-read a file the untrusted job already wrote — out of scope here.
+  Read the PR body's check results as evidence from the batch, not proof
+  independently established — the same posture the sibling per-repo copies
+  already took before this repository existed.
 
 ## What this repository must not grow
 
