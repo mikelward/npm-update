@@ -111,7 +111,7 @@ describe("npm-update reusable workflow", () => {
 
   it("verifies the checked tree is the tree it pushes", () => {
     expect(update).toContain("Verify only dependency files changed");
-    expect(update).toContain("git status --porcelain --untracked-files=all");
+    expect(update).toContain("git status --porcelain -z --untracked-files=all");
     expect(update).not.toMatch(/git diff --name-only \| grep -Ev/);
     expect(update).toContain("git status --porcelain --ignored");
     expect(update).not.toMatch(/--untracked-files=all\s+--ignored/);
@@ -121,20 +121,24 @@ describe("npm-update reusable workflow", () => {
     }
   });
 
-  it("runs both git status calls as their own bare assignment, not inside a pipe that ends in || true", () => {
-    // set -e catches a bare `var=$(cmd)` assignment that fails, but a
-    // blanket `|| true` on the end of a LONGER pipe (git status | sed |
-    // grep || true) swallows a git-status failure exactly as readily as it
-    // swallows grep's ordinary no-matches exit 1 — verified with a real git
-    // sandbox (a repo with .git/HEAD removed, "fatal: not a git
-    // repository", exit 128 — a merely-missing index doesn't reproduce
-    // this, since git just rebuilds one and git status still succeeds): the
-    // old single-pipe form produced an empty $unexpected with a zero exit,
+  it("runs both git status calls as their own bare command, not inside a pipe that ends in || true", () => {
+    // set -e catches a bare command that fails, but a blanket `|| true` on
+    // the end of a LONGER pipe (git status | sed | grep || true) swallows
+    // a git-status failure exactly as readily as it swallows grep's
+    // ordinary no-matches exit 1 — verified with a real git sandbox (a
+    // repo with .git/HEAD removed, "fatal: not a git repository", exit
+    // 128 — a merely-missing index doesn't reproduce this, since git just
+    // rebuilds one and git status still succeeds): a single-pipe form
+    // ending in `|| true` produced an empty $unexpected with a zero exit,
     // i.e. a corrupted git state read as "nothing unexpected," passing the
-    // one check this step exists to enforce. Splitting git status into its
-    // own assignment means set -e kills the script immediately if it
-    // fails, before the grep-tolerant pipe ever runs.
-    expect(update).toMatch(/status_all=\$\(git status --porcelain --untracked-files=all\)\n\s*unexpected=\$\(printf '%s\\n' "\$status_all"/);
+    // one check this step exists to enforce. The untracked pass writes
+    // git status's output to a temp file as a bare command (not `<
+    // <(...)`, whose own exit status set -e/pipefail can't see either) so
+    // set -e kills the script immediately if it fails, before the
+    // grep-tolerant pipe below ever runs; the ignored pass keeps the
+    // original bare `var=$(cmd)` assignment form, which the same
+    // protection applies to.
+    expect(update).toMatch(/status_z="\$RUNNER_TEMP\/npm-update-status\.nul"\n\s*git status --porcelain -z --untracked-files=all > "\$status_z"\n\s*unexpected=""/);
     expect(update).toMatch(/status_ignored=\$\(git status --porcelain --ignored\)\n\s*planted=\$\(printf '%s\\n' "\$status_ignored"/);
   });
 
@@ -264,11 +268,17 @@ describe("npm-update reusable workflow", () => {
     // Scoped to `update`, not the whole workflow: `publish` never runs npm
     // ci/install at all (asserted below), but its verdict step legitimately
     // mentions the string "npm ci" as quoted comparison data, which isn't
-    // an install this rule needs to count.
+    // an install this rule needs to count. The regenerate step is a THIRD
+    // window that runs dependency-adjacent code (whatever `regenerate`
+    // names) without itself containing the literal text "npm ci" — it
+    // reuses the checks step's install rather than running its own — so it
+    // adds one more clear pair than the "npm ci" count alone would predict.
     const installs = update.split("npm ci").length - 1;
     expect(installs).toBeGreaterThanOrEqual(2);
-    expect(update.split(': > "$GITHUB_PATH"').length - 1).toBe(installs);
-    expect(update.split(': > "$GITHUB_ENV"').length - 1).toBe(installs);
+    expect(update).toContain("Regenerate derived files");
+    const expectedClears = installs + 1;
+    expect(update.split(': > "$GITHUB_PATH"').length - 1).toBe(expectedClears);
+    expect(update.split(': > "$GITHUB_ENV"').length - 1).toBe(expectedClears);
   });
 
   it("publishes the exact commit it tested, not the branch tip", () => {
@@ -466,8 +476,10 @@ describe("npm-update reusable workflow", () => {
     // false pass an earlier version of this test had (it kept matching after
     // the gate was deleted, because the file's FIRST passed-check, for the
     // title/verdict branch far above, satisfied a bare lastIndexOf lookup).
+    // Also requires REGEN_SHA empty (see "the regenerate hook" describe
+    // block below) -- both gates live on this one line together.
     expect(publish).toMatch(
-      /\n {10}if \[ "\$PASSED" = 'true' \]; then\n {12}if ! gh pr merge --auto --rebase "\$pr"; then\n/,
+      /\n {10}if \[ "\$PASSED" = 'true' \] && \[ -z "\$REGEN_SHA" \]; then\n {12}if ! gh pr merge --auto --rebase "\$pr"; then\n/,
     );
   });
 
@@ -669,6 +681,560 @@ describe("npm-update reusable workflow", () => {
         action.startsWith("actions/"),
         `npm-update.yml uses "${action}", which is not a first-party actions/* action`,
       ).toBe(true);
+    }
+  });
+});
+
+// The regenerate hook: lets a consumer declare commands that rebuild a file
+// derived from the dependency set (readmo's import map kept in sync with
+// package-lock.json is the motivating case — see AGENTS.md "The
+// extraction"), the npm-update analog of gradle-update's `regenerate` /
+// `regenerated-files` inputs, scoped down to this workflow's simpler
+// two-job (update/publish, no review job) shape.
+describe("the regenerate hook", () => {
+  it("declares both inputs, defaulting to disabled", () => {
+    expect(workflow).toMatch(/^\s*regenerate:\n/m);
+    expect(workflow).toMatch(/^\s*regenerated-files:\n/m);
+    // Both default to '' -- declaring `checks:` with no default the way
+    // gradle-update's own `checks` input does would make this a BREAKING
+    // change for every existing consumer, not an opt-in one.
+    const inputsBlock = workflow.slice(
+      workflow.indexOf("workflow_call:"),
+      workflow.indexOf("permissions: {}"),
+    );
+    expect([...inputsBlock.matchAll(/default: ''/g)].length).toBeGreaterThanOrEqual(2);
+  });
+
+  it("runs after the checks and stops the batch on failure, unlike a failed check", () => {
+    const regenIdx = update.indexOf("Regenerate derived files");
+    const checksIdx = update.indexOf("Run the full check suite");
+    const verifyIdx = update.indexOf("Verify only dependency files changed");
+    expect(checksIdx).toBeGreaterThan(-1);
+    expect(regenIdx).toBeGreaterThan(checksIdx);
+    expect(verifyIdx).toBeGreaterThan(regenIdx);
+    // Checks are wrapped in `check()`, which captures a nonzero exit into
+    // checks.md and keeps going (see `check() { ... eval "$1"; rc=$? ...}`
+    // tested above). The regenerate loop below has no such wrapper --
+    // `eval "$cmd"` runs under the step's own `set -euo pipefail`, so any
+    // nonzero exit kills the step immediately.
+    const regenStep = doc.jobs.update.steps.find((s) => s.id === "regen");
+    expect(!!regenStep).toBe(true);
+    expect(regenStep.run).toMatch(/eval "\$cmd" \)\n\s*echo '::endgroup::'\n\s*done <<< "\$REGENERATE"/);
+  });
+
+  it("is gated on both changed and regenerate being set", () => {
+    const regenStep = doc.jobs.update.steps.find((s) => s.id === "regen");
+    expect(regenStep.if).toBe("steps.changed.outputs.changed == 'true' && inputs.regenerate != ''");
+  });
+
+  it("refuses a path outside the workflow's own reserved names", () => {
+    const regenStep = doc.jobs.update.steps.find((s) => s.id === "regen");
+    for (const reserved of [
+      "package.json",
+      "package-lock.json",
+      "checks.md",
+      "deps-stat.txt",
+      "regen-handoff.tar",
+      "regen-stat.txt",
+    ]) {
+      expect(regenStep.run).toContain(reserved);
+    }
+    // npm-update-hub/ is the publish job's own checkout directory for the
+    // canonical checker -- restoring a regenerated file under that prefix
+    // would collide with it.
+    expect(regenStep.run).toContain("npm-update-hub");
+  });
+
+  it("fingerprints content and executable-bit mode separately, and both travel to publish as job outputs", () => {
+    const regenStep = doc.jobs.update.steps.find((s) => s.id === "regen");
+    expect(regenStep.run).toContain("files_sha<<REGEN_SHA_EOF");
+    expect(regenStep.run).toContain("files_mode<<REGEN_MODE_EOF");
+    expect(update).toContain("regen_sha: ${{ steps.regen.outputs.files_sha }}");
+    expect(update).toContain("regen_mode: ${{ steps.regen.outputs.files_mode }}");
+    expect(publish).toContain("needs.update.outputs.regen_sha");
+    expect(publish).toContain("needs.update.outputs.regen_mode");
+  });
+
+  it("exempts a regenerated file from the tree check only once the regenerate step has actually fingerprinted it", () => {
+    // Keyed off steps.regen.outputs.files_sha (REGEN_SHA), never off the
+    // bare inputs.regenerated-files declaration -- a `regenerate` input
+    // that is set but produced nothing yet must not exempt anything.
+    const verifyStep = doc.jobs.update.steps.find(
+      (s) => s.name === "Verify only dependency files changed",
+    );
+    expect(verifyStep.env.REGEN_SHA).toBe("${{ steps.regen.outputs.files_sha }}");
+    expect(verifyStep.run).toContain('if [ -n "$REGEN_SHA" ]; then');
+    expect(verifyStep.run).toContain("derived+=(\"$f\")");
+  });
+
+  it("re-verifies the regenerated files' fingerprints in the publish job before restoring them", () => {
+    expect(publish).toContain("Restore and verify regenerated files");
+    expect(publish).toContain("sha256sum -c --strict --quiet");
+    expect(publish).toContain(
+      "The artifact is missing declared regenerated file",
+    );
+    expect(publish).toContain(
+      "regenerated-files artifact carries a symlink, not a regular file",
+    );
+    expect(publish).toContain(
+      "The regenerated-files artifact carried an undeclared file",
+    );
+    // Positioned before the commit, same discipline as the manifest
+    // fingerprint check it sits beside.
+    expect(publish.indexOf("Restore and verify regenerated files")).toBeLessThan(
+      publish.indexOf("Open the pull request"),
+    );
+  });
+
+  it("stages regenerated files alongside the manifests and reports their diffstat in the PR body", () => {
+    const openPr = doc.jobs.publish.steps.find((s) => s.name === "Open the pull request");
+    expect(openPr.env.REGENERATED_FILES).toBe("${{ inputs.regenerated-files }}");
+    expect(openPr.run).toContain('git add -- "$f"');
+    expect(openPr.run).toContain("Regenerated files diffstat");
+    expect(openPr.run).toContain("regen-stat.txt");
+  });
+
+  it("hands regenerated files to publish as a tar, not raw glob paths, since a consumer's declared path is data", () => {
+    const verifyStep = doc.jobs.update.steps.find(
+      (s) => s.name === "Verify only dependency files changed",
+    );
+    expect(verifyStep.run).toContain("tar -cf regen-handoff.tar --null --verbatim-files-from -T -");
+    // Always created, even when the feature is off, so the artifact's
+    // fixed path list below never goes missing.
+    expect(verifyStep.run).toContain("tar -cf regen-handoff.tar -T /dev/null");
+    const handoffStep = doc.jobs.update.steps.find(
+      (s) => s.name === "Hand off the dependency diff",
+    );
+    expect(handoffStep.with.path).toContain("regen-handoff.tar");
+  });
+
+  it("validates the declaration end to end: empty, duplicate, noncanonical, untracked, and a clean pass", () => {
+    // Real execution against a real git repo, not just a structural regex --
+    // same discipline the verdict step's test above uses. The step's own
+    // `set -euo pipefail` under `eval "$cmd"` means any nonzero exit from
+    // the harness itself (not just the checked assertions) would also
+    // surface as a thrown error here.
+    const regenStep = doc.jobs.update.steps.find((s) => s.id === "regen");
+    const scratch = mkdtempSync(join(tmpdir(), "npm-update-regen-"));
+    // The GITHUB_OUTPUT/GITHUB_STEP_SUMMARY files have to live OUTSIDE the
+    // repo the step runs in -- the step's own pretree check treats any
+    // untracked file in the working tree as a planted change, and a file
+    // written inside the repo dir would trip that check itself rather than
+    // the scenario each case means to exercise.
+    const tmp = join(scratch, "repo");
+    try {
+      execFileSync("mkdir", ["-p", tmp]);
+      execFileSync("git", ["init", "-q"], { cwd: tmp });
+      execFileSync("git", ["config", "user.email", "t@example.com"], { cwd: tmp });
+      execFileSync("git", ["config", "user.name", "t"], { cwd: tmp });
+      writeFileSync(join(tmp, "checks.md"), "- ✅ `npm ci`\n");
+      writeFileSync(join(tmp, "deps-stat.txt"), " 1 file changed\n");
+
+      const run = (regenerate, regeneratedFiles) => {
+        const outPath = join(scratch, "out.txt");
+        const summaryPath = join(scratch, "summary.txt");
+        // The step's own last two lines truncate these under `set -u`, same
+        // as the real runner always has them set.
+        const pathPath = join(scratch, "path.txt");
+        const envPath = join(scratch, "env.txt");
+        for (const p of [outPath, summaryPath, pathPath, envPath]) writeFileSync(p, "");
+        // Reset tracked state between cases: the "clean pass" case leaves
+        // a.json modified in the working tree (the regenerate step never
+        // commits), which the NEXT case's pretree check would otherwise
+        // see as a pre-existing dirty file rather than the scenario that
+        // case means to exercise.
+        execFileSync("git", ["checkout", "--", "."], { cwd: tmp });
+        try {
+          execFileSync("bash", ["-c", regenStep.run], {
+            cwd: tmp,
+            env: {
+              ...process.env,
+              REGENERATE: regenerate,
+              REGENERATED_FILES: regeneratedFiles,
+              GITHUB_OUTPUT: outPath,
+              GITHUB_STEP_SUMMARY: summaryPath,
+              GITHUB_PATH: pathPath,
+              GITHUB_ENV: envPath,
+            },
+          });
+          return { ok: true, output: readFileSync(outPath, "utf8") };
+        } catch (e) {
+          // ::error:: lines go to stdout (plain `echo`), not stderr.
+          return { ok: false, stdout: e.stdout?.toString() ?? "" };
+        }
+      };
+
+      // Committed upfront (not inline with the "clean pass" case below) so
+      // every case -- including the failing ones above it -- can reset to
+      // this same known-clean state; git checkout -- . needs a commit to
+      // reset TO, which doesn't exist before this.
+      writeFileSync(join(tmp, "a.json"), "before\n");
+      execFileSync("git", ["add", "a.json"], { cwd: tmp });
+      execFileSync("git", ["commit", "-q", "-m", "seed"], { cwd: tmp });
+
+      // Empty regenerated-files is a configuration error, not a no-op.
+      let r = run("echo hi", "");
+      expect(r.ok).toBe(false);
+      expect(r.stdout).toContain("regenerated-files is empty");
+
+      // A duplicate entry.
+      r = run("echo hi", "a.json\na.json");
+      expect(r.ok).toBe(false);
+      expect(r.stdout).toContain("lists the same path more than once");
+
+      // A noncanonical path.
+      r = run("echo hi", "./a.json");
+      expect(r.ok).toBe(false);
+      expect(r.stdout).toContain("is not in canonical repo-relative form");
+
+      // A path git does not track.
+      r = run("echo hi", "untracked.json");
+      expect(r.ok).toBe(false);
+      expect(r.stdout).toContain("names a file git does not track");
+
+      // A clean pass: the tracked file, a regenerate command that rewrites
+      // it, fingerprints produced, PATH/ENV cleared.
+      r = run("echo after > a.json", "a.json");
+      expect(r.ok).toBe(true);
+      expect(r.output).toContain("files_sha<<REGEN_SHA_EOF");
+      expect(r.output).toMatch(/^[0-9a-f]{64}\s+a\.json$/m);
+      expect(r.output).toContain("files_mode<<REGEN_MODE_EOF");
+      expect(r.output).toContain("100644 a.json");
+      expect(readFileSync(join(tmp, "a.json"), "utf8")).toBe("after\n");
+
+      // A regenerate command that modifies checks.md is caught, not
+      // silently trusted -- these files belong to the workflow.
+      r = run("echo tampered >> checks.md", "a.json");
+      expect(r.ok).toBe(false);
+      expect(r.stdout).toContain("a regenerate command modified checks.md or deps-stat.txt");
+    } finally {
+      rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
+  it("withholds auto-merge and flags the title when this batch regenerated a file, even though the ordinary checks passed", () => {
+    // A Codex finding on the original PR: a regenerated file's content is
+    // only fingerprint-checked in publish, never independently re-derived
+    // the way the manifests are (see AGENTS.md "Trust model") — so without
+    // this gate, untrusted update-job code could determine what
+    // auto-merges through a regenerated file while every ordinary check
+    // still passes.
+    const openPr = doc.jobs.publish.steps.find((s) => s.name === "Open the pull request");
+    expect(openPr.env.REGEN_SHA).toBe("${{ needs.update.outputs.regen_sha }}");
+    expect(openPr.run).toContain("REGENERATED FILES, REVIEW BEFORE MERGE");
+    expect(openPr.run).toMatch(
+      /if \[ "\$PASSED" = 'true' \] && \[ -z "\$REGEN_SHA" \]; then\n\s*if ! gh pr merge --auto --rebase "\$pr"; then/,
+    );
+    // A failing check still outranks the regen flag in the title -- the
+    // batch is broken first, and "REGENERATED FILES" only applies once
+    // PASSED is already true.
+    expect(openPr.run).toMatch(
+      /if \[ "\$PASSED" != 'true' \]; then\n\s*title="deps: Update dependencies \(\$today\) — CHECKS FAILING"[^]*?elif \[ -n "\$REGEN_SHA" \]; then\n\s*[^]*?title="deps: Update dependencies \(\$today\) — REGENERATED FILES, REVIEW BEFORE MERGE"/,
+    );
+  });
+
+  it("compares a regenerated-files path against unquoted git status output, not the default quoted form", () => {
+    // A Codex finding on the original PR: `git status --porcelain` (no -z)
+    // wraps a tracked path containing a space (or another
+    // core.quotePath-triggering character) in C-style quotes -- comparing
+    // that quoted status line against the raw declared path would never
+    // match, wrongly aborting every batch whose declared path needed
+    // quoting. Verified directly against a real git repo, not just a
+    // structural regex: a fixed-string false positive is exactly the kind
+    // of bug a regex-only test would miss.
+    const verifyStep = doc.jobs.update.steps.find(
+      (s) => s.name === "Verify only dependency files changed",
+    );
+    expect(verifyStep.run).toContain("git status --porcelain -z --untracked-files=all");
+
+    const scratch = mkdtempSync(join(tmpdir(), "npm-update-verify-"));
+    const tmp = join(scratch, "repo");
+    try {
+      execFileSync("mkdir", ["-p", join(tmp, "gen dir")]);
+      execFileSync("git", ["init", "-q"], { cwd: tmp });
+      execFileSync("git", ["config", "user.email", "t@example.com"], { cwd: tmp });
+      execFileSync("git", ["config", "user.name", "t"], { cwd: tmp });
+      writeFileSync(join(tmp, "package.json"), "{}\n");
+      writeFileSync(join(tmp, "package-lock.json"), "{}\n");
+      writeFileSync(join(tmp, "gen dir", "a file.json"), "before\n");
+      execFileSync("git", ["add", "-A"], { cwd: tmp });
+      execFileSync("git", ["commit", "-q", "-m", "seed"], { cwd: tmp });
+      // Regeneration itself already happened (out of scope for this step);
+      // simulate its result the same way the real job would hand it off --
+      // steps.regen.outputs.files_sha/files_mode as env vars, and the file
+      // already rewritten in the working tree.
+      writeFileSync(join(tmp, "gen dir", "a file.json"), "after\n");
+      const sha = execFileSync(
+        "sh",
+        ["-c", `sha256sum -- "gen dir/a file.json"`],
+        { cwd: tmp },
+      ).toString();
+      writeFileSync(join(tmp, "checks.md"), "- ✅ `npm ci`\n");
+      writeFileSync(join(tmp, "deps-stat.txt"), " 1 file changed\n");
+      const pkgSha = execFileSync("sh", ["-c", "sha256sum package.json | cut -d' ' -f1"], {
+        cwd: tmp,
+      })
+        .toString()
+        .trim();
+      const lockSha = execFileSync(
+        "sh",
+        ["-c", "sha256sum package-lock.json | cut -d' ' -f1"],
+        { cwd: tmp },
+      )
+        .toString()
+        .trim();
+
+      const outPath = join(scratch, "out.txt");
+      const summaryPath = join(scratch, "summary.txt");
+      writeFileSync(outPath, "");
+      writeFileSync(summaryPath, "");
+      execFileSync("bash", ["-c", verifyStep.run], {
+        cwd: tmp,
+        env: {
+          ...process.env,
+          PKG_SHA: pkgSha,
+          LOCK_SHA: lockSha,
+          REGENERATED_FILES: "gen dir/a file.json",
+          REGEN_SHA: sha,
+          REGEN_MODE: "100644 gen dir/a file.json\n",
+          GITHUB_OUTPUT: outPath,
+          GITHUB_STEP_SUMMARY: summaryPath,
+          // Outside the repo dir, same as the real runner: the step's own
+          // temp status file must not itself show up as an untracked
+          // change in the git status it's capturing.
+          RUNNER_TEMP: scratch,
+        },
+      });
+      // No throw means the step accepted the regenerated file's change
+      // instead of reporting it as unexpected -- the bug this test guards
+      // against would have thrown "Dependency code touched files outside
+      // the dependency manifests" here.
+      expect(existsSync(join(tmp, "regen-handoff.tar"))).toBe(true);
+    } finally {
+      rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
+  it("still catches a genuinely undeclared file when regenerated-files names two or more paths", () => {
+    // A second Codex finding on the same PR: grep's bare positional-
+    // argument form only accepts ONE pattern -- `grep -Fxv -- a b` treats
+    // `b` as a FILE to search rather than a second pattern (confirmed
+    // directly: it errors "b: No such file or directory", or worse,
+    // silently greps b's own CONTENT instead of the piped $unexpected
+    // list if `b` happens to exist). With two or more regenerated-files
+    // declared, that could let a genuinely undeclared file slip through
+    // unreported -- the exact failure mode the tree check exists to
+    // prevent. A single-declared-file test (above) can't reach this path
+    // at all, since grep's one-positional-pattern form works fine with
+    // exactly one.
+    const verifyStep = doc.jobs.update.steps.find(
+      (s) => s.name === "Verify only dependency files changed",
+    );
+    const scratch = mkdtempSync(join(tmpdir(), "npm-update-verify-multi-"));
+    const tmp = join(scratch, "repo");
+    try {
+      execFileSync("mkdir", ["-p", tmp]);
+      execFileSync("git", ["init", "-q"], { cwd: tmp });
+      execFileSync("git", ["config", "user.email", "t@example.com"], { cwd: tmp });
+      execFileSync("git", ["config", "user.name", "t"], { cwd: tmp });
+      writeFileSync(join(tmp, "package.json"), "{}\n");
+      writeFileSync(join(tmp, "package-lock.json"), "{}\n");
+      writeFileSync(join(tmp, "a.json"), "before\n");
+      writeFileSync(join(tmp, "b.json"), "before\n");
+      execFileSync("git", ["add", "-A"], { cwd: tmp });
+      execFileSync("git", ["commit", "-q", "-m", "seed"], { cwd: tmp });
+
+      // Both declared files legitimately changed (as the real regenerate
+      // step would have left them) -- PLUS one genuinely undeclared file,
+      // planted the way a lifecycle script would.
+      writeFileSync(join(tmp, "a.json"), "after\n");
+      writeFileSync(join(tmp, "b.json"), "after\n");
+      writeFileSync(join(tmp, "planted.json"), "not declared\n");
+      const sha = execFileSync("sh", ["-c", "sha256sum -- a.json b.json"], { cwd: tmp }).toString();
+      writeFileSync(join(tmp, "checks.md"), "- ✅ `npm ci`\n");
+      writeFileSync(join(tmp, "deps-stat.txt"), " 1 file changed\n");
+      const pkgSha = execFileSync("sh", ["-c", "sha256sum package.json | cut -d' ' -f1"], {
+        cwd: tmp,
+      })
+        .toString()
+        .trim();
+      const lockSha = execFileSync(
+        "sh",
+        ["-c", "sha256sum package-lock.json | cut -d' ' -f1"],
+        { cwd: tmp },
+      )
+        .toString()
+        .trim();
+
+      const outPath = join(scratch, "out.txt");
+      const summaryPath = join(scratch, "summary.txt");
+      writeFileSync(outPath, "");
+      writeFileSync(summaryPath, "");
+      let threw = null;
+      try {
+        execFileSync("bash", ["-c", verifyStep.run], {
+          cwd: tmp,
+          env: {
+            ...process.env,
+            PKG_SHA: pkgSha,
+            LOCK_SHA: lockSha,
+            REGENERATED_FILES: "a.json\nb.json",
+            REGEN_SHA: sha,
+            REGEN_MODE: "100644 a.json\n100644 b.json\n",
+            GITHUB_OUTPUT: outPath,
+            GITHUB_STEP_SUMMARY: summaryPath,
+            RUNNER_TEMP: scratch,
+          },
+        });
+      } catch (e) {
+        threw = e;
+      }
+      expect(!!threw).toBe(true);
+      expect(threw.stdout.toString()).toContain(
+        "Dependency code touched files outside the dependency manifests",
+      );
+      expect(threw.stdout.toString()).toContain("planted.json");
+    } finally {
+      rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
+  it("treats a declared regenerated-files path as a literal pathspec, never as git pathspec magic", () => {
+    // A Codex finding on the original PR: `git ls-files`/`git diff`/`git
+    // add` all read their pathspec argument for MAGIC by default --
+    // ":(top)**" matches every tracked file rather than a file literally
+    // named that (verified directly: `git ls-files --error-unmatch --
+    // ":(top)**"` succeeds and lists the whole tree). Without
+    // GIT_LITERAL_PATHSPECS=1, a declared path that happens to start with
+    // pathspec magic would pass the "must be tracked" check for the wrong
+    // reason (matching SOME tracked file, not the literal name) and later
+    // stage far more than the one file `regenerated-files` names.
+    const regenStep = doc.jobs.update.steps.find((s) => s.id === "regen");
+    expect(regenStep.env.GIT_LITERAL_PATHSPECS).toBe("1");
+    const openPr = doc.jobs.publish.steps.find((s) => s.name === "Open the pull request");
+    expect(openPr.env.GIT_LITERAL_PATHSPECS).toBe("1");
+
+    const scratch = mkdtempSync(join(tmpdir(), "npm-update-pathspec-"));
+    const tmp = join(scratch, "repo");
+    try {
+      execFileSync("mkdir", ["-p", tmp]);
+      execFileSync("git", ["init", "-q"], { cwd: tmp });
+      execFileSync("git", ["config", "user.email", "t@example.com"], { cwd: tmp });
+      execFileSync("git", ["config", "user.name", "t"], { cwd: tmp });
+      writeFileSync(join(tmp, "tracked.json"), "x\n");
+      execFileSync("git", ["add", "tracked.json"], { cwd: tmp });
+      execFileSync("git", ["commit", "-q", "-m", "seed"], { cwd: tmp });
+      writeFileSync(join(tmp, "checks.md"), "- ✅ `npm ci`\n");
+      writeFileSync(join(tmp, "deps-stat.txt"), " 1 file changed\n");
+
+      const outPath = join(scratch, "out.txt");
+      const summaryPath = join(scratch, "summary.txt");
+      const pathPath = join(scratch, "path.txt");
+      const envPath = join(scratch, "env.txt");
+      for (const p of [outPath, summaryPath, pathPath, envPath]) writeFileSync(p, "");
+      let threw = null;
+      try {
+        execFileSync("bash", ["-c", regenStep.run], {
+          cwd: tmp,
+          env: {
+            ...process.env,
+            REGENERATE: "echo hi",
+            // No literal file by this name exists -- only pathspec magic
+            // (which GIT_LITERAL_PATHSPECS must disable) could make the
+            // tracked-file check pass for it.
+            REGENERATED_FILES: ":(top)**",
+            // The real runner sets this from the step's own `env:` block
+            // (asserted above); executing the extracted script directly
+            // needs it set explicitly the same way.
+            GIT_LITERAL_PATHSPECS: "1",
+            GITHUB_OUTPUT: outPath,
+            GITHUB_STEP_SUMMARY: summaryPath,
+            GITHUB_PATH: pathPath,
+            GITHUB_ENV: envPath,
+          },
+        });
+      } catch (e) {
+        threw = e;
+      }
+      expect(!!threw).toBe(true);
+      expect(threw.stdout.toString()).toContain("names a file git does not track");
+    } finally {
+      rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
+  it("propagates a git-status failure from the pre-regeneration check instead of swallowing it", () => {
+    // A Codex finding on the original PR: the pretree check's `|| true`
+    // on the end of its filtering pipe would swallow a genuine git-status
+    // failure the same way the final tree check's ORIGINAL single-pipe
+    // form did (fixed earlier in this same PR) -- a corrupted git state
+    // read as "nothing dirty" lets a regenerate command run and
+    // fingerprint content this pre-check exists to have already stopped
+    // on. Isolated to JUST the pretree call with a fake `git` on PATH
+    // that fails only `git status` and delegates everything else (the
+    // validation loop's `git ls-files --error-unmatch`, the final `git
+    // diff --stat`) to the real binary -- corrupting the whole repo, as
+    // the sibling tree-check test does, doesn't work HERE: `git ls-files
+    // --error-unmatch` runs BEFORE the pretree check and fails on the
+    // same corruption for an unrelated reason, so the script would throw
+    // either way and the test couldn't tell a fixed pretree check from a
+    // still-broken one.
+    const regenStep = doc.jobs.update.steps.find((s) => s.id === "regen");
+    const scratch = mkdtempSync(join(tmpdir(), "npm-update-pretree-"));
+    const tmp = join(scratch, "repo");
+    const fakeBin = join(scratch, "fakebin");
+    try {
+      execFileSync("mkdir", ["-p", tmp, fakeBin]);
+      execFileSync("git", ["init", "-q"], { cwd: tmp });
+      execFileSync("git", ["config", "user.email", "t@example.com"], { cwd: tmp });
+      execFileSync("git", ["config", "user.name", "t"], { cwd: tmp });
+      writeFileSync(join(tmp, "a.json"), "x\n");
+      execFileSync("git", ["add", "a.json"], { cwd: tmp });
+      execFileSync("git", ["commit", "-q", "-m", "seed"], { cwd: tmp });
+      writeFileSync(join(tmp, "checks.md"), "- ✅ `npm ci`\n");
+      writeFileSync(join(tmp, "deps-stat.txt"), " 1 file changed\n");
+
+      const realGit = execFileSync("which", ["git"]).toString().trim();
+      const fakeGitPath = join(fakeBin, "git");
+      writeFileSync(
+        fakeGitPath,
+        `#!/usr/bin/env bash\nif [ "$1" = "status" ]; then\n  echo "fatal: simulated transient status failure" >&2\n  exit 128\nfi\nexec ${realGit} "$@"\n`,
+        { mode: 0o755 },
+      );
+
+      const outPath = join(scratch, "out.txt");
+      const summaryPath = join(scratch, "summary.txt");
+      const pathPath = join(scratch, "path.txt");
+      const envPath = join(scratch, "env.txt");
+      for (const p of [outPath, summaryPath, pathPath, envPath]) writeFileSync(p, "");
+      let threw = null;
+      try {
+        execFileSync("bash", ["-c", regenStep.run], {
+          cwd: tmp,
+          env: {
+            ...process.env,
+            PATH: `${fakeBin}:${process.env.PATH}`,
+            REGENERATE: "echo hi",
+            REGENERATED_FILES: "a.json",
+            GITHUB_OUTPUT: outPath,
+            GITHUB_STEP_SUMMARY: summaryPath,
+            GITHUB_PATH: pathPath,
+            GITHUB_ENV: envPath,
+          },
+        });
+      } catch (e) {
+        threw = e;
+      }
+      // The regression this test guards against would have this call
+      // SUCCEED (no throw at all): the old single-pipe `|| true` form
+      // reads the simulated status failure as an empty, clean $pretree
+      // and lets the rest of the step run to completion on `echo hi`.
+      expect(!!threw).toBe(true);
+      expect(threw.stdout.toString()).not.toContain(
+        "The checks changed the tree outside the dependency manifests",
+      );
+    } finally {
+      rmSync(scratch, { recursive: true, force: true });
     }
   });
 });

@@ -71,6 +71,37 @@ pr: ${{ github.event.pull_request.number || inputs.pr }}
 
 gedmap's own `ci.yml` follows this pattern for its mikelward/lanes gate.
 
+## Regenerating a derived file
+
+A consumer whose build keeps a tracked file in sync with the dependency set
+— readmo's `supabase/functions/import_map.json`, kept in step with
+`package-lock.json` via `npm run import-map:sync` — declares that with the
+`regenerate` and `regenerated-files` inputs:
+
+```yaml
+jobs:
+  npm-update:
+    uses: mikelward/npm-update/.github/workflows/npm-update.yml@main
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: write
+    with:
+      regenerate: npm run import-map:sync
+      regenerated-files: supabase/functions/import_map.json
+```
+
+Both take one entry per line for more than one command or file. `regenerate`
+runs after the check suite, reusing the real install the checks already did;
+a failing command stops the batch rather than publishing stale derived
+output. `regenerated-files` is the commit allowlist: every path it names
+must already be a tracked file (this rebuilds an existing one, it does not
+create a new one) and nothing outside the declared set may change during
+regeneration — the same tree check that already guards the manifests
+enforces this too, fingerprinting each declared file the same way. Leaving
+both empty (the default) disables the hook entirely — no change for an
+existing consumer that doesn't set them.
+
 ## Auto-merge needs "up to date" required, or a merge queue
 
 Once the producer job's own checks pass, the workflow arms `gh pr merge
