@@ -559,6 +559,62 @@ test("a tab at a block scalar's dedent boundary still rejects, even with content
   );
 });
 
+test("throws on a tab in a blank or comment-only line outside any block scalar", () => {
+  // Neither line holds a mapping key, a sequence item, or block-scalar
+  // payload — a blank line and a full-line comment are both excluded from
+  // structural parsing entirely, so nothing had ever visited them to check.
+  // Verified against yaml.safe_load("a: 1\n\t# comment\nb: 2\n") and
+  // ("a: 1\n\t\nb: 2\n"), both a ScannerError despite the tab-bearing line
+  // holding no content of its own.
+  assert.throws(
+    () => parseWorkflowYaml("a: 1\n\t# comment\nb: 2\n"),
+    /tab in indentation/,
+  );
+  assert.throws(
+    () => parseWorkflowYaml("a: 1\n\t\nb: 2\n"),
+    /tab in indentation/,
+  );
+});
+
+test("throws on a tab-only blank line inside a block scalar, before or after its margin is established", () => {
+  // A line that is nothing but tabs still trims to "" (this file's own
+  // isBlank definition), which previously exempted it from the
+  // block-scalar tab check entirely. Verified against
+  // yaml.safe_load("run: |\n\t\n  x\n") (the tab-only line comes BEFORE
+  // anything establishes the block's margin) and
+  // ("run: |\n  x\n\t\t\n  y\n") (it comes AFTER, within the established
+  // margin) — both a ScannerError.
+  assert.throws(
+    () => parseWorkflowYaml("run: |\n\t\n  x\n"),
+    /tab in indentation/,
+  );
+  assert.throws(
+    () => parseWorkflowYaml("run: |\n  x\n\t\t\n  y\n"),
+    /tab in indentation/,
+  );
+});
+
+test("does not treat U+00A0 (NBSP) as YAML separation whitespace", () => {
+  // JS's \s matches Unicode whitespace generally, including NBSP, but
+  // YAML's own s-white is ASCII space and tab only. Three checks in this
+  // file narrow \s to [ \t] for exactly this reason — verified against
+  // yaml.safe_load for each:
+  // - A colon followed by NBSP inside a plain scalar's VALUE is ordinary
+  //   content, not a nested mapping-value indicator ("name: Build:\xa0Linux"
+  //   -> {'name': 'Build:\xa0Linux'}), so parseScalar's colon check must not
+  //   reject it.
+  const doc = parseWorkflowYaml("name: Build: Linux\n");
+  assert.equal(doc.name, "Build: Linux");
+  // - NBSP does not start a comment ("a: b\xa0# not a comment" ->
+  //   {'a': 'b\xa0# not a comment'}), unlike a real space before #.
+  const doc2 = parseWorkflowYaml("a: b # not a comment\n");
+  assert.equal(doc2.a, "b # not a comment");
+  // A real space DOES still start a comment — the fix must not disable
+  // comment detection generally, only for the non-s-white NBSP case.
+  const doc3 = parseWorkflowYaml("a: b # a real comment\n");
+  assert.equal(doc3.a, "b");
+});
+
 test("throws on an unterminated quoted scalar, rather than returning the malformed text as a plain string", () => {
   // `name: "example` (no closing quote) previously fell through every
   // quoted-scalar branch — startsWith('"') && endsWith('"') was false, since
