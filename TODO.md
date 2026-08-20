@@ -17,11 +17,11 @@ Deferred work, recorded here so it isn't lost.
       delete the now-redundant `gate` job and its parity test
       (`workflow-check-rename.test.js`) in a follow-up PR.
 
-## The extracted workflow, when it arrives
+## The extracted workflow
 
-- [ ] **Build the clean-context registry re-check in from day one** — the
-      `--verify-upstream` class the Gradle and Rust siblings run in their
-      publish jobs, which this repository's pure-text checker cannot give:
+- [ ] **Add the clean-context registry re-check** — the `--verify-upstream`
+      class the Gradle and Rust siblings run in their publish jobs, which
+      this repository's pure-text checker cannot give:
       re-ask the npm registry, from a runner that executed no dependency
       code, that every new version exists with the registry's own
       `dist.integrity` hash, that its publish date (the registry's `time`

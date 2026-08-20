@@ -2,9 +2,8 @@ name: npm update
 
 # The reusable half of the weekly dependency batch. A consumer's own
 # npm-update.yml is a few lines calling this via `uses:` — see README.md for
-# the wiring example. Ported from gedmap's original per-repo copy, which is
-# now the thin caller (readmo and newshacker still run their own full copies
-# until they migrate too — see AGENTS.md "The extraction").
+# the wiring example. Ported from gedmap's original per-repo copy; readmo and
+# newshacker have since migrated too (see AGENTS.md "The extraction").
 #
 # `npm update` moves each dependency to the newest version ALLOWED BY THE
 # RANGE ALREADY IN package.json, so a DIRECT dependency cannot cross a major:
