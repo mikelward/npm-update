@@ -5,12 +5,12 @@ Conventions for AI agents working in this repository.
 `CLAUDE.md` is a symlink to this file, so every agent reads the same
 conventions. Edit `AGENTS.md`.
 
-This repository is the shared home of the weekly npm dependency batch: today
-the lockfile major-crossing checker, with the rest of the reusable update
-workflow arriving as it is extracted from the per-repo copies in gedmap,
-newshacker, and readmo. Consumers will track `@main`, so **a merge here
-reaches every consumer's weekly run with no release step in between.**
-Everything below follows from that.
+This repository is the shared home of the weekly npm dependency batch: the
+lockfile major-crossing checker plus the full reusable update workflow,
+extracted from the per-repo copies gedmap, newshacker, and readmo used to
+run. Consumers track `@main`, so **a merge here reaches every consumer's
+weekly run with no release step in between.** Everything below follows from
+that.
 
 Keep this file as short as it can be and still work. Every session loads it
 whole, so each rule costs context on every turn: add one the first time
@@ -20,12 +20,12 @@ has stopped biting.
 
 ## The extraction
 
-- **The per-repo copies are still live.** gedmap, newshacker, and readmo run
-  their own `scripts/check-npm-update.mjs` and
-  `.github/workflows/npm-update.yml` until they consume this repository
-  instead. Until a consumer has switched, a fix to the checker lands in its
-  copy too — the extraction must not become the place where the copies start
-  drifting, since drift is the problem it exists to end.
+- **gedmap, newshacker, and readmo all consume this repository now.** The
+  per-repo `scripts/check-npm-update.mjs` and full
+  `.github/workflows/npm-update.yml` copies are retired everywhere; each
+  consumer keeps only a thin caller plus whatever `with:` inputs it needs
+  (readmo's `regenerate`/`regenerated-files` for its Deno import map). A fix
+  here reaches all three on their next scheduled run.
 - **A change that touches consumers goes through ONE of them first.** Never
   open the same change across the consumers at once: they share one automated
   reviewer, so a finding against a change made three times is the same finding
