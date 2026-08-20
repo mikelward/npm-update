@@ -30,6 +30,29 @@ name: npm update
 
 on:
   workflow_call:
+    inputs:
+      regenerate:
+        description: >-
+          Commands that rebuild a file derived from the dependency set (an
+          import map kept in sync with the lockfile, say), one per line.
+          They run after the check suite, reusing the real install the
+          checks already did rather than installing a second time, in the
+          same untrusted window. A failure stops the run: publishing a
+          batch whose derived files are stale is the silent drift this
+          input exists to end. Empty disables.
+        type: string
+        default: ''
+      regenerated-files:
+        description: >-
+          Tracked files the regenerate commands rebuild, one per line,
+          repo-relative. Committed alongside the manifests when they
+          change, fingerprinted and verified the same way — the
+          declaration is the boundary: only files named here may change
+          during regeneration, and anything else the commands touch stops
+          the run exactly as the tree check always has. Required when
+          regenerate is set.
+        type: string
+        default: ''
 
 # No permissions at the workflow level. The job that runs unreviewed
 # dependency code gets a read-only token; only the publish job, which runs
@@ -57,6 +80,8 @@ jobs:
       lock_sha: ${{ steps.changed.outputs.lock_sha }}
       checks_sha: ${{ steps.checks.outputs.checks_sha }}
       deps_stat_sha: ${{ steps.checks.outputs.deps_stat_sha }}
+      regen_sha: ${{ steps.regen.outputs.files_sha }}
+      regen_mode: ${{ steps.regen.outputs.files_mode }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -286,6 +311,159 @@ jobs:
           : > "$GITHUB_PATH"
           : > "$GITHUB_ENV"
 
+      # Rebuilds a file derived from the dependency set (readmo's import map
+      # kept in sync with package-lock.json is the motivating case), one
+      # command per line — the npm-update analog of gradle-update's
+      # `regenerate` input. Runs after the checks, reusing the real install
+      # they already did rather than installing a second time, in the SAME
+      # untrusted window. A failure here is a STOP, unlike a failed check
+      # above: publishing a batch whose derived files are stale is the
+      # silent drift this input exists to end.
+      - name: Regenerate derived files
+        if: steps.changed.outputs.changed == 'true' && inputs.regenerate != ''
+        id: regen
+        env:
+          REGENERATE: ${{ inputs.regenerate }}
+          REGENERATED_FILES: ${{ inputs.regenerated-files }}
+          # A declared path is consumer configuration, not something to
+          # trust as a literal filename by default: `git ls-files` and
+          # `git diff` below both read their pathspec argument for MAGIC
+          # (":(top)**" matches every tracked file, not a file literally
+          # named that) unless told not to — verified directly against a
+          # real repo. Global for the step rather than per-invocation
+          # since every git call here takes one of these paths.
+          GIT_LITERAL_PATHSPECS: '1'
+        run: |
+          set -euo pipefail
+          # The declaration is load-bearing — it is the commit allowlist —
+          # so an empty one is a configuration error, not a default.
+          files=()
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            files+=("$f")
+          done <<< "$REGENERATED_FILES"
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo '::error::regenerate is set but regenerated-files is empty — declare the files the commands rebuild.'
+            exit 1
+          fi
+          # A duplicate survives the tree check below (both entries name the
+          # same real change) but not the publish job's restore, which
+          # extracts the artifact once per declared entry and removes each
+          # source after copying it out — the second occurrence of the same
+          # path would find nothing left to copy.
+          dupes=$(printf '%s\n' "${files[@]}" | sort | uniq -d)
+          if [ -n "$dupes" ]; then
+            echo "::error::regenerated-files lists the same path more than once:"
+            echo "$dupes"
+            exit 1
+          fi
+          for f in "${files[@]}"; do
+            # Canonicalized so every later comparison — the tree check's
+            # allowlist, the fingerprint lookups, the commit — is a plain
+            # string match; a noncanonical spelling like ./x.json would be
+            # declared and fingerprinted here but never match what git
+            # status reports later, aborting every batch that actually
+            # changes the file.
+            canon=$(realpath -m --relative-to="$PWD" -- "$f")
+            if [ "$canon" != "$f" ]; then
+              echo "::error::regenerated-files entry '$f' is not in canonical repo-relative form; use '$canon'."
+              exit 1
+            fi
+            case "$f" in
+              package.json|package-lock.json|checks.md|deps-stat.txt|regen-handoff.tar|regen-stat.txt)
+                echo "::error::regenerated-files must not name a file the workflow itself owns: $f"
+                exit 1 ;;
+              npm-update-hub|npm-update-hub/*)
+                # The publish job's own checkout directory for the
+                # canonical checker (see that job's "Check out the
+                # canonical checker" step) — restoring a regenerated file
+                # under this prefix would collide with it.
+                echo "::error::regenerated-files must not name a path under npm-update-hub/ — that is the publish job's own checkout directory: $f"
+                exit 1 ;;
+            esac
+            # Tracked files only: the publish job restores each one over a
+            # checkout of the base, so a path with no base state has
+            # nothing to be a regeneration OF — commit it by hand first.
+            git ls-files --error-unmatch -- "$f" >/dev/null 2>&1 || {
+              echo "::error::regenerated-files names a file git does not track: $f"
+              exit 1
+            }
+          done
+          # Before any regenerate command runs: the checks above already ran
+          # unreviewed dependency code and could have left the tree dirty.
+          # A regenerate command that resets its own working state first (an
+          # ordinary "npm run build" doing something incidental) would
+          # otherwise silently erase that evidence before the tree check at
+          # the end of this job ever sees it, and a declared file the checks
+          # modified would be fingerprinted and committed as though
+          # regeneration produced it, when nothing here actually vouches for
+          # it.
+          # git status runs as its own bare assignment, not inside a longer
+          # pipe ending in `|| true`, for the same reason the final tree
+          # check further down does: a `|| true` on the end of a longer
+          # pipe swallows a git-status failure exactly as readily as it
+          # swallows grep's ordinary no-matches exit 1 (verified directly:
+          # a corrupted .git produces an EMPTY $pretree with a zero exit
+          # from the single-pipe form) — a corrupted git state read as
+          # "nothing dirty" would let this pre-check silently pass instead
+          # of catching exactly what it exists to catch.
+          pretree_status=$(git status --porcelain --untracked-files=all)
+          pretree=$(printf '%s\n' "$pretree_status" \
+            | sed 's/^...//' \
+            | grep -Ev '^(package\.json|package-lock\.json|checks\.md|deps-stat\.txt)$' || true)
+          if [ -n "$pretree" ]; then
+            echo '::error::The checks changed the tree outside the dependency manifests before regeneration ran. Not opening a PR — inspect these first:'
+            echo "$pretree"
+            exit 1
+          fi
+          # Fingerprinted before the regenerate commands run, verified
+          # after: checks.md and deps-stat.txt already exist by now, but
+          # nothing before this point stops a regenerate command — the same
+          # dependency-adjacent code as the checks — from writing to them
+          # too.
+          reports_sha_before=$(sha256sum checks.md deps-stat.txt)
+          # Same containment as the checks, but a failure here is a STOP,
+          # not a flag: a batch whose derived files could not be rebuilt
+          # would publish stale ones.
+          while IFS= read -r cmd; do
+            [ -z "$cmd" ] && continue
+            echo "::group::$cmd"
+            ( export GITHUB_OUTPUT=/dev/null GITHUB_ENV=/dev/null \
+                GITHUB_PATH=/dev/null GITHUB_STEP_SUMMARY=/dev/null \
+                GITHUB_STATE=/dev/null
+              eval "$cmd" )
+            echo '::endgroup::'
+          done <<< "$REGENERATE"
+          if [ "$(sha256sum checks.md deps-stat.txt)" != "$reports_sha_before" ]; then
+            echo '::error::a regenerate command modified checks.md or deps-stat.txt — fix the regenerate input; these files belong to the workflow, not to a regeneration command.'
+            exit 1
+          fi
+          # sha256sum's own "hash  path" lines, so the publish job can
+          # verify the whole set with one `sha256sum -c`.
+          {
+            echo 'files_sha<<REGEN_SHA_EOF'
+            sha256sum -- "${files[@]}"
+            echo 'REGEN_SHA_EOF'
+          } >> "$GITHUB_OUTPUT"
+          # A content-only fingerprint has nothing to say about a chmod — a
+          # regenerate command can flip a declared file's executable bit
+          # without touching a byte of content. git's own two-state mode
+          # (100644/100755, the only distinction it stores for a regular
+          # file) is what a later `git add` will actually record, so that
+          # is what gets fingerprinted and later verified.
+          {
+            echo 'files_mode<<REGEN_MODE_EOF'
+            for f in "${files[@]}"; do
+              if [ -x "$f" ]; then echo "100755 $f"; else echo "100644 $f"; fi
+            done
+            echo 'REGEN_MODE_EOF'
+          } >> "$GITHUB_OUTPUT"
+          git diff --stat -- "${files[@]}" >> "$GITHUB_STEP_SUMMARY"
+          # Dependency-adjacent code ran above; discard anything it queued
+          # for later steps, same as every other step in this window.
+          : > "$GITHUB_PATH"
+          : > "$GITHUB_ENV"
+
       # The checks above and the commit below have to describe the SAME tree.
       # The commit stages package files by name (so a planted edit can't ride
       # along), but that cuts the other way too: a lifecycle script could edit
@@ -307,8 +485,27 @@ jobs:
           # than only where the blast radius differs.
           PKG_SHA: ${{ steps.changed.outputs.pkg_sha }}
           LOCK_SHA: ${{ steps.changed.outputs.lock_sha }}
+          REGENERATED_FILES: ${{ inputs.regenerated-files }}
+          # Empty unless the regenerate step ran and fingerprinted the
+          # declared files — every regenerated-file exemption below keys
+          # off THIS, never off the declaration alone: a `regenerate` input
+          # that is set but produced nothing yet must not exempt anything.
+          REGEN_SHA: ${{ steps.regen.outputs.files_sha }}
+          REGEN_MODE: ${{ steps.regen.outputs.files_mode }}
         run: |
           set -euo pipefail
+
+          # Regenerated files are the batch's own product when the
+          # regenerate step ran — expected to differ from the fixed
+          # allowlist below, vouched for by the fingerprint check further
+          # down rather than by appearing in it.
+          derived=()
+          if [ -n "$REGEN_SHA" ]; then
+            while IFS= read -r f; do
+              [ -z "$f" ] && continue
+              derived+=("$f")
+            done <<< "$REGENERATED_FILES"
+          fi
 
           # `git status`, not `git diff`: diff only sees TRACKED changes, so an
           # untracked file a lifecycle script drops into the tree — one that
@@ -317,27 +514,67 @@ jobs:
           # are excluded by porcelain already; the two allowed extras are files
           # this job writes itself.
           #
-          # git status runs as its OWN bare assignment, not inside the pipe
-          # below — `set -e` catches a bare `var=$(cmd)` assignment that
-          # fails, but a blanket `|| true` on the end of a longer pipe would
-          # swallow a git-status failure (a corrupted .git — a malicious
-          # lifecycle script run earlier in this same job could induce one,
-          # e.g. by removing .git/HEAD or .git/objects; a merely-missing
-          # index doesn't reach this path, since git just rebuilds one and
-          # git status still succeeds) exactly as readily as it swallows
-          # grep's ordinary no-matches exit 1 — verified against a repo with
-          # .git/HEAD removed ("fatal: not a git repository", exit 128): the
-          # old single-pipe form produced an EMPTY $unexpected with a zero
-          # exit, i.e. a corrupted git state read as "nothing unexpected,"
-          # passing the one check this step exists to enforce.
-          # sed isn't given the same treatment: it has no external input or
-          # adversarial surface here (a fixed substitution over text git
-          # status already produced), so its own failure isn't independently
-          # reachable the way git status's is.
-          status_all=$(git status --porcelain --untracked-files=all)
-          unexpected=$(printf '%s\n' "$status_all" \
-            | sed 's/^...//' \
-            | grep -Ev '^(package\.json|package-lock\.json|checks\.md|deps-stat\.txt)$' || true)
+          # git status writes to a TEMP FILE as its own bare command, not
+          # captured inside a $()/pipe — `set -e` catches a bare command
+          # that fails, but a blanket `|| true` on the end of a longer pipe
+          # would swallow a git-status failure (a corrupted .git — a
+          # malicious lifecycle script run earlier in this same job could
+          # induce one, e.g. by removing .git/HEAD or .git/objects; a
+          # merely-missing index doesn't reach this path, since git just
+          # rebuilds one and git status still succeeds) exactly as readily
+          # as it swallows grep's ordinary no-matches exit 1 — verified
+          # against a repo with .git/HEAD removed ("fatal: not a git
+          # repository", exit 128): a single-pipe form ending in `|| true`
+          # produced an EMPTY $unexpected with a zero exit, i.e. a
+          # corrupted git state read as "nothing unexpected," passing the
+          # one check this step exists to enforce. A `< <(git status ...)`
+          # process substitution would reopen the same hole in a subtler
+          # form — its own exit status isn't checked by set -e or
+          # pipefail — which is why this reads from a file `git status`
+          # itself was made to write, rather than a live substitution.
+          #
+          # -z, not the default quoted/newline format: a regenerated-files
+          # path is consumer data and can legitimately contain a space or
+          # another character `core.quotePath` wraps in C-style quotes —
+          # comparing that quoted status line against the raw declared path
+          # would never match, wrongly aborting every batch whose declared
+          # path needed quoting (verified directly: `git status
+          # --porcelain` quotes a tracked "a file.json", `-z` does not).
+          # And unlike a `tr '\0' '\n'` conversion, reading each NUL-
+          # terminated record whole with `read -r -d ''` can't confuse an
+          # embedded newline WITHIN an adversarial untracked filename for a
+          # genuine record boundary — a tr-based split would let such a
+          # filename masquerade as two separately-classified lines, one of
+          # which could satisfy the allowlist and hide the other.
+          status_z="$RUNNER_TEMP/npm-update-status.nul"
+          git status --porcelain -z --untracked-files=all > "$status_z"
+          unexpected=""
+          while IFS= read -r -d '' entry; do
+            path=${entry:3}
+            case "$path" in
+              package.json|package-lock.json|checks.md|deps-stat.txt)
+                continue ;;
+            esac
+            # Checked against the regenerated-files declaration as whole
+            # records too (a loop, not folded into the case above or a
+            # grep pass): `grep`'s bare positional-argument form only
+            # takes ONE pattern and treats any further arguments as FILE
+            # names to search instead — confirmed directly (`grep -Fxv --
+            # a b` errors "b: No such file or directory" rather than
+            # excluding both) — so a `regenerated-files` declaration of
+            # two or more paths would silently stop filtering after the
+            # first. This loop has no such arity limit.
+            keep=1
+            for d in "${derived[@]}"; do
+              if [ "$path" = "$d" ]; then
+                keep=0
+                break
+              fi
+            done
+            [ "$keep" -eq 1 ] && unexpected="$unexpected$path"$'\n'
+          done < "$status_z"
+          rm -f -- "$status_z"
+          unexpected=${unexpected%$'\n'}
           if [ -n "$unexpected" ]; then
             echo '::error::Dependency code touched files outside the dependency manifests. Not opening a PR — inspect these before trusting this batch:'
             echo "$unexpected"
@@ -386,6 +623,39 @@ jobs:
             exit 1
           fi
 
+          # Nor the regenerated files since the regenerate step fingerprinted
+          # them.
+          if [ -n "$REGEN_SHA" ]; then
+            printf '%s\n' "$REGEN_SHA" | sha256sum -c --strict --quiet \
+              || { echo '::error::A regenerated file changed AFTER the regenerate step fingerprinted it — something in the check run rewrote it. Not opening a PR.'; exit 1; }
+            # A content-only fingerprint has nothing to say about a chmod —
+            # see the regenerate step's own comment on why the mode is
+            # fingerprinted and verified separately.
+            while IFS= read -r mode_line; do
+              [ -z "$mode_line" ] && continue
+              want_mode=${mode_line%% *}
+              f=${mode_line#* }
+              if [ -x "$f" ]; then have_mode=100755; else have_mode=100644; fi
+              if [ "$have_mode" != "$want_mode" ]; then
+                echo "::error::A regenerated file's executable bit changed AFTER the regenerate step fingerprinted it ($f: expected $want_mode, now $have_mode) — something in the check run rewrote it. Not opening a PR."
+                exit 1
+              fi
+            done <<< "$REGEN_MODE"
+          fi
+
+          # The regenerated files travel as one tar under a fixed literal
+          # name — upload-artifact reads its path list as glob patterns,
+          # and a consumer's regenerated-files path is data that could
+          # legitimately hold a glob metacharacter. NUL-delimited verbatim
+          # names so no filename shape can smuggle options or split into
+          # two. Always created, even when the feature is off, so the
+          # artifact's fixed path list never goes missing.
+          if [ "${#derived[@]}" -gt 0 ]; then
+            printf '%s\0' "${derived[@]}" | tar -cf regen-handoff.tar --null --verbatim-files-from -T -
+          else
+            tar -cf regen-handoff.tar -T /dev/null
+          fi
+
           # The manifest CONTENT check does not live here — see the publish
           # job's "Re-validate the dependency diff from a clean context". This
           # job has run the updated packages' own code, so an assertion made
@@ -410,6 +680,7 @@ jobs:
             package-lock.json
             checks.md
             deps-stat.txt
+            regen-handoff.tar
           retention-days: 1
           if-no-files-found: error
 
@@ -494,6 +765,73 @@ jobs:
             || { echo '::error::checks.md does not match what the update job wrote.'; exit 1; }
           [ "$(sha256sum deps-stat.txt | cut -d" " -f1)" = "$DEPS_STAT_SHA" ] \
             || { echo '::error::deps-stat.txt does not match what the update job wrote.'; exit 1; }
+
+      # regen-handoff.tar travels through the same machine that ran
+      # dependency code, so nothing in it is trusted by name: it is
+      # unpacked OUTSIDE the checkout, only the paths regenerated-files
+      # declares are copied out of it, and each copy must match the
+      # fingerprint the regenerate step took before any review code ran. A
+      # no-op when regenerate is disabled (files_sha is then empty) — the
+      # tar still exists (always created by the update job) but is empty.
+      - name: Restore and verify regenerated files
+        env:
+          REGENERATED_FILES: ${{ inputs.regenerated-files }}
+          REGEN_SHA: ${{ needs.update.outputs.regen_sha }}
+          REGEN_MODE: ${{ needs.update.outputs.regen_mode }}
+        run: |
+          set -euo pipefail
+          [ -n "$REGEN_SHA" ] || exit 0
+          files=()
+          while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            files+=("$f")
+          done <<< "$REGENERATED_FILES"
+          mkdir -- "$RUNNER_TEMP/regenerated"
+          tar -xf regen-handoff.tar -C "$RUNNER_TEMP/regenerated"
+          for f in "${files[@]}"; do
+            [ -f "$RUNNER_TEMP/regenerated/$f" ] \
+              || { echo "::error::The artifact is missing declared regenerated file: $f"; exit 1; }
+            # `-L`, not `-f`: a symlink to a regular file passes `-f` (it
+            # dereferences), which is exactly the shape that would slip
+            # past this check and into the `cp` below. A regenerated file
+            # is always meant to be a plain file.
+            if [ -L "$RUNNER_TEMP/regenerated/$f" ]; then
+              echo "::error::regenerated-files artifact carries a symlink, not a regular file: $f"
+              exit 1
+            fi
+            # Remove the destination first: if the base checkout holds $f
+            # as a symlink, `cp` without this would follow it and write
+            # the verified bytes through to whatever it points at, leaving
+            # the symlink itself unchanged — the fingerprint check below
+            # would then pass by reading through the same symlink, and
+            # `git add` later would stage no change at all.
+            rm -f -- "$f"
+            cp -- "$RUNNER_TEMP/regenerated/$f" "$f"
+            rm -- "$RUNNER_TEMP/regenerated/$f"
+          done
+          leftover=$(find "$RUNNER_TEMP/regenerated" -type f -o -type l | head -n 1)
+          if [ -n "$leftover" ]; then
+            echo "::error::The regenerated-files artifact carried an undeclared file: $leftover"
+            exit 1
+          fi
+          rm -rf -- "$RUNNER_TEMP/regenerated"
+          printf '%s\n' "$REGEN_SHA" | sha256sum -c --strict --quiet \
+            || { echo '::error::A regenerated file does not match what the update job fingerprinted.'; exit 1; }
+          # Same reasoning as the update job's own re-check: content can
+          # match while the executable bit doesn't.
+          while IFS= read -r mode_line; do
+            [ -z "$mode_line" ] && continue
+            want_mode=${mode_line%% *}
+            f=${mode_line#* }
+            if [ -x "$f" ]; then have_mode=100755; else have_mode=100644; fi
+            if [ "$have_mode" != "$want_mode" ]; then
+              echo "::error::A regenerated file's executable bit does not match what the update job fingerprinted ($f: expected $want_mode, got $have_mode)."
+              exit 1
+            fi
+          done <<< "$REGEN_MODE"
+          # Taken now, while the tree still diffs against the base — after
+          # the commit below there is nothing left to diff.
+          git diff --stat -- "${files[@]}" > regen-stat.txt
 
       # See AGENTS.md "Trust model": update no longer reports its own
       # pass/fail verdict as a job output. That boolean and checks.md's
@@ -638,6 +976,16 @@ jobs:
           # doesn't special-case any splice as "probably fine".
           RUN_NUMBER: ${{ github.run_number }}
           RUN_ATTEMPT: ${{ github.run_attempt }}
+          REGENERATED_FILES: ${{ inputs.regenerated-files }}
+          # Empty unless the update job's regenerate step actually ran and
+          # fingerprinted the declared files — drives the title/verdict
+          # branch and withholds auto-merge below. See AGENTS.md "Trust
+          # model".
+          REGEN_SHA: ${{ needs.update.outputs.regen_sha }}
+          # See the regenerate step's own comment: `git add -- "$f"` below
+          # reads $f as a pathspec, and pathspec magic in a declared path
+          # would otherwise stage more than the one file it names.
+          GIT_LITERAL_PATHSPECS: '1'
         run: |
           set -euo pipefail
           case "$PASSED" in
@@ -653,12 +1001,22 @@ jobs:
           today=$(date -u +%Y-%m-%d)
           branch="deps/update-$today"
 
-          if [ "$PASSED" = 'true' ]; then
-            title="deps: Update dependencies ($today)"
-            verdict='All checks passed in the job that produced this branch.'
-          else
+          if [ "$PASSED" != 'true' ]; then
             title="deps: Update dependencies ($today) — CHECKS FAILING"
             verdict='**One or more checks failed.** Do not merge until they are fixed — the failures are real, not flakes to route around.'
+          elif [ -n "$REGEN_SHA" ]; then
+            # See AGENTS.md "Trust model": unlike the manifests, a
+            # regenerated file's content is never independently re-derived
+            # in a clean context here — publish only re-verifies the
+            # fingerprint the untrusted update job itself took, the same
+            # residual gap checks.md/deps-stat.txt already carry. Auto-
+            # merge is withheld so a human looks at the regenerated diff
+            # before it lands, even though the ordinary checks passed.
+            title="deps: Update dependencies ($today) — REGENERATED FILES, REVIEW BEFORE MERGE"
+            verdict='All checks passed, but this batch also regenerated a derived file (see AGENTS.md "Trust model") — that content is not independently re-derived the way the manifests are, so auto-merge is deliberately not armed. Review the regenerated diff below before merging by hand.'
+          else
+            title="deps: Update dependencies ($today)"
+            verdict='All checks passed in the job that produced this branch.'
           fi
 
           remote="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
@@ -707,6 +1065,12 @@ jobs:
           # Stage by name. The artifact only carries these files, but naming them
           # keeps that true even if it ever carries more.
           git add -- package.json package-lock.json
+          if [ -n "$REGENERATED_FILES" ]; then
+            while IFS= read -r f; do
+              [ -z "$f" ] && continue
+              git add -- "$f"
+            done <<< "$REGENERATED_FILES"
+          fi
           git commit -q -m "$title"
           git push "$remote" "HEAD:refs/heads/$branch"
 
@@ -823,6 +1187,16 @@ jobs:
             echo
             echo '</details>'
             echo
+            if [ -s regen-stat.txt ]; then
+              echo '<details><summary>Regenerated files diffstat</summary>'
+              echo
+              echo '```'
+              cat regen-stat.txt
+              echo '```'
+              echo
+              echo '</details>'
+              echo
+            fi
             echo 'Review the direct moves above for anything surprising; the lockfile'
             echo 'churn underneath them is expected and not worth reading line by line.'
             echo
@@ -893,7 +1267,15 @@ jobs:
           # above: the PR already exists, and repos without auto-merge
           # allowed just fall back to manual — and on a failing batch, that
           # fallback (no auto-merge armed) is the correct outcome anyway.
-          if [ "$PASSED" = 'true' ]; then
+          #
+          # Also withheld when this batch regenerated a derived file (see
+          # AGENTS.md "Trust model" and the title/verdict branch above):
+          # unlike the manifests, a regenerated file's content is only
+          # fingerprint-checked here, never independently re-derived, so
+          # untrusted update-job code could otherwise determine what
+          # auto-merges through a regenerated file even while every
+          # ordinary check passes.
+          if [ "$PASSED" = 'true' ] && [ -z "$REGEN_SHA" ]; then
             if ! gh pr merge --auto --rebase "$pr"; then
               echo "Could not arm auto-merge — the PR is open and waits for a manual merge." \
                 >> "$GITHUB_STEP_SUMMARY"
