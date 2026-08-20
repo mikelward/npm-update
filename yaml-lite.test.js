@@ -1,6 +1,6 @@
-// Tests for yaml-lite.js — the same reason vitest-shim.mjs gets its own
-// tests in mikelward/npm-update: anything test tooling depends on needs its
-// own coverage, or a bug in the tool masks bugs in what it checks.
+// Tests for yaml-lite.js — the parser this repo exists to maintain. Anything
+// a consumer's test tooling depends on needs its own coverage here, or a bug
+// in the tool masks bugs in what it checks downstream.
 
 const { test } = require("node:test");
 const assert = require("node:assert/strict");
@@ -98,10 +98,10 @@ test("parses a block sequence item that is itself a nested mapping block", () =>
 });
 
 test("strips an inline comment from a plain scalar, but not a # inside a quoted one", () => {
-  // Caught by Codex against this repo's own commit-artifact.yml, which uses
-  // exactly this shape (`contents: write # push the commit`): without this,
-  // the value parses as "write # push the commit" instead of "write",
-  // silently disagreeing with what GitHub's own YAML parser reads.
+  // Caught by Codex against a real workflow using exactly this shape
+  // (`contents: write # push the commit`): without this, the value parses
+  // as "write # push the commit" instead of "write", silently disagreeing
+  // with what GitHub's own YAML parser reads.
   const doc = parseWorkflowYaml(
     "a: write # push the commit\nb: 'it''s # not a comment'\nc: \"a # b\"\nd: value#no-space-before-hash-is-not-a-comment\n",
   );
@@ -304,9 +304,299 @@ test("throws on a construct this parser doesn't support, rather than returning s
   assert.throws(() => parseWorkflowYaml("a: &anchor value\nb: *anchor\n"));
 });
 
-test("parses an empty flow mapping ('permissions: {}') as an empty object, the one flow-mapping shape this repo's own workflow actually uses", () => {
-  const doc = parseWorkflowYaml("permissions: {}\n");
-  assert.deepEqual(doc.permissions, {});
+test("throws on a block scalar line that dedents below the block's own indent without reaching the parent's", () => {
+  // `a: |\n    x\n  y\nb: 1` is invalid YAML — "  y" is indented less than
+  // the block's own established indent (4, from "    x") but still more
+  // than the parent key's indent (0), so it's neither a continuation of
+  // the block nor a valid dedent out of it. An earlier version silently
+  // absorbed it as an empty line (raw.length < effectiveIndent) and
+  // discarded "y" entirely, letting a: "x\n" pass structural assertions
+  // against a document GitHub's own parser would reject outright.
+  assert.throws(() => parseWorkflowYaml("a: |\n    x\n  y\nb: 1\n"));
+});
+
+test("throws on an unterminated flow sequence, rather than returning the malformed text as a plain string", () => {
+  // "runs-on: [ubuntu-latest" (no closing ]) previously fell through to
+  // parseScalar's final `return s`, silently returning the literal string
+  // "[ubuntu-latest" instead of raising. Verified against
+  // yaml.safe_load("runs-on: [ubuntu-latest\n"), which raises a
+  // ParserError ("expected ',' or ']', but got <stream end>") — GitHub's
+  // own parser rejects this workflow outright.
+  assert.throws(
+    () => parseWorkflowYaml("runs-on: [ubuntu-latest\n"),
+    /unterminated flow sequence/,
+  );
+  // A valid, fully-closed flow sequence must still parse.
+  const doc = parseWorkflowYaml("runs-on: [ubuntu-latest]\n");
+  assert.deepEqual(doc["runs-on"], ["ubuntu-latest"]);
+});
+
+test("throws on a surplus closing bracket, not just a missing one", () => {
+  // "runs-on: [ubuntu-latest]]" still ends with "]", so the unterminated
+  // check above doesn't catch it — the old code sliced off exactly one
+  // leading/trailing character regardless and handed splitFlowSequence
+  // "ubuntu-latest]", silently returning ["ubuntu-latest]"] (a literal "]"
+  // smuggled into element content) instead of rejecting it. Verified
+  // against yaml.safe_load, which raises a ParserError ("while parsing a
+  // block mapping") rather than returning a value.
+  assert.throws(
+    () => parseWorkflowYaml("runs-on: [ubuntu-latest]]\n"),
+    /unbalanced flow sequence brackets/,
+  );
+  // Content that closes and then continues past the close, not just a
+  // trailing bracket — same defect, different shape.
+  assert.throws(
+    () => parseWorkflowYaml("foo: [a][b]\n"),
+    /unbalanced flow sequence brackets/,
+  );
+  // A nested, genuinely balanced flow sequence must still parse.
+  const doc = parseWorkflowYaml("foo: [[a], [b]]\n");
+  assert.deepEqual(doc.foo, [["a"], ["b"]]);
+});
+
+test("hasBalancedFlowBrackets ignores a mid-scalar quote — only an element's OWN first character opens one", () => {
+  // 'a: [echo "x]y", q]' previously entered synthetic quote mode at the
+  // mid-scalar '"' (not that element's own first character), swallowing
+  // the REAL closing "]" right after "x" into the "quoted" run and
+  // reading the whole thing as a balanced two-element sequence —
+  // ["echo \"x]y\", q"]. Verified against yaml.safe_load, which rejects
+  // this outright ("while parsing a block mapping"): the same
+  // element-start restriction splitFlowSequence already applies to
+  // quote-opening (see the sibling "a quote mid-element has no quoting
+  // effect" test) had to be applied here too.
+  assert.throws(
+    () => parseWorkflowYaml(String.raw`a: [echo "x]y", q]` + "\n"),
+    /unbalanced flow sequence brackets/,
+  );
+  // Contrast: a quote that IS an element's own first character still
+  // protects a bracket inside it, same as before this fix.
+  const doc = parseWorkflowYaml(String.raw`a: ["x]y", q]` + "\n");
+  assert.deepEqual(doc.a, ["x]y", "q"]);
+});
+
+test("throws on an empty element in a flow sequence, while still allowing a single trailing comma", () => {
+  // "[ubuntu-latest,,other]" (two commas in a row) pushed an empty
+  // `current` at the second comma, and parseScalar turned that empty
+  // string into `null` — so a missing element silently became a literal
+  // null in the array instead of being rejected. Verified against
+  // yaml.safe_load, which raises a ParserError for a doubled comma, a
+  // leading comma, and a whitespace-only element alike, but accepts a
+  // SINGLE trailing comma (dropped, not an element at all).
+  assert.throws(
+    () => parseWorkflowYaml("runs-on: [ubuntu-latest,,other]\n"),
+    /empty element in flow sequence/,
+  );
+  assert.throws(
+    () => parseWorkflowYaml("runs-on: [,ubuntu-latest,other]\n"),
+    /empty element in flow sequence/,
+  );
+  assert.throws(
+    () => parseWorkflowYaml("runs-on: [a, ,b]\n"),
+    /empty element in flow sequence/,
+  );
+  assert.throws(
+    () => parseWorkflowYaml("runs-on: [a,b,,]\n"),
+    /empty element in flow sequence/,
+  );
+  // A single trailing comma is valid YAML and must still parse.
+  const doc = parseWorkflowYaml("runs-on: [ubuntu-latest, other,]\n");
+  assert.deepEqual(doc["runs-on"], ["ubuntu-latest", "other"]);
+});
+
+test("throws on an unquoted ': ' inside a plain scalar, in both block and flow-sequence context", () => {
+  // "runs-on: ubuntu: latest" previously fell through to the plain-scalar
+  // return, silently accepting "ubuntu: latest" as ordinary text. Verified
+  // against yaml.safe_load, which raises a ParserError ("mapping values
+  // are not allowed here") — a colon followed by whitespace (or at the
+  // very end of the scalar) always reads as a nested mapping-value
+  // indicator in real YAML, never as scalar content, whether the
+  // whitespace is a space or a tab.
+  assert.throws(
+    () => parseWorkflowYaml("runs-on: ubuntu: latest\n"),
+    /unquoted/,
+  );
+  assert.throws(() => parseWorkflowYaml("a: b:\tc\n"), /unquoted/);
+  assert.throws(() => parseWorkflowYaml("a: b:\n"), /unquoted/);
+  assert.throws(() => parseWorkflowYaml("a: b : c\n"), /unquoted/);
+
+  // Inside a flow sequence, "[b: c]" isn't invalid YAML at all — it's a
+  // flow-mapping SHORTHAND (yaml.safe_load resolves it to [{'b': 'c'}]),
+  // a construct this minimal parser doesn't implement any more than it
+  // implements bracketed "{ b: c }". Silently returning the literal
+  // string "b: c" would be the same kind of wrong as silently returning
+  // an unsupported flow mapping's brace text, so this rejects it the same
+  // way rather than only catching the block-mapping-value shape.
+  assert.throws(() => parseWorkflowYaml("a: [b: c]\n"), /unquoted/);
+
+  // A colon NOT followed by whitespace is unambiguous and must still parse.
+  assert.equal(parseWorkflowYaml("a: http://x.com\n").a, "http://x.com");
+  assert.equal(parseWorkflowYaml("a: 1:30\n").a, "1:30");
+  // A colon-space INSIDE a quoted scalar is unaffected — the rule only
+  // applies to plain (unquoted) scalars, which is exactly the branch this
+  // check lives in; a quoted scalar returns earlier and never reaches it.
+  assert.equal(parseWorkflowYaml('a: "b: c"\n').a, "b: c");
+});
+
+test("throws on a tagged scalar, whether the tag is a standard resolvable one or a custom one", () => {
+  // "runs-on: !!str ubuntu-latest" and "a: !custom value" both previously
+  // fell through to the plain-scalar return, silently returning the tag
+  // and payload together as one literal string. Tags are explicitly out
+  // of this file's stated scope (see the file header), same as
+  // anchors/aliases just above this check — and unlike anchors/aliases,
+  // not every tagged scalar is even invalid YAML: yaml.safe_load resolves
+  // "!!str ubuntu-latest" (a standard, known tag) to the plain string
+  // "ubuntu-latest", while "!custom value" (an unknown local tag)
+  // genuinely errors ("could not determine a constructor"). This parser
+  // draws no distinction between the two cases — both are out of scope,
+  // so both throw, rather than only rejecting the one real YAML itself
+  // would also reject.
+  assert.throws(
+    () => parseWorkflowYaml("runs-on: !!str ubuntu-latest\n"),
+    /tags are not supported/,
+  );
+  assert.throws(
+    () => parseWorkflowYaml("a: !custom value\n"),
+    /tags are not supported/,
+  );
+});
+
+test("throws on a plain scalar starting with a reserved indicator (@, `, %), but not on one merely containing it", () => {
+  // "runs-on: @invalid" previously fell through to the plain-scalar
+  // return, silently accepting it as ordinary text. Verified against
+  // yaml.safe_load, which raises a ScannerError ("while scanning for the
+  // next token") for a leading "@", "`" or "%" alike — but only in the
+  // LEADING position: the same characters elsewhere in a scalar are
+  // ordinary content ("b@c", "b`c", "100%" all parse fine), so this must
+  // check startsWith, not a bare includes.
+  assert.throws(
+    () => parseWorkflowYaml("runs-on: @invalid\n"),
+    /reserved leading character/,
+  );
+  assert.throws(
+    () => parseWorkflowYaml("a: `invalid\n"),
+    /reserved leading character/,
+  );
+  assert.throws(
+    () => parseWorkflowYaml("a: %invalid\n"),
+    /reserved leading character/,
+  );
+  const doc = parseWorkflowYaml("a: b@c\nc: b`c\nd: 100%\n");
+  assert.equal(doc.a, "b@c");
+  assert.equal(doc.c, "b`c");
+  assert.equal(doc.d, "100%");
+});
+
+test("prefers the more specific unterminated-quote error over a generic bracket-imbalance one", () => {
+  // 'a: ["b, c]' has an unterminated quote AND, read as pure bracket
+  // counting, an "imbalance" (the quote swallows the sequence's own
+  // closing "]" into its own unclosed run). Verified against
+  // yaml.safe_load, which reports this shape as "while scanning a quoted
+  // scalar" — the more specific, more useful diagnostic — not a
+  // flow-sequence parse error, so hasBalancedFlowBrackets defers to the
+  // existing unterminated-quoted-scalar check rather than reporting its
+  // own generic error first.
+  assert.throws(
+    () => parseWorkflowYaml('a: ["b, c]\n'),
+    /unterminated quoted scalar/,
+  );
+});
+
+test("throws on a tab in a line's indentation, including when the tab is the line's very FIRST character", () => {
+  // The original tab check computed indent by matching only leading SPACES
+  // (raw.replace(/^ */, "")), so a line whose indentation is a tab from its
+  // very first character matched zero leading spaces — indent came out 0,
+  // and the check then tab-tested raw.slice(0, 0), always "". The check
+  // was unreachable for exactly the case it existed to catch. Verified
+  // against yaml.safe_load("a:\n\tb: c\n"), which raises a ScannerError
+  // ("found character '\\t' that cannot start any token") rather than
+  // accepting it as two top-level keys (the old bug's actual result).
+  assert.throws(
+    () => parseWorkflowYaml("a:\n\tb: c\n"),
+    /tab in indentation/,
+  );
+  // A tab AFTER some leading spaces must be caught too — checked directly
+  // rather than assumed, since it turns out the ORIGINAL (broken) check
+  // missed this shape as well: raw.replace(/^ */, "") matches only the
+  // leading spaces and stops at the tab, so raw.slice(0, indent) never
+  // included the tab there either. Both shapes were broken; this fix
+  // closes both.
+  assert.throws(
+    () => parseWorkflowYaml("a:\n  \tb: c\n"),
+    /tab in indentation/,
+  );
+});
+
+test("a tab past a block scalar's own established margin is content, not indentation", () => {
+  // Found by fuzzing: the original tab check ran globally over every raw
+  // line before any block-scalar context existed, so a tab used as literal
+  // script content deep inside a run: | block (past the block's own
+  // established margin) was rejected as if it were indentation. Verified
+  // against yaml.safe_load("run: |\n  echo hi\n  \techo bye\n") ->
+  // {'run': 'echo hi\n\techo bye\n'} — the tab is payload.
+  const doc = parseWorkflowYaml("run: |\n  echo hi\n  \techo bye\n");
+  assert.equal(doc.run, "echo hi\n\techo bye\n");
+});
+
+test("a tab still rejects when it establishes a block scalar's own first-line margin", () => {
+  // Contrast with the case above: a tab that IS the block's margin (nothing
+  // has been established yet) is genuine indentation, and real YAML still
+  // rejects it — verified against yaml.safe_load("run: |\n\techo hi\n"),
+  // a ScannerError ("found character '\t' that cannot start any token").
+  assert.throws(
+    () => parseWorkflowYaml("run: |\n\techo hi\n"),
+    /tab in indentation/,
+  );
+});
+
+test("a tab at a block scalar's dedent boundary still rejects, even with content after it", () => {
+  // The established margin is 2; this line's leading run is "\t " (a tab
+  // then a space) before "y" — genuinely part of the region that decides
+  // continuation vs. dedent, not payload past the margin, so it must still
+  // be rejected the same as any other structural tab.
+  assert.throws(
+    () => parseWorkflowYaml("run: |\n  x\n\t y\n"),
+    /tab in indentation/,
+  );
+});
+
+test("throws on an unterminated quoted scalar, rather than returning the malformed text as a plain string", () => {
+  // `name: "example` (no closing quote) previously fell through every
+  // quoted-scalar branch — startsWith('"') && endsWith('"') was false, since
+  // it doesn't end with a quote at all — and returned the literal text
+  // `"example`, quote character included, as an ordinary plain scalar.
+  // Verified against yaml.safe_load('name: "example\n'), which raises a
+  // ScannerError ("unexpected end of stream") rather than returning a
+  // value: GitHub's own parser rejects this workflow outright, so silently
+  // parsing it here would let a structural test stay green against YAML
+  // that can't actually run.
+  assert.throws(
+    () => parseWorkflowYaml('a: "example\n'),
+    /unterminated quoted scalar/,
+  );
+  assert.throws(
+    () => parseWorkflowYaml("a: 'example\n"),
+    /unterminated quoted scalar/,
+  );
+});
+
+test("throws on an unterminated quoted scalar inside a flow sequence too, not just as a bare value", () => {
+  // splitFlowSequence hands each element to the same parseScalar the bare-
+  // value case above exercises, so an unterminated quote reachable only
+  // through a flow-sequence element ('a: ["b, c]') needs its own case:
+  // fixing only the bare-value path would leave this one silently wrong.
+  assert.throws(
+    () => parseWorkflowYaml('a: ["b, c]\n'),
+    /unterminated quoted scalar/,
+  );
+});
+
+test("does not false-positive on a validly-quoted scalar whose content happens to end in an escaped quote", () => {
+  // A double-quoted scalar ending `\"` immediately before the real closing
+  // quote (`"a\""` — content is a literal `a"`) must still parse: the
+  // escaped quote is content, not the terminator, and the REAL terminator
+  // is the character after it.
+  const doc = parseWorkflowYaml('a: "a\\""\n');
+  assert.equal(doc.a, 'a"');
 });
 
 test("throws yaml-lite's own error on an invalid escape sequence inside a double-quoted scalar, not a bare JSON SyntaxError", () => {
@@ -324,6 +614,122 @@ test("throws yaml-lite's own error on an invalid escape sequence inside a double
   );
   // A scalar using only real escapes must still parse.
   assert.equal(parseWorkflowYaml('a: "a\\tb"\n').a, "a\tb");
+});
+
+test("accepts an empty flow mapping as a value, and throws on a non-empty one", () => {
+  // "permissions: {}" is a common least-privilege idiom and unambiguous, so
+  // it's supported directly. A non-empty flow mapping ("{ contents: read }")
+  // is real, valid YAML — verified against yaml.safe_load, which parses it
+  // into a genuine nested dict — but is out of this minimal parser's scope.
+  // Before this fix, parseScalar had no check for either shape, so a
+  // non-empty flow mapping fell through to the plain-scalar fallback and
+  // was silently returned as the literal brace text (a string), not
+  // rejected.
+  const doc = parseWorkflowYaml("permissions: {}\n");
+  assert.deepEqual(doc.permissions, {});
+
+  assert.throws(
+    () => parseWorkflowYaml("permissions: {contents: read}\n"),
+    /flow mappings are not supported/,
+  );
+});
+
+test("throws on an unterminated flow mapping, rather than returning the malformed text as a plain string", () => {
+  // "permissions: {contents: write" (no closing brace) previously fell
+  // through the old compound startsWith("{") && endsWith("}") condition —
+  // false here, since there's no closing brace at all — straight to
+  // parseScalar's final `return s`, silently returning the literal string
+  // "{contents: write" instead of raising. Verified against
+  // yaml.safe_load("permissions: {contents: write\n"), which raises a
+  // ParserError ("while parsing a flow mapping") rather than returning a
+  // value — the same shape of bug the unterminated-flow-sequence check
+  // above already guards against for "[".
+  assert.throws(
+    () => parseWorkflowYaml("permissions: {contents: write\n"),
+    /unterminated flow mapping/,
+  );
+});
+
+test("throws on a non-empty flow mapping reached as a sequence item too, not just as a bare value", () => {
+  // parseSequence's "- key: value" detection only recognizes a bare
+  // identifier/quoted-string key before the colon; "- { a: 1 }" doesn't
+  // match, so it falls through to parseScalar on "{ a: 1 }" — the same
+  // function the bare-value case above exercises, but reached via a
+  // different call site, so it needs its own coverage.
+  assert.throws(
+    () => parseWorkflowYaml("foo:\n  - { a: 1 }\n"),
+    /flow mappings are not supported/,
+  );
+});
+
+test("throws on a duplicate mapping key at the top level", () => {
+  // Verified against yaml.safe_load("a: 1\na: 2\n"): PyYAML's default
+  // SafeLoader is lenient and silently keeps the last value ({'a': 2}), but
+  // duplicate-key rejection is the spec-correct, commonly-enforced reading
+  // (confirmed with a stricter loader using a no-duplicates constructor,
+  // which raises ConstructorError). Before this fix, parseMapping's
+  // `obj[key] = ...` assignment was unconditional, so a repeated
+  // "permissions:" block — a plausible copy-paste mistake — silently kept
+  // only the last one with no signal that the first was ever discarded.
+  assert.throws(
+    () => parseWorkflowYaml("permissions:\n  contents: read\npermissions:\n  contents: write\n"),
+    /duplicate mapping key "permissions"/,
+  );
+});
+
+test("throws on a duplicate mapping key nested under another key", () => {
+  assert.throws(
+    () => parseWorkflowYaml("permissions:\n  contents: read\n  contents: write\n"),
+    /duplicate mapping key "contents"/,
+  );
+});
+
+test("throws on a duplicate mapping key inside an inline '- key: value' sequence item", () => {
+  // Inline mapping items (a sequence item written as "- key: value" with
+  // further "key: value" siblings at the same indent) are built by
+  // applyMappingEntry via a separate `target[key] = ...` assignment site
+  // from parseMapping's `obj[key] = ...` — both needed the same guard.
+  assert.throws(
+    () => parseWorkflowYaml("foo:\n  - a: 1\n    a: 2\n"),
+    /duplicate mapping key "a"/,
+  );
+});
+
+test("does not false-positive on same-named keys at different nesting levels", () => {
+  // "contents" appears once under "permissions" and once under a sibling
+  // "other" key — these are different objects, not a duplicate.
+  const doc = parseWorkflowYaml("permissions:\n  contents: read\nother:\n  contents: write\n");
+  assert.equal(doc.permissions.contents, "read");
+  assert.equal(doc.other.contents, "write");
+});
+
+test("preserves __proto__ as a real, enumerable own mapping key — a legal job/step ID, not a JS prototype slot", () => {
+  // A plain `target[key] = value` assignment where key is "__proto__"
+  // invokes the inherited __proto__ ACCESSOR instead of creating an own
+  // property, reassigning the object's own prototype rather than storing
+  // the value — so "jobs.__proto__:" (a real, legal GitHub Actions job ID)
+  // silently vanished from Object.keys(doc.jobs) and any for...in/spread,
+  // while doc.jobs.__proto__ still returned it via prototype lookup. Not
+  // an out-of-scope construct to reject: this is a real workflow shape the
+  // parser represented WRONG.
+  const doc = parseWorkflowYaml("jobs:\n  __proto__:\n    runs-on: ubuntu-latest\n  real:\n    runs-on: ubuntu-latest\n");
+  assert.deepEqual(Object.keys(doc.jobs).sort(), ["__proto__", "real"]);
+  assert.ok(Object.prototype.hasOwnProperty.call(doc.jobs, "__proto__"));
+  assert.equal(doc.jobs.__proto__["runs-on"], "ubuntu-latest");
+  // The FIX (Object.defineProperty) must not itself change what a mapping
+  // OBJECT's own prototype is — Object.create(null) would also solve the
+  // enumeration problem, but at the cost of breaking assert.deepEqual
+  // against ordinary {} literals everywhere else in this suite, since
+  // deepEqual checks prototype identity too.
+  assert.equal(Object.getPrototypeOf(doc.jobs), Object.prototype);
+  assert.deepEqual(doc.jobs.real, { "runs-on": "ubuntu-latest" });
+});
+
+test("still catches a duplicate __proto__ key, the same as any other key", () => {
+  assert.throws(
+    () => parseWorkflowYaml("a:\n  __proto__: 1\n  __proto__: 2\n"),
+    /duplicate mapping key "__proto__"/,
+  );
 });
 
 test("throws a clearly-scoped error on an implicit multi-line plain scalar block value, not a confusing generic one", () => {
@@ -354,35 +760,6 @@ test("throws a clearly-scoped error on an implicit multi-line plain scalar block
   // ordinary nested-mapping case this parser has always supported.
   const doc = parseWorkflowYaml("a:\n  b: 1\n");
   assert.equal(doc.a.b, 1);
-});
-
-test("throws on a flow mapping as a plain mapping value, rather than returning the brace text as a string", () => {
-  // "a: { b: 1 }" isn't in this parser's scope (see the file header). An
-  // earlier version fell through to parseScalar's final `return s` and
-  // silently returned the literal string "{ b: 1 }" instead of raising —
-  // structurally wrong in a way nothing downstream would catch.
-  assert.throws(() => parseWorkflowYaml("a: { b: 1 }\n"), /flow mappings are not supported/);
-});
-
-test("throws on a flow mapping as a sequence item, not just as a plain mapping value", () => {
-  // "- { b: 1 }" reaches parseScalar through a different path than the
-  // mapping-value case above: parseSequence's "- key: value" regex doesn't
-  // match (rest starts with "{", not a bare key followed by ":"), so it
-  // falls to the same `result.push(parseScalar(rest))` branch a plain
-  // scalar sequence item takes. Both call sites need to be covered, since a
-  // fix at only one of them leaves the other silently wrong.
-  assert.throws(() => parseWorkflowYaml("a:\n  - { b: 1 }\n"), /flow mappings are not supported/);
-});
-
-test("throws on a block scalar line that dedents below the block's own indent without reaching the parent's", () => {
-  // `a: |\n    x\n  y\nb: 1` is invalid YAML — "  y" is indented less than
-  // the block's own established indent (4, from "    x") but still more
-  // than the parent key's indent (0), so it's neither a continuation of
-  // the block nor a valid dedent out of it. An earlier version silently
-  // absorbed it as an empty line (raw.length < effectiveIndent) and
-  // discarded "y" entirely, letting a: "x\n" pass structural assertions
-  // against a document GitHub's own parser would reject outright.
-  assert.throws(() => parseWorkflowYaml("a: |\n    x\n  y\nb: 1\n"));
 });
 
 test("round-trips this repository's own npm-update.yml without throwing", () => {
