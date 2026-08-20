@@ -25,6 +25,7 @@ import {
   existsSync,
   readFileSync,
   writeFileSync,
+  mkdirSync,
   mkdtempSync,
   rmSync,
   symlinkSync,
@@ -88,7 +89,10 @@ describe("npm-update reusable workflow", () => {
   it("takes the Node major from .nvmrc rather than naming one", () => {
     // .nvmrc lives in the CONSUMER's repo — this job checks out the caller,
     // not the hub, so reading it here still reads the consumer's own pin.
-    expect(update).toContain("node-version-file: .nvmrc");
+    // Prefixed with the working-directory layout output rather than a bare
+    // ".nvmrc" — empty for every existing consumer, so this still resolves
+    // to exactly ".nvmrc" for them (see the working-directory tests below).
+    expect(update).toContain("node-version-file: ${{ steps.layout.outputs.prefix }}.nvmrc");
     expect(update).not.toMatch(/node-version:\s*['"]?\d/);
   });
 
@@ -1410,6 +1414,358 @@ describe("the regenerate hook", () => {
       expect(threw.stdout.toString()).not.toContain(
         "The checks changed the tree outside the dependency manifests",
       );
+    } finally {
+      rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+});
+
+// The working-directory input: added for a consumer whose npm tree isn't at
+// the repository root (clothescast's Cloud Functions backend under
+// functions/, alongside its Android app — see mikelward/npm-update#21).
+// Empty (the default) must reproduce every existing consumer's behavior
+// byte-for-byte -- covered implicitly by every test above continuing to
+// pass unchanged -- so the tests here focus on what's NEW: the input's own
+// declaration, the job-level default that carries it into every relative
+// path below, and the one property most worth getting wrong -- a git
+// status scan correctly scoping itself to the working directory instead of
+// the whole repository.
+describe("the working-directory input", () => {
+  it("declares a working-directory input defaulting to the repository root", () => {
+    expect(workflow).toMatch(/^\s*working-directory:\n/m);
+    const inputsBlock = workflow.slice(
+      workflow.indexOf("workflow_call:"),
+      workflow.indexOf("permissions: {}"),
+    );
+    const wdBlock = inputsBlock.slice(inputsBlock.indexOf("working-directory:"));
+    expect(wdBlock.slice(0, 700)).toMatch(/default: ''/);
+    // The other two inputs stay exactly as they were -- this is additive,
+    // not a restructuring (AGENTS.md's own instruction for this change).
+    expect(inputsBlock).toMatch(/^\s*regenerate:\n/m);
+    expect(inputsBlock).toMatch(/^\s*regenerated-files:\n/m);
+  });
+
+  it("sets the same working-directory default in both jobs, so every relative path in each job moves together", () => {
+    const expr = "working-directory: ${{ inputs.working-directory || '.' }}";
+    expect(update).toContain(expr);
+    expect(publish).toContain(expr);
+    // Exactly one `defaults:` block per job -- not appended beside an
+    // existing one, and not accidentally duplicated.
+    expect([...update.matchAll(/^\s*defaults:\n/gm)].length).toBe(1);
+    expect([...publish.matchAll(/^\s*defaults:\n/gm)].length).toBe(1);
+  });
+
+  it("computes the working-directory prefix from git, not the raw input string, so equivalent spellings agree", () => {
+    // upload-artifact's `with: path:` list and setup-node's `with:` fields
+    // don't inherit the job-level default above -- only run: steps do --
+    // so this step exists to give them the same answer without repeating
+    // the same ternary at every use site. Reading it back from git rather
+    // than concatenating the raw input matters because the job default
+    // above already `cd`s into inputs.working-directory however it's
+    // spelled ('./functions', 'functions/', 'functions/.' all land in the
+    // same place), but `git status --porcelain` always reports the
+    // canonical form -- a prefix built from a noncanonical spelling would
+    // silently stop matching it.
+    const layoutStep = doc.jobs.update.steps.find((s) => s.id === "layout");
+    expect(!!layoutStep).toBe(true);
+    expect(layoutStep.run).toContain("git rev-parse --show-prefix");
+    expect(update).toContain("node-version-file: ${{ steps.layout.outputs.prefix }}.nvmrc");
+    expect(update).toContain(
+      "cache-dependency-path: ${{ steps.layout.outputs.prefix }}package-lock.json",
+    );
+    expect(update).toContain("${{ steps.layout.outputs.prefix }}package.json");
+    expect(update).toContain("${{ steps.layout.outputs.prefix }}regen-handoff.tar");
+
+    const scratch = mkdtempSync(join(tmpdir(), "npm-update-layout-"));
+    const run = (cwd, outPath) => {
+      writeFileSync(outPath, "");
+      execFileSync("bash", ["-c", layoutStep.run], {
+        cwd,
+        env: { ...process.env, GITHUB_OUTPUT: outPath },
+      });
+      return readFileSync(outPath, "utf8");
+    };
+    try {
+      execFileSync("git", ["init", "-q", scratch]);
+      execFileSync("git", ["-C", scratch, "config", "user.email", "a@b.c"]);
+      execFileSync("git", ["-C", scratch, "config", "user.name", "t"]);
+      const functionsDir = join(scratch, "functions");
+      mkdirSync(functionsDir);
+      writeFileSync(join(scratch, "seed"), "");
+      execFileSync("git", ["-C", scratch, "add", "-A"]);
+      execFileSync("git", ["-C", scratch, "commit", "-qm", "seed"]);
+
+      expect(run(scratch, join(scratch, "root.txt"))).toBe("prefix=\ndir=\n");
+
+      // The three equivalent-but-noncanonical ways a caller could spell
+      // `working-directory: functions` in their own workflow file -- the
+      // job-level default would `cd` all three to the same real directory,
+      // so this step, run from each, must report the identical canonical
+      // prefix rather than three different (and two of them wrong) strings.
+      for (const spelling of ["functions", "./functions", "functions/", "functions/."]) {
+        const cwd = join(scratch, spelling);
+        const out = join(scratch, `out-${spelling.replace(/[^a-z]/gi, "_")}.txt`);
+        expect(run(cwd, out)).toBe("prefix=functions/\ndir=functions\n");
+      }
+    } finally {
+      rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
+  it("checks out the canonical checker inside the working directory, not a fixed repository-root path", () => {
+    // So the bare `node npm-update-hub/check-npm-update.mjs` invocations
+    // below (unchanged by this input, on purpose) keep resolving correctly
+    // once the job-level default moves their own cwd to match.
+    expect(publish).toContain(
+      "path: ${{ inputs.working-directory != '' && format('{0}/npm-update-hub', inputs.working-directory) || 'npm-update-hub' }}",
+    );
+    expect(publish).toContain("node npm-update-hub/check-npm-update.mjs");
+  });
+
+  it("restores the artifact and reads regenerated files at the working directory, not always the repository root", () => {
+    expect(publish).toContain("path: ${{ inputs.working-directory || '.' }}");
+  });
+
+  it("scopes the tree check to a non-default working directory end to end, accepting a change inside it", () => {
+    const verifyStep = doc.jobs.update.steps.find(
+      (s) => s.name === "Verify only dependency files changed",
+    );
+    const scratch = mkdtempSync(join(tmpdir(), "npm-update-workdir-verify-"));
+    const tmp = join(scratch, "repo");
+    const functionsDir = join(tmp, "functions");
+    try {
+      execFileSync("mkdir", ["-p", functionsDir]);
+      execFileSync("git", ["init", "-q"], { cwd: tmp });
+      execFileSync("git", ["config", "user.email", "t@example.com"], { cwd: tmp });
+      execFileSync("git", ["config", "user.name", "t"], { cwd: tmp });
+      writeFileSync(join(functionsDir, "package.json"), "{}\n");
+      writeFileSync(join(functionsDir, "package-lock.json"), "{}\n");
+      execFileSync("git", ["add", "-A"], { cwd: tmp });
+      execFileSync("git", ["commit", "-q", "-m", "seed"], { cwd: tmp });
+
+      // The same shape the real job leaves behind inside the working
+      // directory once npm update and the checks have run there.
+      writeFileSync(join(functionsDir, "package.json"), '{"a":1}\n');
+      writeFileSync(join(functionsDir, "checks.md"), "- ✅ `npm ci`\n");
+      writeFileSync(join(functionsDir, "deps-stat.txt"), " 1 file changed\n");
+      const pkgSha = execFileSync(
+        "sh",
+        ["-c", "sha256sum package.json | cut -d' ' -f1"],
+        { cwd: functionsDir },
+      ).toString().trim();
+      const lockSha = execFileSync(
+        "sh",
+        ["-c", "sha256sum package-lock.json | cut -d' ' -f1"],
+        { cwd: functionsDir },
+      ).toString().trim();
+
+      const outPath = join(scratch, "out.txt");
+      const summaryPath = join(scratch, "summary.txt");
+      writeFileSync(outPath, "");
+      writeFileSync(summaryPath, "");
+      execFileSync("bash", ["-c", verifyStep.run], {
+        cwd: functionsDir,
+        env: {
+          ...process.env,
+          PKG_SHA: pkgSha,
+          LOCK_SHA: lockSha,
+          REGENERATED_FILES: "",
+          REGEN_SHA: "",
+          REGEN_MODE: "",
+          WORKING_DIRECTORY: "functions",
+          GITHUB_OUTPUT: outPath,
+          GITHUB_STEP_SUMMARY: summaryPath,
+          RUNNER_TEMP: scratch,
+        },
+      });
+      // No throw -- the scoped change was accepted, and the handoff tar
+      // landed inside the working directory (the job-level default's
+      // cwd), matching where the real job writes every other file too.
+      expect(existsSync(join(functionsDir, "regen-handoff.tar"))).toBe(true);
+    } finally {
+      rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects a change outside the working directory even when its bare name matches the allowlist", () => {
+    // git status --porcelain paths are always repo-root relative regardless
+    // of cwd, so a root-level package.json sitting OUTSIDE functions/ would
+    // keep the exact bare name the allowlist checks for -- this is the
+    // false-accept a naive "just strip the prefix" implementation would
+    // fall into, distinct from the ordinary case above where the change
+    // is legitimately inside the working directory.
+    const verifyStep = doc.jobs.update.steps.find(
+      (s) => s.name === "Verify only dependency files changed",
+    );
+    const scratch = mkdtempSync(join(tmpdir(), "npm-update-workdir-verify-outside-"));
+    const tmp = join(scratch, "repo");
+    const functionsDir = join(tmp, "functions");
+    try {
+      execFileSync("mkdir", ["-p", functionsDir]);
+      execFileSync("git", ["init", "-q"], { cwd: tmp });
+      execFileSync("git", ["config", "user.email", "t@example.com"], { cwd: tmp });
+      execFileSync("git", ["config", "user.name", "t"], { cwd: tmp });
+      writeFileSync(join(functionsDir, "package.json"), "{}\n");
+      writeFileSync(join(functionsDir, "package-lock.json"), "{}\n");
+      writeFileSync(join(tmp, "package.json"), "{}\n");
+      execFileSync("git", ["add", "-A"], { cwd: tmp });
+      execFileSync("git", ["commit", "-q", "-m", "seed"], { cwd: tmp });
+
+      writeFileSync(join(functionsDir, "package.json"), '{"a":1}\n');
+      writeFileSync(join(functionsDir, "checks.md"), "- ✅ `npm ci`\n");
+      writeFileSync(join(functionsDir, "deps-stat.txt"), " 1 file changed\n");
+      // Dependency code also touched the repo-root package.json, outside
+      // functions/ -- a lifecycle script reaching past its own tree.
+      writeFileSync(join(tmp, "package.json"), '{"tampered":true}\n');
+      const pkgSha = execFileSync(
+        "sh",
+        ["-c", "sha256sum package.json | cut -d' ' -f1"],
+        { cwd: functionsDir },
+      ).toString().trim();
+      const lockSha = execFileSync(
+        "sh",
+        ["-c", "sha256sum package-lock.json | cut -d' ' -f1"],
+        { cwd: functionsDir },
+      ).toString().trim();
+
+      const outPath = join(scratch, "out.txt");
+      const summaryPath = join(scratch, "summary.txt");
+      writeFileSync(outPath, "");
+      writeFileSync(summaryPath, "");
+      let threw = null;
+      try {
+        execFileSync("bash", ["-c", verifyStep.run], {
+          cwd: functionsDir,
+          env: {
+            ...process.env,
+            PKG_SHA: pkgSha,
+            LOCK_SHA: lockSha,
+            REGENERATED_FILES: "",
+            REGEN_SHA: "",
+            REGEN_MODE: "",
+            WORKING_DIRECTORY: "functions",
+            GITHUB_OUTPUT: outPath,
+            GITHUB_STEP_SUMMARY: summaryPath,
+            RUNNER_TEMP: scratch,
+          },
+        });
+      } catch (e) {
+        threw = e;
+      }
+      expect(!!threw).toBe(true);
+      expect(threw.stdout.toString()).toContain(
+        "Dependency code touched files outside the dependency manifests",
+      );
+      expect(threw.stdout.toString()).toContain("package.json");
+    } finally {
+      rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
+  it("still runs the verify step's tree check exactly as before when working-directory is unset", () => {
+    // The default-consumer path, run for real rather than inferred from
+    // the fact that the shared step text hasn't changed -- WORKING_DIRECTORY
+    // is left entirely unset here, the same as every pre-existing test
+    // above that exercises this step.
+    const verifyStep = doc.jobs.update.steps.find(
+      (s) => s.name === "Verify only dependency files changed",
+    );
+    const scratch = mkdtempSync(join(tmpdir(), "npm-update-workdir-verify-root-"));
+    const tmp = join(scratch, "repo");
+    try {
+      execFileSync("mkdir", ["-p", tmp]);
+      execFileSync("git", ["init", "-q"], { cwd: tmp });
+      execFileSync("git", ["config", "user.email", "t@example.com"], { cwd: tmp });
+      execFileSync("git", ["config", "user.name", "t"], { cwd: tmp });
+      writeFileSync(join(tmp, "package.json"), "{}\n");
+      writeFileSync(join(tmp, "package-lock.json"), "{}\n");
+      execFileSync("git", ["add", "-A"], { cwd: tmp });
+      execFileSync("git", ["commit", "-q", "-m", "seed"], { cwd: tmp });
+
+      writeFileSync(join(tmp, "package.json"), '{"a":1}\n');
+      writeFileSync(join(tmp, "checks.md"), "- ✅ `npm ci`\n");
+      writeFileSync(join(tmp, "deps-stat.txt"), " 1 file changed\n");
+      const pkgSha = execFileSync(
+        "sh",
+        ["-c", "sha256sum package.json | cut -d' ' -f1"],
+        { cwd: tmp },
+      ).toString().trim();
+      const lockSha = execFileSync(
+        "sh",
+        ["-c", "sha256sum package-lock.json | cut -d' ' -f1"],
+        { cwd: tmp },
+      ).toString().trim();
+
+      const outPath = join(scratch, "out.txt");
+      const summaryPath = join(scratch, "summary.txt");
+      writeFileSync(outPath, "");
+      writeFileSync(summaryPath, "");
+      execFileSync("bash", ["-c", verifyStep.run], {
+        cwd: tmp,
+        env: {
+          ...process.env,
+          PKG_SHA: pkgSha,
+          LOCK_SHA: lockSha,
+          REGENERATED_FILES: "",
+          REGEN_SHA: "",
+          REGEN_MODE: "",
+          WORKING_DIRECTORY: "",
+          GITHUB_OUTPUT: outPath,
+          GITHUB_STEP_SUMMARY: summaryPath,
+          RUNNER_TEMP: scratch,
+        },
+      });
+      expect(existsSync(join(tmp, "regen-handoff.tar"))).toBe(true);
+    } finally {
+      rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
+  it("scopes the pre-regeneration tree check to the working directory too", () => {
+    const regenStep = doc.jobs.update.steps.find((s) => s.id === "regen");
+    const scratch = mkdtempSync(join(tmpdir(), "npm-update-workdir-pretree-"));
+    const tmp = join(scratch, "repo");
+    const functionsDir = join(tmp, "functions");
+    try {
+      execFileSync("mkdir", ["-p", functionsDir]);
+      execFileSync("git", ["init", "-q"], { cwd: tmp });
+      execFileSync("git", ["config", "user.email", "t@example.com"], { cwd: tmp });
+      execFileSync("git", ["config", "user.name", "t"], { cwd: tmp });
+      writeFileSync(join(functionsDir, "package.json"), "{}\n");
+      writeFileSync(join(functionsDir, "package-lock.json"), "{}\n");
+      writeFileSync(join(functionsDir, "derived.json"), "before\n");
+      execFileSync("git", ["add", "-A"], { cwd: tmp });
+      execFileSync("git", ["commit", "-q", "-m", "seed"], { cwd: tmp });
+
+      // regenerated-files is relative to the working directory too (same
+      // as the manifests) -- declared here as it would be from inside
+      // functions/, which is also this step's own cwd below.
+      writeFileSync(join(functionsDir, "checks.md"), "- ✅ `npm ci`\n");
+      writeFileSync(join(functionsDir, "deps-stat.txt"), " 1 file changed\n");
+
+      const outPath = join(scratch, "out.txt");
+      const summaryPath = join(scratch, "summary.txt");
+      const pathPath = join(scratch, "path.txt");
+      const envPath = join(scratch, "env.txt");
+      for (const p of [outPath, summaryPath, pathPath, envPath]) writeFileSync(p, "");
+      execFileSync("bash", ["-c", regenStep.run], {
+        cwd: functionsDir,
+        env: {
+          ...process.env,
+          REGENERATE: "echo hi",
+          REGENERATED_FILES: "derived.json",
+          WORKING_DIRECTORY: "functions",
+          GIT_LITERAL_PATHSPECS: "1",
+          GITHUB_OUTPUT: outPath,
+          GITHUB_STEP_SUMMARY: summaryPath,
+          GITHUB_PATH: pathPath,
+          GITHUB_ENV: envPath,
+        },
+      });
+      // No throw: checks.md/deps-stat.txt sitting inside functions/ (this
+      // step's own cwd) read as the two allowlisted names once the prefix
+      // is stripped, not as unexpected tree changes.
+      expect(readFileSync(outPath, "utf8")).toContain("files_sha<<REGEN_SHA_EOF");
     } finally {
       rmSync(scratch, { recursive: true, force: true });
     }

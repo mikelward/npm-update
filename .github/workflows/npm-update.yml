@@ -44,12 +44,25 @@ on:
       regenerated-files:
         description: >-
           Tracked files the regenerate commands rebuild, one per line,
-          repo-relative. Committed alongside the manifests when they
-          change, fingerprinted and verified the same way — the
-          declaration is the boundary: only files named here may change
-          during regeneration, and anything else the commands touch stops
-          the run exactly as the tree check always has. Required when
-          regenerate is set.
+          relative to working-directory (repo-relative when that is unset).
+          Committed alongside the manifests when they change, fingerprinted
+          and verified the same way — the declaration is the boundary: only
+          files named here may change during regeneration, and anything else
+          the commands touch stops the run exactly as the tree check always
+          has. Required when regenerate is set.
+        type: string
+        default: ''
+      working-directory:
+        description: >-
+          Directory holding the npm project (package.json,
+          package-lock.json), relative to the repository root — a Cloud
+          Functions backend living alongside an app's own tree, say. Every
+          install, check, manifest read, and git status scan below runs
+          inside it, via a job-level `defaults.run.working-directory`; the
+          `regenerate`/`regenerated-files` inputs above are relative to it
+          too, the same as the manifests. Empty (the default) means the
+          repository root — byte-identical to every existing consumer, none
+          of which sets this.
         type: string
         default: ''
 
@@ -72,6 +85,16 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: read
+    # Empty resolves to '.' (GitHub Actions expressions treat '' as falsy),
+    # so every run: step below reads/writes relative to the repository root
+    # exactly as before for a consumer that never sets working-directory —
+    # this is the one place that has to change for every relative path in
+    # this job to move together. `uses:` steps (checkout, setup-node,
+    # upload-artifact) do NOT inherit this — their own `with:` paths are
+    # fixed up individually below, via the layout step's prefix output.
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory || '.' }}
     outputs:
       changed: ${{ steps.changed.outputs.changed }}
       base: ${{ steps.base.outputs.sha }}
@@ -103,6 +126,37 @@ jobs:
           # block is ever widened.
           persist-credentials: false
 
+      # A `uses:` step's own `with:` paths don't inherit the job-level
+      # `defaults.run.working-directory` above (only `run:` steps do), so
+      # setup-node's file inputs and upload-artifact's path list below need
+      # the working directory spelled out by hand. Computed once here rather
+      # than repeating the same ternary at each use — trailing slash
+      # included so a use site just concatenates it in front of a bare
+      # filename, and empty (not '.') when working-directory is unset, so
+      # concatenation reproduces the exact unprefixed paths this job wrote
+      # before this input existed.
+      #
+      # Read back from git rather than built from the raw input string:
+      # this job's own defaults.run.working-directory above already changed
+      # into inputs.working-directory however it was spelled — './functions',
+      # 'functions/', and 'functions/.' all `cd` to the same place — but
+      # `git status --porcelain` further down always reports paths in git's
+      # canonical form (no leading `./`, no trailing slash), so a prefix
+      # built by concatenating the raw string would silently stop matching
+      # for any caller who wrote one of those equivalent-but-noncanonical
+      # forms, misclassifying every real change as outside the working
+      # directory. `git rev-parse --show-prefix`, run from wherever the job
+      # default already put this step, reports exactly that canonical form
+      # regardless of which spelling got it there (verified directly against
+      # all three).
+      - name: Resolve the working-directory prefix
+        id: layout
+        run: |
+          set -euo pipefail
+          prefix=$(git rev-parse --show-prefix)
+          echo "prefix=$prefix" >> "$GITHUB_OUTPUT"
+          echo "dir=${prefix%/}" >> "$GITHUB_OUTPUT"
+
       # Pinned and handed to the publish job. Publishing from "the default
       # branch" instead would take whatever the tip is by then — if someone
       # lands a package.json or lockfile commit in between, the artifact would
@@ -117,9 +171,16 @@ jobs:
         uses: actions/setup-node@v7
         with:
           # Read the major from .nvmrc rather than repeating it here, same
-          # single-source rule the consumer's own ci.yml follows.
-          node-version-file: .nvmrc
+          # single-source rule the consumer's own ci.yml follows — inside
+          # working-directory when set, alongside the package.json it
+          # governs the engines.npm floor for below.
+          node-version-file: ${{ steps.layout.outputs.prefix }}.nvmrc
           cache: npm
+          # setup-node's own default glob (**/package-lock.json) would still
+          # find a lockfile scoped to working-directory, but naming it
+          # explicitly is one less thing to get right if a repo ever
+          # legitimately has more than one lockfile in its tree.
+          cache-dependency-path: ${{ steps.layout.outputs.prefix }}package-lock.json
 
       # `.nvmrc` holds a bare major and setup-node may serve a CACHED Node 24,
       # whose bundled npm can predate 11.10.0 — the release that added
@@ -324,6 +385,9 @@ jobs:
         env:
           REGENERATE: ${{ inputs.regenerate }}
           REGENERATED_FILES: ${{ inputs.regenerated-files }}
+          # The canonical form the layout step already derived from git, not
+          # the raw input — see that step's comment for why.
+          WORKING_DIRECTORY: ${{ steps.layout.outputs.dir }}
           # A declared path is consumer configuration, not something to
           # trust as a literal filename by default: `git ls-files` and
           # `git diff` below both read their pathspec argument for MAGIC
@@ -409,7 +473,24 @@ jobs:
           pretree_status=$(git status --porcelain --untracked-files=all)
           pretree=$(printf '%s\n' "$pretree_status" \
             | sed 's/^...//' \
+            | while IFS= read -r p; do
+                case "$p" in
+                  "${WORKING_DIRECTORY:-}"/*) printf '%s\n' "${p#"${WORKING_DIRECTORY:-}"/}" ;;
+                  *)
+                    # Outside the working directory — unexpected on its
+                    # own, same reasoning as the verify step's own tree
+                    # check further down (which this pretree check
+                    # mirrors, ahead of it, before any regenerate command
+                    # runs). A no-op when working-directory is unset.
+                    if [ -n "${WORKING_DIRECTORY:-}" ]; then
+                      printf '%s\t\n' "$p"
+                    else
+                      printf '%s\n' "$p"
+                    fi ;;
+                esac
+              done \
             | grep -Ev '^(package\.json|package-lock\.json|checks\.md|deps-stat\.txt)$' || true)
+          pretree=$(printf '%s\n' "$pretree" | sed 's/\t$//')
           if [ -n "$pretree" ]; then
             echo '::error::The checks changed the tree outside the dependency manifests before regeneration ran. Not opening a PR — inspect these first:'
             echo "$pretree"
@@ -491,6 +572,9 @@ jobs:
           # that is set but produced nothing yet must not exempt anything.
           REGEN_SHA: ${{ steps.regen.outputs.files_sha }}
           REGEN_MODE: ${{ steps.regen.outputs.files_mode }}
+          # The canonical form the layout step already derived from git, not
+          # the raw input — see that step's comment for why.
+          WORKING_DIRECTORY: ${{ steps.layout.outputs.dir }}
         run: |
           set -euo pipefail
 
@@ -559,6 +643,27 @@ jobs:
           unexpected=""
           while IFS= read -r -d '' entry; do
             path=${entry:3}
+            # git status --porcelain paths are always repo-root relative
+            # regardless of cwd (verified directly against a checkout with
+            # a working-directory subdirectory). A no-op when
+            # working-directory is unset — the pattern is then a bare
+            # "/*", which no repo-relative path (none start with "/") ever
+            # matches, so this falls straight through to the allowlist
+            # below exactly as before working-directory existed. When it
+            # IS set, a path outside it is unexpected on its own, checked
+            # BEFORE the allowlist rather than left to fall through
+            # unstripped: a root-level package.json (say) would otherwise
+            # keep its bare, allowlisted-looking name and be waved
+            # through as if it were the one inside the working directory.
+            case "$path" in
+              "${WORKING_DIRECTORY:-}"/*) path=${path#"${WORKING_DIRECTORY:-}"/} ;;
+              *)
+                if [ -n "${WORKING_DIRECTORY:-}" ]; then
+                  unexpected="$unexpected$path"$'\n'
+                  continue
+                fi
+                ;;
+            esac
             case "$path" in
               package.json|package-lock.json|checks.md|deps-stat.txt)
                 continue ;;
@@ -614,7 +719,28 @@ jobs:
           planted=$(printf '%s\n' "$status_ignored" \
             | grep '^!! ' \
             | sed 's/^!! //' \
+            | while IFS= read -r p; do
+                case "$p" in
+                  "${WORKING_DIRECTORY:-}"/*) printf '%s\n' "${p#"${WORKING_DIRECTORY:-}"/}" ;;
+                  *)
+                    # Outside the working directory, so unexpected
+                    # regardless of name — same reasoning as the tracked
+                    # loop above. A trailing tab (never legitimately part
+                    # of a path here, and never in the allowlist patterns
+                    # below) keeps a same-named outside entry from
+                    # surviving the allowlist just because its bare name
+                    # happens to match; stripped back off below once this
+                    # whole capture is done, purely for a clean error
+                    # message. A no-op when working-directory is unset.
+                    if [ -n "${WORKING_DIRECTORY:-}" ]; then
+                      printf '%s\t\n' "$p"
+                    else
+                      printf '%s\n' "$p"
+                    fi ;;
+                esac
+              done \
             | grep -Ev '^(node_modules/|dist/|dist-ssr/|dev-dist/|coverage/|[^/]*\.tsbuildinfo)$' || true)
+          planted=$(printf '%s\n' "$planted" | sed 's/\t$//')
           if [ -n "$planted" ]; then
             echo '::error::Dependency code left IGNORED files in the tree. Git would not commit them, but the build could read them. Not opening a PR — inspect these:'
             echo "$planted"
@@ -706,12 +832,19 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: npm-update
+          # `with:` paths don't inherit the job-level working-directory
+          # default (only `run:` steps do), so each one is spelled out via
+          # the layout step's prefix — empty for every existing consumer,
+          # reproducing these five bare names exactly. upload-artifact
+          # keys the archived paths off their common parent, so publish's
+          # download-artifact step (its own `path:` input, same reasoning)
+          # restores them at the matching location either way.
           path: |
-            package.json
-            package-lock.json
-            checks.md
-            deps-stat.txt
-            regen-handoff.tar
+            ${{ steps.layout.outputs.prefix }}package.json
+            ${{ steps.layout.outputs.prefix }}package-lock.json
+            ${{ steps.layout.outputs.prefix }}checks.md
+            ${{ steps.layout.outputs.prefix }}deps-stat.txt
+            ${{ steps.layout.outputs.prefix }}regen-handoff.tar
           retention-days: 1
           if-no-files-found: error
 
@@ -727,6 +860,14 @@ jobs:
       pull-requests: write
       # Dispatching `ci.yml` on the pushed branch is a write to the Actions API.
       actions: write
+    # Same reasoning as the update job's own defaults block: every relative
+    # path this job's run: steps read, write, stage, and commit moves inside
+    # working-directory together. `inputs.working-directory` is available
+    # here directly — reusable-workflow inputs aren't job-scoped — so this
+    # doesn't need a value handed across the job boundary.
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory || '.' }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -754,12 +895,27 @@ jobs:
         with:
           repository: mikelward/npm-update
           ref: ${{ job.workflow_sha }}
-          path: npm-update-hub
+          # Inside working-directory (a `with:` path, so it needs spelling
+          # out by hand the same way the update job's upload-artifact list
+          # does) — not a fixed workspace-root location — so the bare
+          # `npm-update-hub/...` invocations below, which run with that
+          # same directory as their cwd via the job-level defaults, find it
+          # without needing an absolute path or a relative `../` count that
+          # would depend on how deep working-directory nests. Empty
+          # working-directory reproduces the unprefixed "npm-update-hub"
+          # this checked out at before this input existed.
+          path: ${{ inputs.working-directory != '' && format('{0}/npm-update-hub', inputs.working-directory) || 'npm-update-hub' }}
           persist-credentials: false
 
       - uses: actions/download-artifact@v4
         with:
           name: npm-update
+          # Matches the update job's upload: its five paths shared
+          # working-directory as their common parent (empty for every
+          # existing consumer, so upload-artifact stripped nothing and this
+          # is the same as omitting `path:` entirely), so restoring them
+          # under that same directory reproduces the layout exactly.
+          path: ${{ inputs.working-directory || '.' }}
 
       # The artifact traveled through a machine that ran dependency code, so
       # check it against the fingerprints taken before any of it ran. Those
