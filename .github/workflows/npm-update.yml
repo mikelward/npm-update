@@ -545,7 +545,16 @@ jobs:
           # genuine record boundary — a tr-based split would let such a
           # filename masquerade as two separately-classified lines, one of
           # which could satisfy the allowlist and hide the other.
-          status_z="$RUNNER_TEMP/npm-update-status.nul"
+          #
+          # mktemp, not a fixed name: dependency code ran in this same job
+          # (npm update, the checks, any regenerate command) and could plant
+          # a symlink at a predictable path in advance, so a later `>` here
+          # would follow it and overwrite whatever it points at — verified
+          # directly by pre-symlinking the old fixed name to checks.md and
+          # watching the redirect truncate it. mktemp's own O_CREAT|O_EXCL
+          # guarantees a fresh regular file at a name nothing could have
+          # pre-placed a link at.
+          status_z=$(mktemp "$RUNNER_TEMP/npm-update-status-XXXXXX.nul")
           git status --porcelain -z --untracked-files=all > "$status_z"
           unexpected=""
           while IFS= read -r -d '' entry; do
@@ -649,11 +658,34 @@ jobs:
           # names so no filename shape can smuggle options or split into
           # two. Always created, even when the feature is off, so the
           # artifact's fixed path list never goes missing.
+          #
+          # tar writes to an mktemp'd path and only the final `mv` touches
+          # the fixed "regen-handoff.tar" name: dependency code already ran
+          # in this job and knows that name from the workflow source, so it
+          # could pre-plant a symlink there — same class as the status_z fix
+          # above. `tar -cf regen-handoff.tar` directly would follow it and
+          # overwrite whatever it points at; `mv` onto that path instead
+          # replaces the directory entry via rename(2), which never
+          # dereferences an existing destination (verified directly:
+          # `mv`ing onto a pre-existing symlink leaves the link's target
+          # file untouched and the destination path holding the new file).
+          #
+          # -T (--no-target-directory) is load-bearing, not cosmetic: a
+          # symlink planted here pointing at a DIRECTORY instead of a file
+          # (from a background process timed to land after the status scans
+          # above but before this line — the same race the manifest
+          # fingerprints already have to account for) makes a bare `mv`
+          # move the tar INSIDE that directory rather than replace the
+          # symlink, leaving regen-handoff.tar still attacker-controlled —
+          # verified directly. -T forces "dest is a file," so `mv` always
+          # replaces the entry regardless of what it resolves to.
+          regen_tmp=$(mktemp "$RUNNER_TEMP/npm-update-regen-handoff-XXXXXX.tar")
           if [ "${#derived[@]}" -gt 0 ]; then
-            printf '%s\0' "${derived[@]}" | tar -cf regen-handoff.tar --null --verbatim-files-from -T -
+            printf '%s\0' "${derived[@]}" | tar -cf "$regen_tmp" --null --verbatim-files-from -T -
           else
-            tar -cf regen-handoff.tar -T /dev/null
+            tar -cf "$regen_tmp" -T /dev/null
           fi
+          mv -T -- "$regen_tmp" regen-handoff.tar
 
           # The manifest CONTENT check does not live here — see the publish
           # job's "Re-validate the dependency diff from a clean context". This

@@ -21,7 +21,15 @@
 // that already work.
 
 import { describe, it, expect } from "./vitest-shim.mjs";
-import { existsSync, readFileSync, writeFileSync, mkdtempSync, rmSync } from "node:fs";
+import {
+  existsSync,
+  readFileSync,
+  writeFileSync,
+  mkdtempSync,
+  rmSync,
+  symlinkSync,
+  lstatSync,
+} from "node:fs";
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -138,7 +146,7 @@ describe("npm-update reusable workflow", () => {
     // grep-tolerant pipe below ever runs; the ignored pass keeps the
     // original bare `var=$(cmd)` assignment form, which the same
     // protection applies to.
-    expect(update).toMatch(/status_z="\$RUNNER_TEMP\/npm-update-status\.nul"\n\s*git status --porcelain -z --untracked-files=all > "\$status_z"\n\s*unexpected=""/);
+    expect(update).toMatch(/status_z=\$\(mktemp "\$RUNNER_TEMP\/npm-update-status-XXXXXX\.nul"\)\n\s*git status --porcelain -z --untracked-files=all > "\$status_z"\n\s*unexpected=""/);
     expect(update).toMatch(/status_ignored=\$\(git status --porcelain --ignored\)\n\s*planted=\$\(printf '%s\\n' "\$status_ignored"/);
   });
 
@@ -798,14 +806,183 @@ describe("the regenerate hook", () => {
     const verifyStep = doc.jobs.update.steps.find(
       (s) => s.name === "Verify only dependency files changed",
     );
-    expect(verifyStep.run).toContain("tar -cf regen-handoff.tar --null --verbatim-files-from -T -");
+    // tar writes to an mktemp'd path, not the fixed "regen-handoff.tar"
+    // name directly -- dependency code ran earlier in this job and knows
+    // that name from the workflow source, so a direct `tar -cf
+    // regen-handoff.tar` would follow a pre-planted symlink there. Only
+    // the final `mv` (rename(2), which never dereferences an existing
+    // destination) touches the fixed name.
+    expect(verifyStep.run).toContain(
+      'printf \'%s\\0\' "${derived[@]}" | tar -cf "$regen_tmp" --null --verbatim-files-from -T -',
+    );
     // Always created, even when the feature is off, so the artifact's
     // fixed path list below never goes missing.
-    expect(verifyStep.run).toContain("tar -cf regen-handoff.tar -T /dev/null");
+    expect(verifyStep.run).toContain('tar -cf "$regen_tmp" -T /dev/null');
+    expect(verifyStep.run).toMatch(/regen_tmp=\$\(mktemp "\$RUNNER_TEMP\/npm-update-regen-handoff-XXXXXX\.tar"\)/);
+    // -T forces "dest is a file": without it, a symlink planted at
+    // regen-handoff.tar pointing at a DIRECTORY makes a bare mv move the
+    // tar inside that directory instead of replacing the symlink.
+    expect(verifyStep.run).toContain('mv -T -- "$regen_tmp" regen-handoff.tar');
     const handoffStep = doc.jobs.update.steps.find(
       (s) => s.name === "Hand off the dependency diff",
     );
     expect(handoffStep.with.path).toContain("regen-handoff.tar");
+  });
+
+  it("replaces a directory symlink planted at regen-handoff.tar instead of moving the tar inside it", () => {
+    // A background process left running by an earlier npm-update/regenerate
+    // command (the same race the manifest fingerprints already have to
+    // account for -- see AGENTS.md "Trust model") could time a plant to
+    // land AFTER the untracked-file scans above complete but BEFORE this
+    // tar+mv snippet runs later in the same step -- too late for those
+    // scans to catch it. Isolates just the tar-creation-through-mv text
+    // from the real step (not a hand-copied duplicate) so this stays tied
+    // to the actual script; a directory symlink is the case a bare `mv`
+    // gets wrong (verified directly against the pre-`-T` code before
+    // writing this test).
+    const verifyStep = doc.jobs.update.steps.find(
+      (s) => s.name === "Verify only dependency files changed",
+    );
+    const start = verifyStep.run.indexOf("regen_tmp=$(mktemp");
+    const end = verifyStep.run.indexOf("\n", verifyStep.run.indexOf('mv -T -- "$regen_tmp"'));
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    const snippet = verifyStep.run.slice(start, end);
+
+    const scratch = mkdtempSync(join(tmpdir(), "npm-update-tar-mv-"));
+    const tmp = join(scratch, "repo");
+    try {
+      execFileSync("mkdir", ["-p", join(tmp, "victim_dir")]);
+      symlinkSync("victim_dir", join(tmp, "regen-handoff.tar"));
+      execFileSync(
+        "bash",
+        ["-c", `set -euo pipefail\nderived=()\n${snippet}`],
+        { cwd: tmp, env: { ...process.env, RUNNER_TEMP: scratch } },
+      );
+      expect(lstatSync(join(tmp, "regen-handoff.tar")).isSymbolicLink()).toBe(false);
+      expect(existsSync(join(tmp, "victim_dir"))).toBe(true);
+      // Nothing landed inside the directory the symlink used to point at --
+      // a bare mv would have moved the tar there instead of replacing the
+      // symlink.
+      expect(execFileSync("ls", ["-A", join(tmp, "victim_dir")]).toString()).toBe("");
+    } finally {
+      rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
+  it("never writes dependency-job output through a fixed, predictable path a plant could symlink", () => {
+    // Regression guard for the status_z and regen-handoff.tar symlink
+    // fixes: any future scratch file the update job's steps write through
+    // a `>` redirect or `tar -cf` must go through mktemp (a bare variable
+    // reference is exempt -- it's the mktemp result), since dependency code
+    // (npm update, the checks, a regenerate command) runs earlier in the
+    // same job and can pre-plant a symlink at any name it can read out of
+    // this file. Scoped to the update job's own step scripts only --
+    // publish is a fresh runner that installs nothing, so nothing untrusted
+    // ever runs there to plant a symlink in the first place. Comments
+    // stripped first, so an explanatory `tar -cf regen-handoff.tar` in a
+    // comment (like this fix's own) can't satisfy or fail the check.
+    const stripComments = (text) =>
+      text
+        .split("\n")
+        .filter((line) => !line.trimStart().startsWith("#"))
+        .map((line) => line.replace(/\s+#.*$/, ""))
+        .join("\n");
+    for (const step of doc.jobs.update.steps) {
+      if (!step.run) continue;
+      const run = stripComments(step.run);
+      const redirects = [...run.matchAll(/>\s*"?(\$RUNNER_TEMP\/[\w.$/-]+|[\w.-]+\.(?:tar|nul))"?/g)]
+        .map((m) => m[1])
+        .filter((path) => path !== "$status_z" && path !== "$regen_tmp");
+      expect(redirects, `${step.name}: unexpected fixed-path redirect(s)`).toEqual([]);
+      const tarCreates = [...run.matchAll(/tar -cf "?([\w.$-]+)"?/g)]
+        .map((m) => m[1])
+        .filter((path) => path !== "$regen_tmp");
+      expect(tarCreates, `${step.name}: unexpected fixed-path tar create(s)`).toEqual([]);
+    }
+  });
+
+  it("does not follow a symlink planted at the old fixed status-file name", () => {
+    // Reproduces the exploit directly: dependency code that ran earlier in
+    // this same job (npm update, a check, a regenerate command) can plant a
+    // symlink at any name it can read out of the workflow source. Before the
+    // mktemp fix, `git status ... > "$RUNNER_TEMP/npm-update-status.nul"`
+    // followed such a symlink and truncated whatever it pointed at --
+    // verified directly against the old code before writing this test.
+    //
+    // regen-handoff.tar (the OTHER fixed name this PR moved behind mktemp)
+    // isn't exercised here: it lives inside the checkout tree, where this
+    // same step's own untracked-file scan already rejects a pre-planted
+    // symlink there before the tar-create line ever runs, regardless of
+    // this fix -- confirmed directly (a plant at that path makes the step
+    // exit 1 for "touched files outside the dependency manifests", not
+    // silently succeed). The mktemp/mv there is defense in depth for that
+    // check ever gaining a gap, not a closure of an independently reachable
+    // hole the way the status file is.
+    //
+    // checks.md stays untouched and the fixed status-file name itself never
+    // gets planted, since the real path is now random.
+    const verifyStep = doc.jobs.update.steps.find(
+      (s) => s.name === "Verify only dependency files changed",
+    );
+    const scratch = mkdtempSync(join(tmpdir(), "npm-update-symlink-"));
+    const tmp = join(scratch, "repo");
+    try {
+      execFileSync("mkdir", ["-p", tmp]);
+      execFileSync("git", ["init", "-q"], { cwd: tmp });
+      execFileSync("git", ["config", "user.email", "t@example.com"], { cwd: tmp });
+      execFileSync("git", ["config", "user.name", "t"], { cwd: tmp });
+      writeFileSync(join(tmp, "package.json"), "{}\n");
+      writeFileSync(join(tmp, "package-lock.json"), "{}\n");
+      execFileSync("git", ["add", "-A"], { cwd: tmp });
+      execFileSync("git", ["commit", "-q", "-m", "seed"], { cwd: tmp });
+
+      const checksVictim = "REAL CHECKS REPORT -- must survive\n";
+      writeFileSync(join(tmp, "checks.md"), checksVictim);
+      writeFileSync(join(tmp, "deps-stat.txt"), "1 file changed\n");
+      const pkgSha = execFileSync("sh", ["-c", "sha256sum package.json | cut -d' ' -f1"], {
+        cwd: tmp,
+      })
+        .toString()
+        .trim();
+      const lockSha = execFileSync(
+        "sh",
+        ["-c", "sha256sum package-lock.json | cut -d' ' -f1"],
+        { cwd: tmp },
+      )
+        .toString()
+        .trim();
+
+      symlinkSync(join(tmp, "checks.md"), join(scratch, "npm-update-status.nul"));
+
+      const outPath = join(scratch, "out.txt");
+      const summaryPath = join(scratch, "summary.txt");
+      writeFileSync(outPath, "");
+      writeFileSync(summaryPath, "");
+      execFileSync("bash", ["-c", verifyStep.run], {
+        cwd: tmp,
+        env: {
+          ...process.env,
+          PKG_SHA: pkgSha,
+          LOCK_SHA: lockSha,
+          REGENERATED_FILES: "",
+          REGEN_SHA: "",
+          REGEN_MODE: "",
+          GITHUB_OUTPUT: outPath,
+          GITHUB_STEP_SUMMARY: summaryPath,
+          RUNNER_TEMP: scratch,
+        },
+      });
+
+      expect(readFileSync(join(tmp, "checks.md"), "utf8")).toBe(checksVictim);
+      // Also confirm the step's own regen-handoff.tar output landed as a
+      // real file, not a dangling link -- the normal, no-attack path this
+      // step is also expected to produce.
+      expect(lstatSync(join(tmp, "regen-handoff.tar")).isSymbolicLink()).toBe(false);
+      expect(existsSync(join(tmp, "regen-handoff.tar"))).toBe(true);
+    } finally {
+      rmSync(scratch, { recursive: true, force: true });
+    }
   });
 
   it("validates the declaration end to end: empty, duplicate, noncanonical, untracked, and a clean pass", () => {
