@@ -309,6 +309,53 @@ test("parses an empty flow mapping ('permissions: {}') as an empty object, the o
   assert.deepEqual(doc.permissions, {});
 });
 
+test("throws yaml-lite's own error on an invalid escape sequence inside a double-quoted scalar, not a bare JSON SyntaxError", () => {
+  // Found by fuzzing: '"a\qb"' closes its quote fine (hasClosingQuote only
+  // tracks whether the quote closes, not whether each escape is valid),
+  // so it reaches the JSON.parse fast path — but \q isn't a JSON escape,
+  // and JSON.parse throws its own uncaught SyntaxError instead of this
+  // file's "yaml-lite: ..." convention every other rejection follows.
+  // Verified against yaml.safe_load('a: "a\\qb"\n'), which also rejects
+  // this (a ScannerError — \q isn't a YAML double-quoted escape either),
+  // so throwing here is correct; the fix is only about *which* error.
+  assert.throws(
+    () => parseWorkflowYaml('a: "a\\qb"\n'),
+    /invalid escape sequence/,
+  );
+  // A scalar using only real escapes must still parse.
+  assert.equal(parseWorkflowYaml('a: "a\\tb"\n').a, "a\tb");
+});
+
+test("throws a clearly-scoped error on an implicit multi-line plain scalar block value, not a confusing generic one", () => {
+  // "a:\n  free text\n  more text\n" is real, valid YAML — verified against
+  // yaml.safe_load, which folds it to {'a': 'free text more text'}, using a
+  // DIFFERENT folding rule than this file's own ">" support (a more-
+  // indented line inside this construct folds to a plain space, unlike a
+  // ">"-folded scalar's "more-indented lines break the fold" behavior —
+  // yaml.safe_load("a:\n  line one\n    indented\n  line two\n") ->
+  // {'a': 'line one indented line two'}, not the ">"-style hard break).
+  // Reusing the ">" folding logic here would be quietly wrong, not merely
+  // unimplemented, so this is out of this parser's scope rather than a
+  // guess at a construct with its own subtle rules. Before this check
+  // existed, the same input still failed — just via splitKeyValue's
+  // generic "could not parse mapping entry: ..." error, found by fuzzing.
+  assert.throws(
+    () => parseWorkflowYaml("a:\n  free text\n  more text\n"),
+    /implicit multi-line plain scalar/,
+  );
+  // A single-line implicit scalar hits the exact same construct (its
+  // "block" is just one line) and is equally out of scope.
+  assert.throws(
+    () => parseWorkflowYaml("a:\n  free text\n"),
+    /implicit multi-line plain scalar/,
+  );
+  // Contrast: a deeper block whose first line genuinely looks like a
+  // mapping key ("key: value" or bare "key:") is unaffected — that's the
+  // ordinary nested-mapping case this parser has always supported.
+  const doc = parseWorkflowYaml("a:\n  b: 1\n");
+  assert.equal(doc.a.b, 1);
+});
+
 test("throws on a flow mapping as a plain mapping value, rather than returning the brace text as a string", () => {
   // "a: { b: 1 }" isn't in this parser's scope (see the file header). An
   // earlier version fell through to parseScalar's final `return s` and

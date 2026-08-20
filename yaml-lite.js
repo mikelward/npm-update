@@ -6,20 +6,25 @@
 // a thing to guess at, so it throws rather than silently returning
 // something wrong.
 //
-// Exists so npm-update-workflow.test.js can assert real structure instead
-// of regex/string-matching over serialized YAML text — a class of fragility
-// this file hit directly: a "no expression is spliced into any run: block"
+// Vendored from mikelward/yaml-lite (canonical source; last synced from
+// commit bbc7cb2c960b065ac35e1ee507935a24b720dee8). This parser was copied
+// "verbatim" into this repo from mikelward/ci-commit-artifact (where it
+// originated), and the two copies then drifted independently for a while
+// before being reconciled into mikelward/yaml-lite, which is now the
+// source of truth — fix a bug there first, then re-sync this copy (see
+// this repo's own AGENTS.md).
+//
+// Exists so npm-update-workflow.test.js can assert real structure instead of
+// regex/string-matching over serialized YAML text. That fragility is exactly
+// what motivated this: a "no expression is spliced into any run: block"
 // sweep written as a block-boundary regex couldn't reliably tell a run:
 // script line from an env: declaration or a with: input, and needed several
 // rounds of exclusion patches to stop false-positiving on its own fixes.
-// Ported verbatim from mikelward/ci-commit-artifact, which hit the same
-// problem first and built this to fix it — see that repository's AGENTS.md
-// for the fuller argument. Kept in-process and dependency-free on purpose,
-// matching this repository's own "no dependencies, no package.json, no
-// lockfile" rule: shelling out to python3 for a real YAML parser (PyYAML,
-// as mikelward/codex-review's check_consumer.py does) would be a second
-// runtime taken on for test-time convenience, not a structural need the way
-// it is there.
+// Kept in-process and dependency-free on purpose, matching every consumer's
+// "no dependencies, no package.json, no lockfile" rule: shelling out to
+// python3 for a real YAML parser (PyYAML, as mikelward/codex-review's
+// check_consumer.py does) would be a second runtime taken on for test-time
+// convenience, not a structural need the way it is there.
 //
 // Deliberately does NOT implement YAML 1.1's `on`/`off`/`yes`/`no`-as-boolean
 // expansion (only `true`/`false`/`null`/`~` are recognized) — that quirk is
@@ -52,10 +57,20 @@ function parseWorkflowYaml(text) {
   // whether a given line sits inside a block scalar, was this parser's
   // first real bug — caught by round-tripping this repo's own workflow.
   const rawLines = body.split("\n").map((raw, i) => {
-    const indent = raw.length - raw.replace(/^ */, "").length;
-    if (/\t/.test(raw.slice(0, indent))) {
+    // Leading whitespace scanned as SPACES-OR-TABS first, tabs checked
+    // against that — not raw.replace(/^ */, "") followed by checking
+    // raw.slice(0, indent) for a tab, which made the check unreachable for
+    // the exact case it exists to catch: a line whose indentation is a tab
+    // from its very first character matches zero leading spaces, so indent
+    // was computed as 0 and the slice it then tab-checked was always "".
+    // Verified against yaml.safe_load("a:\n\tb: c\n"), which raises a
+    // ScannerError ("found character '\t' that cannot start any token")
+    // rather than accepting it as two top-level keys.
+    const leadingWhitespace = raw.match(/^[ \t]*/)[0];
+    if (leadingWhitespace.includes("\t")) {
       throw new Error(`yaml-lite: tab in indentation at line ${i + 1} — not supported`);
     }
+    const indent = leadingWhitespace.length;
     const trimmed = raw.trim();
     return {
       n: i + 1,
@@ -141,17 +156,71 @@ function parseWorkflowYaml(text) {
     if (s.startsWith("&") || s.startsWith("*")) {
       throw new Error(`yaml-lite: anchors/aliases are not supported (got ${JSON.stringify(s)})`);
     }
-    if (s.startsWith("{") && s.endsWith("}")) {
-      // An empty flow mapping ("permissions: {}", least-privilege workflows'
-      // standard idiom, is this repo's own real usage) is unambiguous and
-      // costs nothing to support. A NON-empty one ("{ a: 1, b: 2 }") is out
-      // of this parser's scope (see the file header) — reachable both as a
-      // plain mapping value and as a sequence item's scalar ("- { a: 1 }"
-      // falls through the "- key: value" check above, since its rest starts
-      // with "{" rather than a bare key, straight into this function).
-      // Throwing for the non-empty case covers both call sites from one
-      // place instead of guessing at its structure and returning something
-      // wrong.
+    // Tags ("!!str foo", "!custom bar") are explicitly out of this file's
+    // header-stated scope, same as anchors/aliases above — but unlike
+    // anchors/aliases, a tagged scalar isn't even always invalid YAML:
+    // yaml.safe_load resolves "!!str ubuntu-latest" to the plain string
+    // "ubuntu-latest" (a standard, known tag), while it genuinely errors
+    // on "!custom value" ("could not determine a constructor"). This
+    // parser draws no distinction between the two — both throw, since
+    // implementing tag resolution is out of scope either way and silently
+    // returning "!!str ubuntu-latest" as the literal 18-character string
+    // (this file's previous behavior, via the plain-scalar fallback) is
+    // wrong regardless of which case it is.
+    if (s.startsWith("!")) {
+      throw new Error(`yaml-lite: tags are not supported (got ${JSON.stringify(s)})`);
+    }
+    // "@", "`" and "%" are reserved as a plain scalar's OWN first
+    // character — verified against yaml.safe_load, which raises a
+    // ScannerError ("while scanning for the next token") for
+    // "runs-on: @invalid", "a: \`invalid" and "a: %invalid" alike, while
+    // the SAME characters elsewhere in a scalar are perfectly ordinary
+    // ("a: b@c", "a: b\`c", "a: 100%" all parse fine). Only the leading
+    // position is reserved, so this checks startsWith, not includes.
+    if (s.startsWith("@") || s.startsWith("`") || s.startsWith("%")) {
+      throw new Error(`yaml-lite: reserved leading character in a plain scalar (got ${JSON.stringify(s)})`);
+    }
+    // A scalar that OPENS a quote must genuinely close it, right at its own
+    // last character — not just happen to end in a quote character (an
+    // escaped one doesn't count) and not fail to close at all. A blind
+    // `startsWith(q) && endsWith(q)` check (what the branches below relied
+    // on alone) treats `"example` — no closing quote anywhere — as an
+    // ordinary plain scalar starting with a literal `"`, silently returning
+    // the malformed text instead of catching that GitHub's own parser
+    // rejects it outright. Verified against yaml.safe_load('name: "example\n'),
+    // which raises a ScannerError for "unexpected end of stream" rather than
+    // returning a value. Reachable both directly and via a flow-sequence
+    // element (splitFlowSequence hands an unterminated quoted element to
+    // this same function), so one check here covers both.
+    if ((s.startsWith("'") && !hasClosingQuote(s, "'")) || (s.startsWith('"') && !hasClosingQuote(s, '"'))) {
+      throw new Error(`yaml-lite: unterminated quoted scalar (got ${JSON.stringify(s)})`);
+    }
+    if (s.startsWith("{")) {
+      // Checked separately from endsWith("}") below — a compound
+      // startsWith("{") && endsWith("}") condition (this file's first
+      // version) is false for an unmatched opener ("permissions:
+      // {contents: write", no closing brace) and falls through every
+      // remaining branch to the plain-scalar return at the bottom,
+      // silently returning the malformed text instead of rejecting it.
+      // Verified against yaml.safe_load("permissions: {contents: write\n"),
+      // which raises a ParserError ("while parsing a flow mapping")
+      // rather than returning a value — the same shape of bug the
+      // unterminated-flow-sequence check below already guards against.
+      if (!s.endsWith("}")) {
+        throw new Error(`yaml-lite: unterminated flow mapping (got ${JSON.stringify(s)})`);
+      }
+      // An empty flow mapping ("permissions: {}", least-privilege
+      // workflows' standard idiom) is unambiguous and costs nothing to
+      // support. A NON-empty one ("{ contents: read }") is out of this
+      // parser's scope (see the file header) — real, valid YAML that
+      // yaml.safe_load parses into a genuine nested object, but this
+      // parser previously returned the brace text as a literal STRING
+      // instead, silently wrong rather than merely unsupported (the file
+      // header's own stated contract is to throw on out-of-scope
+      // constructs, not guess). Reachable both as a plain mapping value
+      // and as a sequence item's scalar ("- { a: 1 }" falls through the
+      // "- key: value" check in parseSequence, since its rest starts with
+      // "{" rather than a bare key, straight into this function).
       const inner = s.slice(1, -1).trim();
       if (inner === "") return {};
       throw new Error(`yaml-lite: flow mappings are not supported (got ${JSON.stringify(s)})`);
@@ -162,14 +231,169 @@ function parseWorkflowYaml(text) {
       return s.slice(1, -1).replace(/''/g, "'");
     }
     if (s.startsWith('"') && s.endsWith('"') && s.length >= 2) {
-      return JSON.parse(s);
+      // A closed double-quoted scalar can still carry an escape sequence
+      // JSON doesn't accept — YAML's own escape set and JSON's overlap but
+      // aren't identical (JSON has no \e, \0, \x.., \N, \_, \L, \P, and
+      // rejects an unrecognized \<letter> the same way JSON does), and
+      // JSON.parse throws its own bare SyntaxError for those, uncaught,
+      // instead of this file's "yaml-lite: ..." convention every OTHER
+      // rejection here follows. Found by fuzzing: '"a\qb"' passes
+      // hasClosingQuote (it only tracks whether the quote closes, not
+      // whether each escape is valid) and then throws
+      // "Bad escaped character in JSON" straight out of this function.
+      // Not a silent-wrong-answer bug — it already refused to return
+      // something incorrect — but an inconsistent one a caller pattern-
+      // matching on this parser's own error convention would trip over.
+      try {
+        return JSON.parse(s);
+      } catch {
+        throw new Error(`yaml-lite: invalid escape sequence in a double-quoted scalar (got ${JSON.stringify(s)})`);
+      }
     }
-    if (s.startsWith("[") && s.endsWith("]")) {
+    if (s.startsWith("[")) {
+      // An unmatched opening bracket ("runs-on: [ubuntu-latest", no closing
+      // "]") previously fell through to the plain-scalar return below,
+      // silently returning the literal text "[ubuntu-latest" instead of
+      // rejecting it — verified against yaml.safe_load, which raises a
+      // ParserError ("expected ',' or ']', but got <stream end>") rather
+      // than returning a value.
+      if (!s.endsWith("]")) {
+        throw new Error(`yaml-lite: unterminated flow sequence (got ${JSON.stringify(s)})`);
+      }
+      // endsWith("]") alone only rules out a MISSING close, not a surplus
+      // one: "runs-on: [ubuntu-latest]]" still ends with "]", but the
+      // extra bracket makes it invalid YAML — verified against
+      // yaml.safe_load, which raises a ParserError ("while parsing a
+      // block mapping") rather than returning a value. The old check
+      // sliced off exactly one leading/trailing character regardless,
+      // handing splitFlowSequence "ubuntu-latest]" and silently returning
+      // ["ubuntu-latest]"] — a real bracket smuggled into element content.
+      // hasBalancedFlowBrackets confirms the sequence's own brackets net
+      // to zero and land on the string's LAST character, not just that a
+      // "]" appears somewhere after the "[".
+      if (!hasBalancedFlowBrackets(s)) {
+        throw new Error(`yaml-lite: unbalanced flow sequence brackets (got ${JSON.stringify(s)})`);
+      }
       const inner = s.slice(1, -1).trim();
       if (inner === "") return [];
       return splitFlowSequence(inner).map(parseScalar);
     }
+    // An unquoted plain scalar containing ": " (colon then whitespace) or
+    // ending in a bare ":" is invalid where it's reachable from — both a
+    // block mapping's value ("runs-on: ubuntu: latest", genuinely
+    // ambiguous YAML: a colon followed by whitespace/EOL always reads as
+    // a nested mapping-value indicator, never scalar content) and a flow
+    // sequence element ("[b: c]", which real YAML resolves as a flow
+    // MAPPING shorthand — {b: 'c'} — a construct this parser doesn't
+    // implement, so silently returning it as the literal string "b: c"
+    // would be wrong the same way an unimplemented flow mapping is
+    // elsewhere in this file). Verified against yaml.safe_load: "a: b: c"
+    // and "a: b:\tc" both raise "mapping values are not allowed here";
+    // "a: [b: c]" parses as [{'b': 'c'}], not a scalar. A colon NOT
+    // followed by whitespace ("http://x.com", "1:30", "b:c") is
+    // unambiguous and stays a plain scalar.
+    if (/:\s|:$/.test(s)) {
+      throw new Error(`yaml-lite: unquoted ": " or trailing ":" in a plain scalar (got ${JSON.stringify(s)})`);
+    }
     return s;
+  }
+
+  // Whether `s` (which starts with `quoteChar`) has a genuine, unescaped
+  // closing quote as its very last character. Forward scan skipping the
+  // character after a backslash inside a double-quoted run, and a doubled
+  // `''` inside a single-quoted one — the same escape-tracking style as
+  // stripInlineComment and splitFlowSequence below, kept consistent rather
+  // than reinvented, since getting this asymmetric by accident is exactly
+  // how this file's earlier quote-handling bugs happened.
+  function hasClosingQuote(s, quoteChar) {
+    for (let i = 1; i < s.length; i++) {
+      const ch = s[i];
+      if (quoteChar === '"' && ch === "\\") {
+        i++; // skip the escaped character
+        continue;
+      }
+      if (ch === quoteChar) {
+        if (quoteChar === "'" && s[i + 1] === "'") {
+          i++; // escaped '' inside a single-quoted scalar
+          continue;
+        }
+        return i === s.length - 1;
+      }
+    }
+    return false;
+  }
+
+  // Whether `s` (a flow sequence, brackets included) has genuinely
+  // balanced [ ] delimiters: depth never goes negative (no unmatched
+  // closer) and returns to exactly 0 only once, at the string's own last
+  // character (no unmatched opener, and nothing trailing after the
+  // sequence's own close — "[a]]" and "[a][b]" both fail this the same
+  // way, at the first bracket that closes the depth-0 case is not the
+  // final character). Quote-aware — the same reason splitFlowSequence and
+  // stripInlineComment are: a bracket character inside a quoted element
+  // ("[\"a]b\"]") is content, not a delimiter, so it must not be counted.
+  // `elementStart` restricts quote-opening to an element's OWN first
+  // character, same rule and same reason as splitFlowSequence's
+  // `current.trim() === ""` guard: without it, this function previously
+  // entered quote mode for ANY quote character anywhere, so
+  // "[echo \"x]y\", q]" swallowed the real closing "]" right after "x"
+  // into a synthetic quote run and read the whole thing as balanced —
+  // verified against yaml.safe_load, which rejects it outright. `[` and
+  // `,` both start a fresh element (nested or sibling); any non-whitespace
+  // character ends "start of element".
+  function hasBalancedFlowBrackets(s) {
+    let depth = 0;
+    let quote = null;
+    let elementStart = true;
+    for (let i = 0; i < s.length; i++) {
+      const ch = s[i];
+      if (quote) {
+        if (quote === '"' && ch === "\\") {
+          i++; // skip the escaped character
+          continue;
+        }
+        if (ch === quote) {
+          if (quote === "'" && s[i + 1] === "'") {
+            i++; // escaped '' inside a single-quoted element
+            continue;
+          }
+          quote = null;
+        }
+        continue;
+      }
+      if ((ch === "'" || ch === '"') && elementStart) {
+        quote = ch;
+        elementStart = false;
+        continue;
+      }
+      if (ch === "[") {
+        depth++;
+        elementStart = true;
+        continue;
+      }
+      if (ch === "]") {
+        depth--;
+        elementStart = false;
+        if (depth < 0) return false;
+        if (depth === 0) return i === s.length - 1;
+        continue;
+      }
+      if (ch === ",") {
+        elementStart = true;
+        continue;
+      }
+      if (!/\s/.test(ch)) elementStart = false;
+    }
+    // A quote still open at the string's end ('a: ["b, c]') is a
+    // different, more specific defect — an unterminated quoted scalar —
+    // that parseScalar/hasClosingQuote already catches once this element
+    // is actually parsed. Deferring to that here (rather than reporting
+    // it as an unbalanced-bracket problem) keeps the more accurate
+    // diagnostic: verified against yaml.safe_load, which reports this
+    // shape as "while scanning a quoted scalar", not a flow-sequence
+    // parse error.
+    if (quote) return true;
+    return depth === 0;
   }
 
   // Same escape handling as stripInlineComment, and for the same reason: a
@@ -215,6 +439,20 @@ function parseWorkflowYaml(text) {
       if (ch === "[") depth++;
       if (ch === "]") depth--;
       if (ch === "," && depth === 0) {
+        // An empty element (two commas in a row, or a leading comma) is
+        // invalid — verified against yaml.safe_load, which raises a
+        // ParserError for "[a,,b]", "[,a,b]" and "[a, ,b]" alike. A SINGLE
+        // trailing comma ("[a,b,]") is valid and never reaches this throw:
+        // it splits off "b" here (current is non-empty at that point) and
+        // the resulting empty tail is dropped below, after the loop, by
+        // the trim() check that already existed — this only rejects an
+        // element that is empty at a SPLIT point, not the harmless nothing
+        // that follows the sequence's own last comma.
+        if (current.trim() === "") {
+          throw new Error(
+            `yaml-lite: empty element in flow sequence (got ${JSON.stringify(`[${inner}]`)})`,
+          );
+        }
         parts.push(current);
         current = "";
         continue;
@@ -358,6 +596,13 @@ function parseWorkflowYaml(text) {
     return stripped + (sourceEndsWithNewline ? "\n" : "");
   }
 
+  // Same key-detection pattern splitKeyValue itself matches against, kept
+  // separate so parseNode can ask "is this a mapping?" without committing
+  // to consuming the line — real YAML decides block-scalar-vs-mapping by
+  // looking at exactly this shape on the first line of a deeper-indented
+  // block, so this mirrors that rule rather than reinventing one.
+  const MAPPING_KEY_RE = /^("(?:[^"\\]|\\.)*"|'(?:[^']|'')*'|[^:]+?):(?:\s.*)?$/;
+
   function parseNode(indent) {
     const line = peek();
     if (!line) return null;
@@ -365,6 +610,34 @@ function parseWorkflowYaml(text) {
 
     if (line.content.startsWith("- ") || line.content === "-") {
       return parseSequence(line.indent);
+    }
+    if (!MAPPING_KEY_RE.test(line.content)) {
+      // A deeper-indented block whose first line is neither a sequence
+      // item nor a "key:"/"key: value" mapping entry is an implicit,
+      // indicator-less multi-line plain scalar block value — real, valid
+      // YAML ("a:\n  free text\n  more text\n" -> {'a': 'free text more
+      // text'}), found by fuzzing. Verified against yaml.safe_load that its
+      // folding is NOT the same algorithm this file's own ">" handling
+      // implements: a more-indented line inside an explicit folded scalar
+      // breaks the fold (see parseBlockScalar's folded-style comments), but
+      // the SAME shape inside an implicit plain-scalar block folds to a
+      // plain space regardless of relative indentation
+      // (yaml.safe_load("a:\n  line one\n    indented\n  line two\n") ->
+      // {'a': 'line one indented line two'}, not the ">"-style "line
+      // one\n  indented\nline two"). Reusing parseBlockScalar's folding
+      // logic here would therefore be quietly wrong, not merely
+      // unimplemented — exactly the failure mode this file's folded-scalar
+      // comments describe getting bitten by twice already for the explicit
+      // case. Rather than risk a third wrong implementation under the same
+      // pressure, this construct is out of scope (see the file header) and
+      // throws its own clearly-scoped error. This is a message
+      // improvement, not a new restriction: every input reaching this
+      // branch already failed before this check existed, via
+      // splitKeyValue's generic "could not parse mapping entry" — this
+      // only makes the failure legible instead of confusing.
+      throw new Error(
+        `yaml-lite: line ${line.n} looks like an implicit multi-line plain scalar block value, which this parser does not support — use an explicit | or > block scalar, or put the value on the key's own line (got ${JSON.stringify(line.content)})`,
+      );
     }
     return parseMapping(line.indent);
   }
@@ -407,6 +680,38 @@ function parseWorkflowYaml(text) {
     return result;
   }
 
+  // Verified against yaml.safe_load("a: 1\na: 2\n"), which raises a
+  // ConstructorError under a duplicate-key-rejecting loader (PyYAML's
+  // default SafeLoader is lenient and keeps the last value, but rejecting
+  // is the spec-correct, commonly-enforced reading) — silently keeping the
+  // last value here would hide a workflow author's copy-paste mistake
+  // (two "permissions:" blocks, the second one clobbering the first)
+  // rather than surfacing it.
+  function checkDuplicateKey(target, key, lineNumber) {
+    if (Object.prototype.hasOwnProperty.call(target, key)) {
+      throw new Error(`yaml-lite: duplicate mapping key ${JSON.stringify(key)} at line ${lineNumber}`);
+    }
+  }
+
+  // A key with special meaning on Object.prototype — most notably
+  // "__proto__", a real, legal GitHub Actions job/step/input ID — cannot be
+  // set with plain `target[key] = value`: that invokes the inherited
+  // `__proto__` ACCESSOR, which reassigns the object's own prototype
+  // instead of creating an enumerable own property. The job then silently
+  // vanishes from `Object.keys(doc.jobs)` and every `for...in`/spread-based
+  // test, while `doc.jobs.__proto__` still returns it via prototype lookup
+  // — a real workflow structure the parser would otherwise represent
+  // wrong, not an out-of-scope construct to reject. Object.defineProperty
+  // sidesteps the accessor and always creates a genuine own data property,
+  // keeping the target's OWN prototype untouched (Object.create(null)
+  // would also fix this, but strips the prototype from every mapping this
+  // parser returns, breaking assert.deepEqual/deepStrictEqual — which
+  // checks prototype identity — against ordinary {} literals throughout
+  // the existing test suite).
+  function setMappingValue(target, key, value) {
+    Object.defineProperty(target, key, { value, enumerable: true, writable: true, configurable: true });
+  }
+
   function parseInlineMappingItem(firstLineRest, siblingIndent, firstLineRawIndex) {
     const obj = {};
     applyMappingEntry(obj, firstLineRest, siblingIndent, firstLineRawIndex);
@@ -419,13 +724,14 @@ function parseWorkflowYaml(text) {
 
     function applyMappingEntry(target, content, ownIndent, rawIndex) {
       const { key, rest, isBlockScalar, style, chomp } = splitKeyValue(content);
+      checkDuplicateKey(target, key, rawLines[rawIndex].n);
       if (isBlockScalar) {
-        target[key] = parseBlockScalar(style, chomp, ownIndent, rawIndex + 1);
+        setMappingValue(target, key, parseBlockScalar(style, chomp, ownIndent, rawIndex + 1));
       } else if (rest === "") {
         const next = peek();
-        target[key] = next && next.indent > ownIndent ? parseNode(next.indent) : null;
+        setMappingValue(target, key, next && next.indent > ownIndent ? parseNode(next.indent) : null);
       } else {
-        target[key] = parseScalar(rest);
+        setMappingValue(target, key, parseScalar(rest));
       }
     }
   }
@@ -451,13 +757,14 @@ function parseWorkflowYaml(text) {
       const line = structural[pos];
       pos++;
       const { key, rest, isBlockScalar, style, chomp } = splitKeyValue(line.content);
+      checkDuplicateKey(obj, key, line.n);
       if (isBlockScalar) {
-        obj[key] = parseBlockScalar(style, chomp, indent, line.rawIndex + 1);
+        setMappingValue(obj, key, parseBlockScalar(style, chomp, indent, line.rawIndex + 1));
       } else if (rest === "") {
         const next = peek();
-        obj[key] = next && next.indent > indent ? parseNode(next.indent) : null;
+        setMappingValue(obj, key, next && next.indent > indent ? parseNode(next.indent) : null);
       } else {
-        obj[key] = parseScalar(rest);
+        setMappingValue(obj, key, parseScalar(rest));
       }
     }
     return obj;
