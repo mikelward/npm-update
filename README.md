@@ -102,6 +102,32 @@ enforces this too, fingerprinting each declared file the same way. Leaving
 both empty (the default) disables the hook entirely — no change for an
 existing consumer that doesn't set them.
 
+## Working in a subdirectory
+
+A consumer whose npm tree isn't at the repository root — an Android app with
+a Cloud Functions backend under `functions/`, say — declares that directory
+with `working-directory`:
+
+```yaml
+jobs:
+  npm-update:
+    uses: mikelward/npm-update/.github/workflows/npm-update.yml@main
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: write
+    with:
+      working-directory: functions
+```
+
+Every install, check, manifest read, and git status scan then runs inside
+that directory, including `regenerate`/`regenerated-files` above, which
+become relative to it too rather than the repository root. A `.nvmrc` is
+expected there (`node-version-file` reads it the same way it always has,
+just now scoped to the working directory), the same as at the repository
+root for an existing consumer. Empty (the default) means the repository
+root — no change for gedmap, newshacker, or readmo, none of which sets this.
+
 ## Auto-merge needs "up to date" required, or a merge queue
 
 Once the producer job's own checks pass, the workflow arms `gh pr merge
