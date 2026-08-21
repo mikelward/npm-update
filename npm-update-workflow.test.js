@@ -23,6 +23,7 @@
 import { describe, it, expect } from "./vitest-shim.mjs";
 import {
   existsSync,
+  readdirSync,
   readFileSync,
   writeFileSync,
   mkdirSync,
@@ -133,24 +134,27 @@ describe("npm-update reusable workflow", () => {
     }
   });
 
-  it("runs both git status calls as their own bare command, not inside a pipe that ends in || true", () => {
-    // set -e catches a bare command that fails, but a blanket `|| true` on
-    // the end of a LONGER pipe (git status | sed | grep || true) swallows
-    // a git-status failure exactly as readily as it swallows grep's
-    // ordinary no-matches exit 1 — verified with a real git sandbox (a
-    // repo with .git/HEAD removed, "fatal: not a git repository", exit
-    // 128 — a merely-missing index doesn't reproduce this, since git just
-    // rebuilds one and git status still succeeds): a single-pipe form
-    // ending in `|| true` produced an empty $unexpected with a zero exit,
-    // i.e. a corrupted git state read as "nothing unexpected," passing the
-    // one check this step exists to enforce. The untracked pass writes
-    // git status's output to a temp file as a bare command (not `<
-    // <(...)`, whose own exit status set -e/pipefail can't see either) so
-    // set -e kills the script immediately if it fails, before the
-    // grep-tolerant pipe below ever runs; the ignored pass keeps the
-    // original bare `var=$(cmd)` assignment form, which the same
-    // protection applies to.
-    expect(update).toMatch(/status_z=\$\(mktemp "\$RUNNER_TEMP\/npm-update-status-XXXXXX\.nul"\)\n\s*git status --porcelain -z --untracked-files=all > "\$status_z"\n\s*unexpected=""/);
+  it("feeds the untracked git status directly into the read loop via a pipe, under lastpipe+pipefail", () => {
+    // A pipe, not a scratch file: no name on disk for anything watching
+    // $RUNNER_TEMP (a lifecycle script, or a detached process one left
+    // running) to discover and swap the content of between this git status
+    // and the read loop opening it -- an earlier mktemp version here closed
+    // the PREDICTABLE-name version of that attack, but not this one, since a
+    // temp file is still reopened by name for reading a moment after it's
+    // written (Codex, on review of the mktemp fix in mikelward/rust-update,
+    // then cross-pollinated here). `shopt -s lastpipe` keeps the loop in the
+    // step's own shell (not a subshell) so $unexpected set inside it
+    // survives past the pipe, and `pipefail` still catches a genuine
+    // git-status failure (a corrupted .git) the same way the old bare
+    // `var=$(cmd)` assignment did -- both verified directly in the
+    // execution tests below. The ignored pass keeps the original bare
+    // `var=$(cmd)` assignment form, which the same set -e protection
+    // applies to without needing a pipe at all.
+    expect(update).toContain("shopt -s lastpipe");
+    expect(update).toMatch(
+      /git status --porcelain -z --untracked-files=all \| while IFS= read -r -d '' entry; do/,
+    );
+    expect(update).not.toMatch(/status_z=\$\(mktemp/);
     expect(update).toMatch(/status_ignored=\$\(git status --porcelain --ignored\)\n\s*planted=\$\(printf '%s\\n' "\$status_ignored"/);
   });
 
@@ -875,17 +879,18 @@ describe("the regenerate hook", () => {
   });
 
   it("never writes dependency-job output through a fixed, predictable path a plant could symlink", () => {
-    // Regression guard for the status_z and regen-handoff.tar symlink
-    // fixes: any future scratch file the update job's steps write through
-    // a `>` redirect or `tar -cf` must go through mktemp (a bare variable
-    // reference is exempt -- it's the mktemp result), since dependency code
-    // (npm update, the checks, a regenerate command) runs earlier in the
-    // same job and can pre-plant a symlink at any name it can read out of
-    // this file. Scoped to the update job's own step scripts only --
-    // publish is a fresh runner that installs nothing, so nothing untrusted
-    // ever runs there to plant a symlink in the first place. Comments
-    // stripped first, so an explanatory `tar -cf regen-handoff.tar` in a
-    // comment (like this fix's own) can't satisfy or fail the check.
+    // Regression guard for the regen-handoff.tar symlink fix (status_z no
+    // longer exists at all -- see the lastpipe test above): any future
+    // scratch file the update job's steps write through a `>` redirect or
+    // `tar -cf` must go through mktemp (a bare variable reference is
+    // exempt -- it's the mktemp result), since dependency code (npm
+    // update, the checks, a regenerate command) runs earlier in the same
+    // job and can pre-plant a symlink at any name it can read out of this
+    // file. Scoped to the update job's own step scripts only -- publish is
+    // a fresh runner that installs nothing, so nothing untrusted ever runs
+    // there to plant a symlink in the first place. Comments stripped
+    // first, so an explanatory `tar -cf regen-handoff.tar` in a comment
+    // (like this fix's own) can't satisfy or fail the check.
     const stripComments = (text) =>
       text
         .split("\n")
@@ -897,7 +902,7 @@ describe("the regenerate hook", () => {
       const run = stripComments(step.run);
       const redirects = [...run.matchAll(/>\s*"?(\$RUNNER_TEMP\/[\w.$/-]+|[\w.-]+\.(?:tar|nul))"?/g)]
         .map((m) => m[1])
-        .filter((path) => path !== "$status_z" && path !== "$regen_tmp");
+        .filter((path) => path !== "$regen_tmp");
       expect(redirects, `${step.name}: unexpected fixed-path redirect(s)`).toEqual([]);
       const tarCreates = [...run.matchAll(/tar -cf "?([\w.$-]+)"?/g)]
         .map((m) => m[1])
@@ -906,30 +911,25 @@ describe("the regenerate hook", () => {
     }
   });
 
-  it("does not follow a symlink planted at the old fixed status-file name", () => {
-    // Reproduces the exploit directly: dependency code that ran earlier in
-    // this same job (npm update, a check, a regenerate command) can plant a
-    // symlink at any name it can read out of the workflow source. Before the
-    // mktemp fix, `git status ... > "$RUNNER_TEMP/npm-update-status.nul"`
-    // followed such a symlink and truncated whatever it pointed at --
-    // verified directly against the old code before writing this test.
-    //
-    // regen-handoff.tar (the OTHER fixed name this PR moved behind mktemp)
-    // isn't exercised here: it lives inside the checkout tree, where this
-    // same step's own untracked-file scan already rejects a pre-planted
-    // symlink there before the tar-create line ever runs, regardless of
-    // this fix -- confirmed directly (a plant at that path makes the step
-    // exit 1 for "touched files outside the dependency manifests", not
-    // silently succeed). The mktemp/mv there is defense in depth for that
-    // check ever gaining a gap, not a closure of an independently reachable
-    // hole the way the status file is.
-    //
-    // checks.md stays untouched and the fixed status-file name itself never
-    // gets planted, since the real path is now random.
+  it("creates no named scratch file at all for the untracked-status classification, on a real run", () => {
+    // The status_z mktemp fix closed the PREDICTABLE-name symlink attack
+    // (a fixed name a dependency script could plant a symlink at in
+    // advance), but Codex's review of the identical fix in
+    // mikelward/rust-update found that even a random mktemp name doesn't
+    // close a WATCHER attack: a process left running by an earlier
+    // untrusted step could discover the chosen name (list $RUNNER_TEMP)
+    // and swap its content between the write and the read that follows a
+    // moment later. Piping git status directly into the read loop (see
+    // the structural test above) removes the file from the picture
+    // entirely -- there's no name to discover in the first place. This
+    // proves that end to end on a real run: nothing matching a status
+    // scratch pattern ever appears under RUNNER_TEMP, and checks.md (the
+    // file the old fixed-name version of this attack targeted) is
+    // untouched.
     const verifyStep = doc.jobs.update.steps.find(
       (s) => s.name === "Verify only dependency files changed",
     );
-    const scratch = mkdtempSync(join(tmpdir(), "npm-update-symlink-"));
+    const scratch = mkdtempSync(join(tmpdir(), "npm-update-lastpipe-"));
     const tmp = join(scratch, "repo");
     try {
       execFileSync("mkdir", ["-p", tmp]);
@@ -957,8 +957,6 @@ describe("the regenerate hook", () => {
         .toString()
         .trim();
 
-      symlinkSync(join(tmp, "checks.md"), join(scratch, "npm-update-status.nul"));
-
       const outPath = join(scratch, "out.txt");
       const summaryPath = join(scratch, "summary.txt");
       writeFileSync(outPath, "");
@@ -979,11 +977,86 @@ describe("the regenerate hook", () => {
       });
 
       expect(readFileSync(join(tmp, "checks.md"), "utf8")).toBe(checksVictim);
+      const scratchEntries = readdirSync(scratch).filter((f) => f !== "repo");
+      expect(scratchEntries.some((f) => /npm-update-status/.test(f))).toBe(false);
       // Also confirm the step's own regen-handoff.tar output landed as a
       // real file, not a dangling link -- the normal, no-attack path this
       // step is also expected to produce.
       expect(lstatSync(join(tmp, "regen-handoff.tar")).isSymbolicLink()).toBe(false);
       expect(existsSync(join(tmp, "regen-handoff.tar"))).toBe(true);
+    } finally {
+      rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+
+  it("does not fail the batch when the last status record is a regenerated (allowlisted) file", () => {
+    // Fresh evidence after the lastpipe fix: this loop is now the last
+    // stage of a pipe, so its own exit status becomes the PIPELINE's exit
+    // status under pipefail. `[ "$keep" -eq 1 ] && unexpected=...` returns
+    // nonzero -- and so aborts the whole run -- whenever the alphabetically
+    // LAST git-status record happens to be a regenerated (declared,
+    // allowlisted) file, since the `&&`'s left side is false and nothing
+    // after it runs. checks.md/deps-stat.txt/package.json/package-lock.json
+    // can't trigger this (they hit the earlier bare-name `case` and
+    // `continue` before ever reaching this line), so a name that sorts
+    // after all four -- readmo's import_map.json, say -- is what surfaces
+    // it. Names this file z*.json specifically so it sorts last among the
+    // untracked entries regardless of locale. (Codex, on review of the
+    // identical construct in mikelward/rust-update.)
+    const verifyStep = doc.jobs.update.steps.find(
+      (s) => s.name === "Verify only dependency files changed",
+    );
+    const scratch = mkdtempSync(join(tmpdir(), "npm-update-regen-last-"));
+    const tmp = join(scratch, "repo");
+    try {
+      execFileSync("mkdir", ["-p", tmp]);
+      execFileSync("git", ["init", "-q"], { cwd: tmp });
+      execFileSync("git", ["config", "user.email", "t@example.com"], { cwd: tmp });
+      execFileSync("git", ["config", "user.name", "t"], { cwd: tmp });
+      writeFileSync(join(tmp, "package.json"), "{}\n");
+      writeFileSync(join(tmp, "package-lock.json"), "{}\n");
+      execFileSync("git", ["add", "-A"], { cwd: tmp });
+      execFileSync("git", ["commit", "-q", "-m", "seed"], { cwd: tmp });
+
+      writeFileSync(join(tmp, "checks.md"), "- ✅ `npm ci`\n");
+      writeFileSync(join(tmp, "deps-stat.txt"), "1 file changed\n");
+      writeFileSync(join(tmp, "zzz-regenerated.json"), '{"regenerated":true}\n');
+      const pkgSha = execFileSync("sh", ["-c", "sha256sum package.json | cut -d' ' -f1"], {
+        cwd: tmp,
+      })
+        .toString()
+        .trim();
+      const lockSha = execFileSync(
+        "sh",
+        ["-c", "sha256sum package-lock.json | cut -d' ' -f1"],
+        { cwd: tmp },
+      )
+        .toString()
+        .trim();
+      const regenSha = execFileSync("sha256sum", ["--", "zzz-regenerated.json"], {
+        cwd: tmp,
+      }).toString();
+
+      const outPath = join(scratch, "out.txt");
+      const summaryPath = join(scratch, "summary.txt");
+      writeFileSync(outPath, "");
+      writeFileSync(summaryPath, "");
+      execFileSync("bash", ["-c", verifyStep.run], {
+        cwd: tmp,
+        env: {
+          ...process.env,
+          PKG_SHA: pkgSha,
+          LOCK_SHA: lockSha,
+          REGENERATED_FILES: "zzz-regenerated.json",
+          REGEN_SHA: regenSha,
+          REGEN_MODE: "",
+          GITHUB_OUTPUT: outPath,
+          GITHUB_STEP_SUMMARY: summaryPath,
+          RUNNER_TEMP: scratch,
+        },
+      });
+      // No throw -- a batch whose last status record is an allowlisted
+      // regenerated file is accepted, not aborted.
     } finally {
       rmSync(scratch, { recursive: true, force: true });
     }
