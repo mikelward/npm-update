@@ -576,6 +576,7 @@ jobs:
           # the raw input — see that step's comment for why.
           WORKING_DIRECTORY: ${{ steps.layout.outputs.dir }}
         run: |
+          shopt -s lastpipe
           set -euo pipefail
 
           # Regenerated files are the batch's own product when the
@@ -597,24 +598,33 @@ jobs:
           # are excluded by porcelain already; the two allowed extras are files
           # this job writes itself.
           #
-          # git status writes to a TEMP FILE as its own bare command, not
-          # captured inside a $()/pipe — `set -e` catches a bare command
-          # that fails, but a blanket `|| true` on the end of a longer pipe
-          # would swallow a git-status failure (a corrupted .git — a
+          # A pipe, not a scratch file: no name on disk for anything watching
+          # $RUNNER_TEMP (a lifecycle script, or a detached process one left
+          # running) to discover and swap the content of between this git
+          # status and the read loop opening it — an earlier mktemp version
+          # here closed the PREDICTABLE-name version of that attack, but not
+          # this one, since a temp file is still reopened by name for reading
+          # a moment after it's written (Codex, on review of the mktemp fix
+          # in mikelward/rust-update, then cross-pollinated here). `shopt -s
+          # lastpipe` above keeps the loop below in THIS shell rather than a
+          # subshell, so $unexpected set inside it survives past the pipe —
+          # verified directly (`shopt -s lastpipe; printf 'a\nb\n' | while
+          # read -r l; do out="$out$l,"; done; echo "$out"` prints "a,b,",
+          # not empty).
+          #
+          # pipefail still catches a genuine git-status failure the same way
+          # the temp-file form's bare command did — a corrupted .git (a
           # malicious lifecycle script run earlier in this same job could
           # induce one, e.g. by removing .git/HEAD or .git/objects; a
           # merely-missing index doesn't reach this path, since git just
-          # rebuilds one and git status still succeeds) exactly as readily
-          # as it swallows grep's ordinary no-matches exit 1 — verified
-          # against a repo with .git/HEAD removed ("fatal: not a git
-          # repository", exit 128): a single-pipe form ending in `|| true`
-          # produced an EMPTY $unexpected with a zero exit, i.e. a
-          # corrupted git state read as "nothing unexpected," passing the
-          # one check this step exists to enforce. A `< <(git status ...)`
-          # process substitution would reopen the same hole in a subtler
-          # form — its own exit status isn't checked by set -e or
-          # pipefail — which is why this reads from a file `git status`
-          # itself was made to write, rather than a live substitution.
+          # rebuilds one and git status still succeeds) must not read as
+          # "nothing unexpected" — verified directly (`shopt -s lastpipe;
+          # set -eo pipefail; false | while read l; do :; done; echo
+          # unreached` never reaches "unreached"). A `< <(git status ...)`
+          # process substitution would NOT give this guarantee — its own
+          # exit status isn't checked by set -e or pipefail — which is why
+          # this is a pipe into the loop rather than a substitution feeding
+          # a `<`.
           #
           # -z, not the default quoted/newline format: a regenerated-files
           # path is consumer data and can legitimately contain a space or
@@ -629,19 +639,8 @@ jobs:
           # genuine record boundary — a tr-based split would let such a
           # filename masquerade as two separately-classified lines, one of
           # which could satisfy the allowlist and hide the other.
-          #
-          # mktemp, not a fixed name: dependency code ran in this same job
-          # (npm update, the checks, any regenerate command) and could plant
-          # a symlink at a predictable path in advance, so a later `>` here
-          # would follow it and overwrite whatever it points at — verified
-          # directly by pre-symlinking the old fixed name to checks.md and
-          # watching the redirect truncate it. mktemp's own O_CREAT|O_EXCL
-          # guarantees a fresh regular file at a name nothing could have
-          # pre-placed a link at.
-          status_z=$(mktemp "$RUNNER_TEMP/npm-update-status-XXXXXX.nul")
-          git status --porcelain -z --untracked-files=all > "$status_z"
           unexpected=""
-          while IFS= read -r -d '' entry; do
+          git status --porcelain -z --untracked-files=all | while IFS= read -r -d '' entry; do
             path=${entry:3}
             # git status --porcelain paths are always repo-root relative
             # regardless of cwd (verified directly against a checkout with
@@ -684,9 +683,22 @@ jobs:
                 break
               fi
             done
-            [ "$keep" -eq 1 ] && unexpected="$unexpected$path"$'\n'
-          done < "$status_z"
-          rm -f -- "$status_z"
+            # `if`/`fi`, not `[ ... ] &&`: this loop is now the last stage
+            # of a pipe rather than reading `< "$status_z"` from a file, so
+            # its own exit status is the pipeline's exit status under
+            # pipefail. `[ "$keep" -eq 1 ] && unexpected=...` returns
+            # nonzero on every ordinary run where the LAST processed status
+            # record is an allowlisted one (checks.md, say) — the common
+            # case, not an edge case — aborting the whole batch even though
+            # nothing is wrong. Verified directly: the `&&` form with
+            # keep=0 on the final iteration exits 1 under `set -eo
+            # pipefail`; `if`/`fi` always exits 0 when the condition is
+            # false (Codex, on review of the same construct in
+            # mikelward/rust-update).
+            if [ "$keep" -eq 1 ]; then
+              unexpected="$unexpected$path"$'\n'
+            fi
+          done
           unexpected=${unexpected%$'\n'}
           if [ -n "$unexpected" ]; then
             echo '::error::Dependency code touched files outside the dependency manifests. Not opening a PR — inspect these before trusting this batch:'
