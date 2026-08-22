@@ -82,17 +82,29 @@ has stopped biting.
   consumer's workflow runs is the source here, which is what makes an unpinned
   `@main` reference reviewable by reading it. `vitest-shim.mjs` exists so the
   suite ported from the consumers runs under `node --test` without installing
-  anything; extending the shim beats adding a test framework. `yaml-lite.js`
-  (ported from `mikelward/ci-commit-artifact`, dependency-free itself) is the
-  same kind of addition — a minimal YAML-subset parser for the specific class
-  of check a regex over raw text can't do reliably, like "no `${{ }}`
-  expression is spliced into any `run:` script anywhere in the workflow." Use
-  it there and leave the rest of the suite's regex-based assertions alone;
-  they're not fragile the way that one was.
+  anything; extending the shim beats adding a test framework. `yaml-lite`
+  (the minimal YAML-subset parser some structural tests use, for the class
+  of check a regex over raw text can't do reliably — like "no `${{ }}`
+  expression is spliced into any `run:` script anywhere in the workflow")
+  is dependency-free too but is NOT vendored: the canonical copy is
+  `mikelward/yaml-lite`, tracked `@main` like the fleet's other shared
+  machinery (lanes, codex-review). CI checks it out into `.yaml-lite/`
+  (see ci.yml); locally, clone it as a sibling
+  (`git clone https://github.com/mikelward/yaml-lite ../yaml-lite`) — the
+  suite fails with that instruction, never skips, when the parser is
+  missing. Fix parser bugs there, not here. Use it only where the regex
+  approach has already shown it can't tell the difference reliably, and
+  leave the rest of the suite's regex-based assertions alone; they're not
+  fragile the way that one was.
 
 ## Testing
 
 - `node --test *.test.js`. No install step — there is nothing to install.
+  The one setup step is a one-time
+  `git clone https://github.com/mikelward/yaml-lite ../yaml-lite` (a git
+  clone, not a package manager): the structural tests resolve the parser
+  from CI's `.yaml-lite/` checkout or that sibling clone, and fail with
+  that exact command — never skip — when both are missing.
 - **Add or update tests with any change.** This suite is the only thing
   between a push and every consumer's weekly run, so a change that ships
   untested ships unreviewed.
