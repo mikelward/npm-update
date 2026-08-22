@@ -1201,7 +1201,7 @@ jobs:
           branch="deps/update-$today"
 
           if [ "$PASSED" != 'true' ]; then
-            title="deps: Update dependencies ($today) — CHECKS FAILING"
+            title="Update dependencies ($today) — CHECKS FAILING"
             verdict='**One or more checks failed.** Do not merge until they are fixed — the failures are real, not flakes to route around.'
           elif [ -n "$REGEN_SHA" ]; then
             # See AGENTS.md "Trust model": unlike the manifests, a
@@ -1211,10 +1211,10 @@ jobs:
             # residual gap checks.md/deps-stat.txt already carry. Auto-
             # merge is withheld so a human looks at the regenerated diff
             # before it lands, even though the ordinary checks passed.
-            title="deps: Update dependencies ($today) — REGENERATED FILES, REVIEW BEFORE MERGE"
+            title="Update dependencies ($today) — REGENERATED FILES, REVIEW BEFORE MERGE"
             verdict='All checks passed, but this batch also regenerated a derived file (see AGENTS.md "Trust model") — that content is not independently re-derived the way the manifests are, so auto-merge is deliberately not armed. Review the regenerated diff below before merging by hand.'
           else
-            title="deps: Update dependencies ($today)"
+            title="Update dependencies ($today)"
             verdict='All checks passed in the job that produced this branch.'
           fi
 

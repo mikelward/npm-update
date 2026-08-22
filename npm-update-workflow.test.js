@@ -94,14 +94,16 @@ describe("npm-update reusable workflow", () => {
     expect(workflow).toMatch(/^permissions: \{\}/m);
   });
 
-  it("prefixes its commit subject and PR title with deps:", () => {
-    // A subject that does not change what a consumer runs carries a prefix
-    // (AGENTS.md "Commit messages"), and this is the one commit nobody
-    // hand-writes a subject for.
-    expect(workflow).toContain('title="deps: Update dependencies ($today)"');
+  it("leaves the commit subject and PR title bare, with no prefix", () => {
+    // The batch commit changes a consumer's shipped dependencies, so it's
+    // release-worthy rather than internal plumbing (AGENTS.md "Commit
+    // messages" — a bare subject means a consumer could notice the
+    // difference). Also guards against a stray "deps: " creeping back in.
+    expect(workflow).toContain('title="Update dependencies ($today)"');
     expect(workflow).toContain(
-      'title="deps: Update dependencies ($today) — CHECKS FAILING"',
+      'title="Update dependencies ($today) — CHECKS FAILING"',
     );
+    expect(workflow).not.toMatch(/title="deps: /);
   });
 
   it("takes the Node major from .nvmrc rather than naming one", () => {
@@ -1200,7 +1202,7 @@ describe("the regenerate hook", () => {
     // batch is broken first, and "REGENERATED FILES" only applies once
     // PASSED is already true.
     expect(openPr.run).toMatch(
-      /if \[ "\$PASSED" != 'true' \]; then\n\s*title="deps: Update dependencies \(\$today\) — CHECKS FAILING"[^]*?elif \[ -n "\$REGEN_SHA" \]; then\n\s*[^]*?title="deps: Update dependencies \(\$today\) — REGENERATED FILES, REVIEW BEFORE MERGE"/,
+      /if \[ "\$PASSED" != 'true' \]; then\n\s*title="Update dependencies \(\$today\) — CHECKS FAILING"[^]*?elif \[ -n "\$REGEN_SHA" \]; then\n\s*[^]*?title="Update dependencies \(\$today\) — REGENERATED FILES, REVIEW BEFORE MERGE"/,
     );
   });
 
