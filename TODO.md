@@ -16,6 +16,13 @@ Deferred work, recorded here so it isn't lost.
       check the ruleset should require — `mikelward/scripts`' tool), then
       delete the now-redundant `gate` job and its parity test
       (`workflow-check-rename.test.js`) in a follow-up PR.
+- [ ] **Add `zizmor` to the ruleset's required set** once it has reported
+      on a pull request after this change: zizmor.yml now runs unfiltered
+      on every PR precisely so it can be required (a paths-filtered
+      workflow creates no check run at all on a non-matching PR, which a
+      ruleset waits on forever) — the posture piloted in mikelward/lanes
+      and mikelward/ci-commit-artifact. Fold into the same repo-rules
+      invocation as the lanes flip.
 
 ## The extracted workflow
 
