@@ -9,16 +9,16 @@
 // tested the workflow before extraction. Most assertions here are regexes
 // over the raw text rather than a real YAML parser, matching
 // check-npm-update.mjs's own style — cheap, direct, and this repository
-// still ships no dependencies to run one with. yaml-lite.js (ported from
-// mikelward/ci-commit-artifact) is the one exception: it exists
-// specifically for checks a regex can't do reliably, like "no `${{ }}`
-// expression is spliced into any run: script anywhere in the workflow" —
-// telling a run: line from an env: declaration or a with: input by regex
-// alone took several rounds of narrow exclusions and was still one
-// legitimate YAML shape away from a false positive. Reach for it the same
-// way: only where the regex approach has already shown it can't tell the
-// difference reliably, not as a wholesale replacement for the tests below
-// that already work.
+// still ships no dependencies to run one with. yaml-lite (the canonical
+// parser at mikelward/yaml-lite, resolved below — no longer a vendored
+// copy) is the one exception: it exists specifically for checks a regex
+// can't do reliably, like "no `${{ }}` expression is spliced into any
+// run: script anywhere in the workflow" — telling a run: line from an
+// env: declaration or a with: input by regex alone took several rounds of
+// narrow exclusions and was still one legitimate YAML shape away from a
+// false positive. Reach for it the same way: only where the regex
+// approach has already shown it can't tell the difference reliably, not
+// as a wholesale replacement for the tests below that already work.
 
 import { describe, it, expect } from "./vitest-shim.mjs";
 import {
@@ -35,7 +35,24 @@ import {
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { parseWorkflowYaml } from "./yaml-lite.js";
+// yaml-lite tracks @main like the rest of the fleet's shared machinery
+// (lanes, codex-review, the reusable workflows) instead of living here as
+// a vendored copy that needs syncing. CI checks the canonical repo out
+// into .yaml-lite/ (see ci.yml); locally a sibling clone serves the same
+// role. Required, not skippable: a skip here would let CI go green with
+// the structural YAML checks silently not running — the exact false-pass
+// shape this suite exists to prevent — so a missing parser fails loudly
+// with the fix in the message instead.
+const yamlLiteUrl = ["./.yaml-lite/yaml-lite.js", "../yaml-lite/yaml-lite.js"]
+  .map((p) => new URL(p, import.meta.url))
+  .find((u) => existsSync(u));
+if (!yamlLiteUrl) {
+  throw new Error(
+    "yaml-lite.js not found — it is no longer vendored; the canonical copy is mikelward/yaml-lite. " +
+      "CI checks it out into .yaml-lite/ (see ci.yml). Locally: git clone https://github.com/mikelward/yaml-lite ../yaml-lite",
+  );
+}
+const { parseWorkflowYaml } = await import(yamlLiteUrl.href);
 
 const workflow = readFileSync(".github/workflows/npm-update.yml", "utf8");
 
