@@ -288,32 +288,92 @@ describe("npm-update reusable workflow", () => {
     expect(update).toContain("npm update --save --ignore-scripts");
     const resolveIdx = workflow.indexOf("npm update --save --ignore-scripts");
     const fingerprintIdx = workflow.indexOf("lock_sha=$(sha256sum");
-    const installIdx = workflow.indexOf("check 'npm ci'");
+    // The install is its own step now (it runs before the regenerate
+    // hook, which runs before the rest of the checks), so this looks for
+    // the install itself rather than the check() call it used to be.
+    const installIdx = workflow.indexOf("npm ci\n");
     expect(resolveIdx).toBeGreaterThan(-1);
     expect(fingerprintIdx).toBeGreaterThan(resolveIdx);
     expect(installIdx).toBeGreaterThan(fingerprintIdx);
   });
 
   it("reports a failed install in the PR instead of killing the job", () => {
-    expect(update).toContain("check 'npm ci'");
+    // Its own step now, but still a REPORTED check: `set +e`, the exit
+    // status captured into a report line, and no `exit` on failure — so a
+    // postinstall that fails still opens a PR that says which package
+    // broke, rather than dying before the artifact exists.
+    const install = doc.jobs.update.steps.find((s) => s.id === "install");
+    expect(install.run).toContain("set +e");
+    expect(install.run).toMatch(/npm ci\n\s*rc=\$\?/);
+    expect(install.run).toContain("- ❌ \\`npm ci\\` (exit $rc)");
+    expect(install.run).not.toMatch(/exit 1/);
     expect(update).not.toContain("Install the resolved tree");
   });
 
+  it("runs the install, then the regenerate hook, then the rest of the checks", () => {
+    // The ordering bug this split exists to fix: readmo's suite asserts its
+    // Deno import map pins what the lockfile installs, and with the hook
+    // running AFTER the suite, every batch that moved a pinned package
+    // reported `npm test ❌` against a map the same commit then corrected —
+    // a CHECKS FAILING title and withheld auto-merge on a branch whose own
+    // CI passed.
+    const names = doc.jobs.update.steps.map((s) => s.name);
+    const installIdx = names.findIndex((n) => (n ?? "").startsWith("Install with lifecycle scripts"));
+    const regenIdx = names.indexOf("Regenerate derived files");
+    const checksIdx = names.indexOf("Run the rest of the check suite");
+    expect(installIdx).toBeGreaterThan(-1);
+    expect(regenIdx).toBeGreaterThan(installIdx);
+    expect(checksIdx).toBeGreaterThan(regenIdx);
+    // And the checks that read a derived file are the ones AFTER the hook.
+    const checks = doc.jobs.update.steps[checksIdx].run;
+    expect(checks).toContain("check 'npm test'");
+    expect(checks).not.toContain("check 'npm ci'");
+  });
+
+  it("still reports all four checks, once each, in the order they ran", () => {
+    // publish derives the verdict from checks.md and refuses a file that
+    // does not report each expected check exactly once, so a split that
+    // dropped or duplicated the install line would fail every batch closed.
+    const install = doc.jobs.update.steps.find((s) => s.id === "install");
+    const checks = doc.jobs.update.steps.find((s) => s.id === "checks");
+    expect(install.run).toContain("report<<INSTALL_REPORT_EOF");
+    expect(checks.env.INSTALL_REPORT).toBe("${{ steps.install.outputs.report }}");
+    expect(checks.run).toMatch(/report="\$INSTALL_REPORT"\$'\\n'/);
+    const order = ["npm run lint", "npm test", "npm run build"];
+    let at = -1;
+    for (const c of order) {
+      const idx = checks.run.indexOf(`check '${c}'`);
+      expect(idx).toBeGreaterThan(at);
+      at = idx;
+    }
+  });
+
   it("clears the runner env after every step that runs dependency code", () => {
-    // Scoped to `update`, not the whole workflow: `publish` never runs npm
-    // ci/install at all (asserted below), but its verdict step legitimately
-    // mentions the string "npm ci" as quoted comparison data, which isn't
-    // an install this rule needs to count. The regenerate step is a THIRD
-    // window that runs dependency-adjacent code (whatever `regenerate`
-    // names) without itself containing the literal text "npm ci" — it
-    // reuses the checks step's install rather than running its own — so it
-    // adds one more clear pair than the "npm ci" count alone would predict.
-    const installs = update.split("npm ci").length - 1;
-    expect(installs).toBeGreaterThanOrEqual(2);
-    expect(update).toContain("Regenerate derived files");
-    const expectedClears = installs + 1;
-    expect(update.split(': > "$GITHUB_PATH"').length - 1).toBe(expectedClears);
-    expect(update.split(': > "$GITHUB_ENV"').length - 1).toBe(expectedClears);
+    // $GITHUB_PATH/$GITHUB_ENV are applied to LATER steps, so a lifecycle or
+    // build script can otherwise put a fake `git`, `node` or `npm` ahead of
+    // the real one for everything below it — including the tree check whose
+    // whole job is catching source edits. Every window that runs dependency
+    // or dependency-adjacent code clears the pair on its way out.
+    //
+    // Enumerated by step rather than counted off the string "npm ci": the
+    // comments in this file discuss npm ci often enough that a substring
+    // count says more about the prose than about the script.
+    const windows = [
+      "Install from the lockfile",
+      "Install with lifecycle scripts, as the first reported check",
+      "Regenerate derived files",
+      "Run the rest of the check suite",
+    ];
+    for (const name of windows) {
+      const step = doc.jobs.update.steps.find((s) => s.name === name);
+      expect(step === undefined, `no step named ${name}`).toBe(false);
+      expect(step.run, `${name} must clear $GITHUB_PATH`).toContain(': > "$GITHUB_PATH"');
+      expect(step.run, `${name} must clear $GITHUB_ENV`).toContain(': > "$GITHUB_ENV"');
+    }
+    // And no OTHER step does it, so this list stays the whole story: a new
+    // window that runs dependency code has to be added here deliberately.
+    expect(update.split(': > "$GITHUB_PATH"').length - 1).toBe(windows.length);
+    expect(update.split(': > "$GITHUB_ENV"').length - 1).toBe(windows.length);
   });
 
   it("publishes the exact commit it tested, not the branch tip", () => {
@@ -375,7 +435,7 @@ describe("npm-update reusable workflow", () => {
     expect(update).toContain("deps_stat<<DEPS_STAT_EOF");
     expect(update).toContain("DEPS_STAT: ${{ steps.changed.outputs.deps_stat }}");
     const captureIdx = update.indexOf("deps_stat<<DEPS_STAT_EOF");
-    expect(captureIdx).toBeLessThan(update.indexOf("Run the full check suite"));
+    expect(captureIdx).toBeLessThan(update.indexOf("Run the rest of the check suite"));
   });
 
   it("keeps the write token out of the job that runs dependency code", () => {
@@ -740,13 +800,29 @@ describe("the regenerate hook", () => {
     expect([...inputsBlock.matchAll(/default: ''/g)].length).toBeGreaterThanOrEqual(2);
   });
 
-  it("runs after the checks and stops the batch on failure, unlike a failed check", () => {
+  it("documents the install → regenerate → checks order on the public input, not just in a comment", () => {
+    // The input description is the contract a consumer configures against
+    // (Codex, on the PR that reordered these steps): left saying "after the
+    // check suite", it would tell a consumer whose command needs build
+    // output that this hook is the place for it, which it no longer is.
+    const desc = doc.on.workflow_call.inputs.regenerate.description;
+    expect(desc).toContain("BEFORE lint, test and build");
+    expect(desc).not.toContain("after the check suite");
+  });
+
+  it("runs after the install and before the rest of the checks, and stops the batch on failure", () => {
+    // Between them, not after them: it reuses the install rather than
+    // installing again, and the checks that read a derived file have to see
+    // the rebuilt one (see the install step's own comment for the readmo
+    // batch that proved it).
     const regenIdx = update.indexOf("Regenerate derived files");
-    const checksIdx = update.indexOf("Run the full check suite");
+    const installIdx = update.indexOf("Install with lifecycle scripts");
+    const checksIdx = update.indexOf("Run the rest of the check suite");
     const verifyIdx = update.indexOf("Verify only dependency files changed");
-    expect(checksIdx).toBeGreaterThan(-1);
-    expect(regenIdx).toBeGreaterThan(checksIdx);
-    expect(verifyIdx).toBeGreaterThan(regenIdx);
+    expect(installIdx).toBeGreaterThan(-1);
+    expect(regenIdx).toBeGreaterThan(installIdx);
+    expect(checksIdx).toBeGreaterThan(regenIdx);
+    expect(verifyIdx).toBeGreaterThan(checksIdx);
     // Checks are wrapped in `check()`, which captures a nonzero exit into
     // checks.md and keeps going (see `check() { ... eval "$1"; rc=$? ...}`
     // tested above). The regenerate loop below has no such wrapper --
@@ -1108,11 +1184,10 @@ describe("the regenerate hook", () => {
       execFileSync("git", ["init", "-q"], { cwd: tmp });
       execFileSync("git", ["config", "user.email", "t@example.com"], { cwd: tmp });
       execFileSync("git", ["config", "user.name", "t"], { cwd: tmp });
-      writeFileSync(join(tmp, "checks.md"), "- ✅ `npm ci`\n");
-      writeFileSync(join(tmp, "deps-stat.txt"), " 1 file changed\n");
-      // Empty in the ordinary week -- nothing held back -- but present, the
-      // way the hold-back step always leaves it. The step fingerprints all
-      // three report files, so a missing one fails before any case runs.
+      // holdback.md alone: under the current order this step runs before
+      // the one that writes checks.md and deps-stat.txt, so those two do not
+      // exist yet on a real run. Empty in the ordinary week -- nothing held
+      // back -- but present, the way the hold-back step always leaves it.
       writeFileSync(join(tmp, "holdback.md"), "");
 
       const run = (regenerate, regeneratedFiles) => {
@@ -1187,23 +1262,17 @@ describe("the regenerate hook", () => {
       expect(r.output).toContain("100644 a.json");
       expect(readFileSync(join(tmp, "a.json"), "utf8")).toBe("after\n");
 
-      // A regenerate command that modifies checks.md is caught, not
-      // silently trusted -- these files belong to the workflow.
-      r = run("echo tampered >> checks.md", "a.json");
-      expect(r.ok).toBe(false);
-      expect(r.stdout).toContain(
-        "a regenerate command modified checks.md, deps-stat.txt or holdback.md",
-      );
-
-      // holdback.md is guarded the same way, and it is the one whose
-      // tampering would be invisible: it names the packages this batch
-      // deliberately left behind, so an emptied copy turns a PR body that
-      // admits a hold-back into one that claims everything moved.
+      // holdback.md is guarded, and it is the one whose tampering would
+      // otherwise be invisible: it names what this batch deliberately left
+      // behind, so an emptied copy turns a PR body that admits a hold-back
+      // into one claiming everything moved. checks.md and deps-stat.txt need
+      // no guard here any more -- this step runs BEFORE the check step that
+      // writes them, from values a regenerate command cannot reach, so
+      // anything planted at those paths is overwritten rather than
+      // published.
       r = run("echo '- `x`: tampered' >> holdback.md", "a.json");
       expect(r.ok).toBe(false);
-      expect(r.stdout).toContain(
-        "a regenerate command modified checks.md, deps-stat.txt or holdback.md",
-      );
+      expect(r.stdout).toContain("a regenerate command modified holdback.md");
     } finally {
       rmSync(scratch, { recursive: true, force: true });
     }
@@ -1885,6 +1954,106 @@ describe("the working-directory input", () => {
       expect(readFileSync(outPath, "utf8")).toContain("files_sha<<REGEN_SHA_EOF");
     } finally {
       rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("the check suite across the install/regenerate split", () => {
+  // Behavioral, because the split's failure mode is a checks.md that
+  // publish refuses (a check missing or duplicated closes every batch) or
+  // one that quietly loses the install's verdict — neither of which a
+  // structural assertion about step order would notice.
+  const installStep = doc.jobs.update.steps.find((s) => s.id === "install");
+  const checksStep = doc.jobs.update.steps.find((s) => s.id === "checks");
+
+  const run = ({ failing = [] } = {}) => {
+    const scratch = mkdtempSync(join(tmpdir(), "npm-update-checks-"));
+    const repo = join(scratch, "repo");
+    mkdirSync(repo);
+    const bin = join(scratch, "bin");
+    mkdirSync(bin);
+    // `npm ci` / `npm run lint` / `npm test` / `npm run build`, failing only
+    // for the argument shapes the scenario names.
+    writeFileSync(
+      join(bin, "npm"),
+      [
+        "#!/usr/bin/env bash",
+        'args="$*"',
+        `for f in ${failing.map((f) => `"${f}"`).join(" ") || '"__none__"'}; do`,
+        '  if [ "npm $args" = "$f" ]; then exit 3; fi',
+        "done",
+        "exit 0",
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+    const outPath = join(scratch, "out.txt");
+    const summaryPath = join(scratch, "summary.txt");
+    const pathPath = join(scratch, "path.txt");
+    const envPath = join(scratch, "env.txt");
+    for (const p of [outPath, summaryPath, pathPath, envPath]) writeFileSync(p, "");
+    const env = {
+      ...process.env,
+      PATH: `${bin}:${process.env.PATH}`,
+      GITHUB_OUTPUT: outPath,
+      GITHUB_STEP_SUMMARY: summaryPath,
+      GITHUB_PATH: pathPath,
+      GITHUB_ENV: envPath,
+    };
+    execFileSync("bash", ["-c", installStep.run], { cwd: repo, env, encoding: "utf8" });
+    // What the runner does between the two steps: capture the heredoc
+    // output and hand it to the next step as an env var.
+    const out = readFileSync(outPath, "utf8");
+    const report = out
+      .slice(out.indexOf("report<<INSTALL_REPORT_EOF\n") + "report<<INSTALL_REPORT_EOF\n".length)
+      .split("INSTALL_REPORT_EOF")[0]
+      .replace(/\n$/, "");
+    execFileSync("bash", ["-c", checksStep.run], {
+      cwd: repo,
+      env: { ...env, INSTALL_REPORT: report, DEPS_STAT: " package.json | 2 +-", HOLDBACK: "" },
+      encoding: "utf8",
+    });
+    return {
+      scratch,
+      checks: readFileSync(join(repo, "checks.md"), "utf8"),
+      output: readFileSync(outPath, "utf8"),
+    };
+  };
+
+  it("writes one checks.md holding all four checks, in the order they ran", () => {
+    // publish's verdict step refuses a checks.md that does not report each
+    // expected check exactly once, so this is what keeps the split from
+    // closing every batch.
+    const r = run();
+    try {
+      expect(r.checks).toBe(
+        "- ✅ `npm ci`\n- ✅ `npm run lint`\n- ✅ `npm test`\n- ✅ `npm run build`\n",
+      );
+      expect(r.output).toContain("checks_sha=");
+    } finally {
+      rmSync(r.scratch, { recursive: true, force: true });
+    }
+  });
+
+  it("carries a failed install across the split instead of losing it", () => {
+    // The install runs in its own step now; if its verdict did not survive
+    // the hand-off, a batch whose install failed would report all-green.
+    const r = run({ failing: ["npm ci"] });
+    try {
+      expect(r.checks).toContain("- ❌ `npm ci` (exit 3)");
+      expect(r.checks).toContain("- ✅ `npm test`");
+    } finally {
+      rmSync(r.scratch, { recursive: true, force: true });
+    }
+  });
+
+  it("reports a later check's failure with the install's success intact", () => {
+    const r = run({ failing: ["npm test"] });
+    try {
+      expect(r.checks).toBe(
+        "- ✅ `npm ci`\n- ✅ `npm run lint`\n- ❌ `npm test` (exit 3)\n- ✅ `npm run build`\n",
+      );
+    } finally {
+      rmSync(r.scratch, { recursive: true, force: true });
     }
   });
 });
