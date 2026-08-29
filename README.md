@@ -71,6 +71,41 @@ pr: ${{ github.event.pull_request.number || inputs.pr }}
 
 gedmap's own `ci.yml` follows this pattern for its mikelward/lanes gate.
 
+## What gets held back
+
+`npm update` moves each dependency to the newest release its existing range
+in `package.json` allows, so a **direct** dependency can never cross a major
+— the publish job re-derives that from the diff and refuses the batch if one
+did. Beneath the manifest the promise is weaker: a subdependency whose own
+range is `*` or `>=x` can take a major, or a 0.x minor (which a caret pins),
+without anything showing up in the `package.json` diff.
+
+When that happens the batch is **not** abandoned. The workflow rebuilds it
+one declared package at a time, validating after each, and reverts only the
+package whose own move drags a subdependency across a breaking boundary;
+everything else lands as usual. The PR body says so under **Held back**, with
+the crossing that blocked each package, and they stay held until someone does
+the migration deliberately — which is the point, since that migration is
+exactly what an unattended weekly job must not attempt.
+
+Sometimes the rebuild holds back *nothing* and still changes the outcome: a
+bare `npm update` walks the whole tree, while `npm update <name>` re-resolves
+one package's subtree, so a crossing can live in a subdependency the rebuild
+simply never reaches. The PR body reports that case too, naming the crossing —
+otherwise it would claim every dependency moved while one deliberately did
+not.
+
+Two consequences worth knowing:
+
+- A week in which *everything* available is blocked fails the run loudly
+  rather than reporting "no dependency updates available" — no PR, but no
+  silence either.
+- The rebuild only runs in a week the batch would otherwise have shipped
+  nothing at all, so the ordinary week costs exactly what it did before. On a
+  week it does run, the job takes one `npm update` per declared package —
+  minutes rather than the usual seconds, on the same free Actions runners, for
+  a batch that would otherwise not have happened.
+
 ## Regenerating a derived file
 
 A consumer whose build keeps a tracked file in sync with the dependency set
