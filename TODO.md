@@ -26,6 +26,18 @@ Deferred work, recorded here so it isn't lost.
 
 ## The extracted workflow
 
+- [ ] **Support a consumer with npm workspaces end to end.** The checker
+      validates workspace manifests and the hold-back pass now snapshots and
+      restores them, but the surrounding workflow still assumes the root pair
+      is the whole batch: the update job's tree check allowlists only
+      `package.json`/`package-lock.json`, and publish stages those two by
+      name — so a batch that legitimately moved a range declared by a
+      workspace aborts on the tree check, and would drop that manifest from
+      the commit if it did not. None of gedmap, newshacker or readmo uses
+      workspaces, which is why it has never fired. Raised by Codex on #28
+      while reviewing the hold-back pass; deliberately not fixed there,
+      since it is a different change from the one that PR makes.
+
 - [ ] **Add the clean-context registry re-check** — the `--verify-upstream`
       class the Gradle and Rust siblings run in their publish jobs, which
       this repository's pure-text checker cannot give:
