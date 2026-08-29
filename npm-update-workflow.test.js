@@ -925,8 +925,16 @@ describe("the regenerate hook", () => {
       expect(redirects, `${step.name}: unexpected fixed-path redirect(s)`).toEqual([]);
       const tarCreates = [...run.matchAll(/tar -cf "?([\w.$-]+)"?/g)]
         .map((m) => m[1])
-        .filter((path) => path !== "$regen_tmp");
+        // $snapshot is the hold-back pass's own `mktemp -d`, asserted
+        // below so the exemption cannot be satisfied by a fixed name that
+        // merely happens to be spelled with a $.
+        .filter((path) => path !== "$regen_tmp" && path !== "$snapshot");
       expect(tarCreates, `${step.name}: unexpected fixed-path tar create(s)`).toEqual([]);
+      if (run.includes("$snapshot")) {
+        expect(run, `${step.name}: $snapshot must come from mktemp`).toMatch(
+          /snapshot=\$\(mktemp -d\)/,
+        );
+      }
     }
   });
 
@@ -1102,6 +1110,10 @@ describe("the regenerate hook", () => {
       execFileSync("git", ["config", "user.name", "t"], { cwd: tmp });
       writeFileSync(join(tmp, "checks.md"), "- ✅ `npm ci`\n");
       writeFileSync(join(tmp, "deps-stat.txt"), " 1 file changed\n");
+      // Empty in the ordinary week -- nothing held back -- but present, the
+      // way the hold-back step always leaves it. The step fingerprints all
+      // three report files, so a missing one fails before any case runs.
+      writeFileSync(join(tmp, "holdback.md"), "");
 
       const run = (regenerate, regeneratedFiles) => {
         const outPath = join(scratch, "out.txt");
@@ -1179,7 +1191,19 @@ describe("the regenerate hook", () => {
       // silently trusted -- these files belong to the workflow.
       r = run("echo tampered >> checks.md", "a.json");
       expect(r.ok).toBe(false);
-      expect(r.stdout).toContain("a regenerate command modified checks.md or deps-stat.txt");
+      expect(r.stdout).toContain(
+        "a regenerate command modified checks.md, deps-stat.txt or holdback.md",
+      );
+
+      // holdback.md is guarded the same way, and it is the one whose
+      // tampering would be invisible: it names the packages this batch
+      // deliberately left behind, so an emptied copy turns a PR body that
+      // admits a hold-back into one that claims everything moved.
+      r = run("echo '- `x`: tampered' >> holdback.md", "a.json");
+      expect(r.ok).toBe(false);
+      expect(r.stdout).toContain(
+        "a regenerate command modified checks.md, deps-stat.txt or holdback.md",
+      );
     } finally {
       rmSync(scratch, { recursive: true, force: true });
     }
@@ -1834,6 +1858,7 @@ describe("the working-directory input", () => {
       // functions/, which is also this step's own cwd below.
       writeFileSync(join(functionsDir, "checks.md"), "- ✅ `npm ci`\n");
       writeFileSync(join(functionsDir, "deps-stat.txt"), " 1 file changed\n");
+      writeFileSync(join(functionsDir, "holdback.md"), "");
 
       const outPath = join(scratch, "out.txt");
       const summaryPath = join(scratch, "summary.txt");
@@ -1854,12 +1879,408 @@ describe("the working-directory input", () => {
           GITHUB_ENV: envPath,
         },
       });
-      // No throw: checks.md/deps-stat.txt sitting inside functions/ (this
-      // step's own cwd) read as the two allowlisted names once the prefix
-      // is stripped, not as unexpected tree changes.
+      // No throw: checks.md/deps-stat.txt/holdback.md sitting inside
+      // functions/ (this step's own cwd) read as the allowlisted names once
+      // the prefix is stripped, not as unexpected tree changes.
       expect(readFileSync(outPath, "utf8")).toContain("files_sha<<REGEN_SHA_EOF");
     } finally {
       rmSync(scratch, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("holding back only what a breaking transitive blocks", () => {
+  const step = doc.jobs.update.steps.find((s) => s.id === "holdback");
+
+  it("runs before the manifests are fingerprinted, so the fingerprints cover the held-back result", () => {
+    // The whole pass rewrites package.json/package-lock.json. Fingerprinting
+    // them first would pin the bulk resolve — the one this pass exists to
+    // replace — and publish would reject its own artifact every time a
+    // package was held back.
+    const names = doc.jobs.update.steps.map((s) => s.name);
+    expect(names.indexOf("Hold back only what a breaking transitive blocks")).toBeGreaterThan(
+      names.indexOf("Resolve updates within their declared ranges"),
+    );
+    expect(names.indexOf("Hold back only what a breaking transitive blocks")).toBeLessThan(
+      names.indexOf("Stop early if nothing moved"),
+    );
+  });
+
+  it("executes no dependency code: every resolve it makes carries --ignore-scripts", () => {
+    // It runs inside the window where the manifests are still trustworthy —
+    // ahead of the fingerprints and of the first install with lifecycle
+    // scripts — and a resolve here that ran one would put unreviewed code
+    // ahead of both.
+    // Comments stripped first: this step's own prose explains what
+    // `npm update --save` does, and a sentence is not an invocation.
+    const script = step.run
+      .split("\n")
+      .filter((line) => !line.trimStart().startsWith("#"))
+      .join("\n");
+    const updates = script.match(/npm update --[^\n]*/g) ?? [];
+    expect(updates.length).toBeGreaterThan(0);
+    for (const cmd of updates) expect(cmd).toContain("--ignore-scripts");
+  });
+
+  it("fetches the checker OUTSIDE the consumer's tree, pinned to the workflow's own sha", () => {
+    // A gedmap pilot opened a PR titled CHECKS FAILING because an in-tree
+    // checkout of this repository put its .test.js files where the
+    // consumer's own vitest run collected them. actions/checkout cannot
+    // write outside the workspace, so this is a clone into $RUNNER_TEMP —
+    // and the pin stays `job.workflow_sha`, so the workflow and the checker
+    // it loads are the pair that was reviewed together.
+    const fetchStep = doc.jobs.update.steps.find((s) => s.id === "checker");
+    expect(fetchStep.env.CHECKER_REF).toBe("${{ job.workflow_sha }}");
+    expect(fetchStep.run).toContain('dir="$RUNNER_TEMP/npm-update-hub"');
+    expect(fetchStep.run).toContain("https://github.com/mikelward/npm-update");
+    expect(fetchStep.run).toMatch(/checkout --quiet --detach "\$CHECKER_REF"/);
+    // The update job must not check the checker out with actions/checkout
+    // at all — that is the shape that lands inside the workspace.
+    const inTree = doc.jobs.update.steps.filter(
+      (s) => s.uses?.startsWith("actions/checkout") && s.with?.repository === "mikelward/npm-update",
+    );
+    expect(inTree).toEqual([]);
+    // And the hold-back pass reads that path rather than spelling one of
+    // its own.
+    expect(step.env.CHECKER).toBe("${{ steps.checker.outputs.path }}");
+  });
+
+  it("leaves the update job's tree checks exactly as tight as they were", () => {
+    // The corollary of fetching outside the tree: no new allowlist entry.
+    // An exemption here is a hole in the check that catches dependency code
+    // writing to the repository.
+    const verify = doc.jobs.update.steps.find((s) => s.name === "Verify only dependency files changed");
+    expect(verify.run).not.toContain("npm-update-hub");
+    const regen = doc.jobs.update.steps.find((s) => s.id === "regen");
+    expect(regen.run).not.toMatch(/npm-update-hub\/\.\*/);
+  });
+
+  it("restores and snapshots every manifest the batch can rewrite, not just the root pair", () => {
+    // npm update --save writes the new range into whichever manifest
+    // DECLARES the dependency, which for a workspace's dependency is that
+    // workspace's own package.json (Codex). Restoring two files would leave
+    // a workspace range change behind, so the rebuild would not start from
+    // HEAD and a rejected workspace dependency would keep its change.
+    expect(step.run).toContain('node "$CHECKER" manifests');
+    expect(step.run).toContain('git checkout HEAD -- "${manifests[@]}"');
+    expect(step.run).toContain('tar -cf "$snapshot/manifests.tar" -- "${manifests[@]}"');
+    expect(step.run).toContain('tar -xf "$snapshot/manifests.tar"');
+    // Read as whole lines: a workspace directory is a repository path and
+    // can contain a space, which word-splitting would tear in half.
+    expect(step.run).toMatch(/while IFS= read -r m; do/);
+  });
+
+  it("hands holdback.md to publish and verifies it against a pre-check fingerprint", () => {
+    // It names the packages the batch deliberately left behind. A rewrite
+    // on the machine that ran dependency code could empty it, turning a PR
+    // body that admits a hold-back into one claiming everything moved.
+    expect(update).toContain("holdback.md");
+    expect(doc.jobs.update.outputs.holdback_sha).toBe("${{ steps.checks.outputs.holdback_sha }}");
+    expect(update).toMatch(/holdback_sha=\$\(sha256sum holdback\.md/);
+    expect(publish).toContain("HOLDBACK_SHA: ${{ needs.update.outputs.holdback_sha }}");
+    expect(publish).toContain("holdback.md does not match what the update job wrote");
+    const upload = doc.jobs.update.steps.find((s) => s.name === "Hand off the dependency diff");
+    expect(upload.with.path).toContain("holdback.md");
+  });
+
+  it("rewrites holdback.md from the trusted copy after the checks, and keeps empty empty", () => {
+    // Same treatment as deps-stat.txt: written before any dependency code
+    // ran, captured as a step output, and rewritten from that copy once the
+    // checks (which run dependency code) are done. The empty case has to
+    // stay a zero-byte file — a lone newline would read as "something was
+    // held back" to every `[ -s holdback.md ]` test in the body.
+    const checks = doc.jobs.update.steps.find((s) => s.id === "checks");
+    expect(checks.env.HOLDBACK).toBe("${{ steps.holdback.outputs.holdback }}");
+    expect(checks.run).toContain('printf \'%s\\n\' "$HOLDBACK" > holdback.md');
+    expect(checks.run).toContain(": > holdback.md");
+    const rewriteIdx = checks.run.indexOf('"$HOLDBACK" > holdback.md');
+    const lastCheckIdx = checks.run.indexOf("check 'npm run build'");
+    expect(rewriteIdx).toBeGreaterThan(lastCheckIdx);
+  });
+
+  it("names the held-back packages in the PR body, gated on the file having content", () => {
+    const openPr = doc.jobs.publish.steps.find((s) => s.name === "Open the pull request");
+    expect(openPr.run).toContain("if [ -s holdback.md ]; then");
+    expect(openPr.run).toContain("## Held back");
+    expect(openPr.run).toMatch(/## Held back[\s\S]*cat holdback\.md/);
+    // And the claim the section qualifies moves with it: "every dependency
+    // moved" is false for the packages listed, so the opening line says so
+    // rather than leaving the correction to a section further down.
+    expect(openPr.run).toContain(
+      "scope='every dependency it could take without crossing a breaking boundary (see **Held back**)'",
+    );
+    expect(openPr.run).toContain("— $scope moved to the newest version its");
+  });
+});
+
+describe("the hold-back pass, run", () => {
+  // Behavioral, because the failure mode is a false pass: a pass that
+  // reverts nothing, or reverts everything, or leaves the tree at HEAD
+  // while reporting success, all look identical to a structural check.
+  //
+  // The checker and npm are both stubbed. What is under test is the pass's
+  // own control flow — when it falls back, what it reverts, what it names,
+  // and when it refuses to go quiet — not npm's resolver or the checker's
+  // graph walk, which have their own suites.
+  const step = doc.jobs.update.steps.find((s) => s.id === "holdback");
+
+  // The fixture's package-lock.json is the list of packages that have
+  // moved, one per line. The stub npm appends the name it is told to
+  // update; the stub checker fails when that list contains a name the
+  // scenario declares blocked, reporting it the way the real one does.
+  const scenario = ({ declared, blocked, npmFails = [], npmSilent = false, workspace = null, bulkOnly = [] }) => {
+    const scratch = mkdtempSync(join(tmpdir(), "npm-update-holdback-"));
+    const repo = join(scratch, "repo");
+    mkdirSync(repo);
+    const git = (...args) => execFileSync("git", ["-C", repo, ...args], { encoding: "utf8" });
+    writeFileSync(join(repo, "package.json"), "{}\n");
+    writeFileSync(join(repo, "package-lock.json"), "");
+    // A workspace manifest, when the scenario declares one: npm update
+    // --save rewrites whichever manifest declares the dependency, so this
+    // is the file the pass has to restore alongside the root pair.
+    if (workspace) {
+      mkdirSync(join(repo, workspace), { recursive: true });
+      writeFileSync(join(repo, workspace, "package.json"), "HEAD\n");
+    }
+    git("init", "-q");
+    git("config", "user.email", "t@example.com");
+    git("config", "user.name", "t");
+    git("add", "-A");
+    git("-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null", "commit", "-q", "-m", "base");
+
+    // Outside the repository, exactly where the real step now fetches it —
+    // a checker inside the tree is what the gedmap pilot proved breaks the
+    // consumer's own test run.
+    const hub = join(scratch, "hub");
+    mkdirSync(hub);
+    const checker = join(hub, "check-npm-update.mjs");
+    writeFileSync(
+      checker,
+      [
+        "import { readFileSync } from 'node:fs'",
+        `const declared = ${JSON.stringify(declared)}`,
+        `const blocked = ${JSON.stringify(blocked)}`,
+        `const workspace = ${JSON.stringify(workspace)}`,
+        "if (process.argv[2] === 'names') {",
+        "  process.stdout.write(declared.join('\\n') + '\\n')",
+        "  process.exit(0)",
+        "}",
+        "if (process.argv[2] === 'manifests') {",
+        "  const paths = ['package.json', 'package-lock.json']",
+        "  if (workspace) paths.push(workspace + '/package.json')",
+        "  process.stdout.write(paths.join('\\n') + '\\n')",
+        "  process.exit(0)",
+        "}",
+        "const moved = readFileSync('package-lock.json', 'utf8').split('\\n').filter(Boolean)",
+        "const bad = moved.filter((m) => blocked.includes(m))",
+        "for (const b of bad) console.error(`::error::${b} now resolves dep to a different major: 1.0.0 -> 2.0.0.`)",
+        "if (bad.length) process.exit(1)",
+        "console.log('Dependency diff validated: no majors, no out-of-range moves.')",
+      ].join("\n"),
+    );
+
+    const bin = join(scratch, "bin");
+    mkdirSync(bin);
+    writeFileSync(
+      join(bin, "npm"),
+      [
+        "#!/usr/bin/env bash",
+        'name="${@: -1}"',
+        `for f in ${npmFails.join(" ") || "__none__"}; do`,
+        `  if [ "$f" = "$name" ]; then ${npmSilent ? "" : 'echo "npm error code E404" >&2; '}exit 1; fi`,
+        "done",
+        'printf "%s\\n" "$name" >> package-lock.json',
+        'printf "{\\"$name\\":1}\\n" > package.json',
+        // Every resolve also rewrites the workspace manifest, the way
+        // --save does for a dependency that workspace declares.
+        workspace ? `printf "%s\\n" "$name" > ${workspace}/package.json` : ":",
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+
+    // The bulk resolve the real step's predecessor would have left behind:
+    // every declared package moved at once.
+    // bulkOnly stands for what only a BARE `npm update` reaches: it walks
+    // the whole tree, while `npm update <name>` re-resolves one package's
+    // subtree, so a transitive can move in the bulk resolve and not in the
+    // rebuild. That is the shape the gedmap pilot hit.
+    writeFileSync(
+      join(repo, "package-lock.json"),
+      [...declared, ...bulkOnly].map((d) => d + "\n").join(""),
+    );
+    writeFileSync(join(repo, "package.json"), '{"bulk":1}\n');
+    if (workspace) writeFileSync(join(repo, workspace, "package.json"), "bulk\n");
+
+    const outPath = join(scratch, "out.txt");
+    const summaryPath = join(scratch, "summary.txt");
+    for (const p of [outPath, summaryPath]) writeFileSync(p, "");
+
+    const run = () => {
+      try {
+        const stdout = execFileSync("bash", ["-c", step.run], {
+          cwd: repo,
+          encoding: "utf8",
+          env: {
+            ...process.env,
+            PATH: `${bin}:${process.env.PATH}`,
+            CHECKER: checker,
+            GITHUB_OUTPUT: outPath,
+            GITHUB_STEP_SUMMARY: summaryPath,
+          },
+        });
+        return { ok: true, stdout };
+      } catch (e) {
+        return { ok: false, stdout: e.stdout?.toString() ?? "" };
+      }
+    };
+    return {
+      run,
+      repo,
+      scratch,
+      moved: () => readFileSync(join(repo, "package-lock.json"), "utf8").split("\n").filter(Boolean),
+      holdback: () => readFileSync(join(repo, "holdback.md"), "utf8"),
+      workspaceManifest: () => readFileSync(join(repo, workspace, "package.json"), "utf8"),
+      output: () => readFileSync(outPath, "utf8"),
+    };
+  };
+
+  it("leaves an already-publishable batch exactly as the bulk resolve left it", () => {
+    // The ordinary week. Nothing is re-resolved, nothing is reverted, and
+    // holdback.md exists but is empty so the PR body says nothing about it.
+    const s = scenario({ declared: ["a", "b", "c"], blocked: [] });
+    try {
+      const r = s.run();
+      expect(r.ok).toBe(true);
+      expect(s.moved()).toEqual(["a", "b", "c"]);
+      expect(s.holdback()).toBe("");
+      expect(s.output()).toContain("holdback<<HOLDBACK_EOF");
+    } finally {
+      rmSync(s.scratch, { recursive: true, force: true });
+    }
+  });
+
+  it("reverts only the blocking package and ships the rest of the batch", () => {
+    // The case that sank gedmap, newshacker and readmo for two weeks: one
+    // package's transitive move fails the diff, and every other package
+    // that moved perfectly well waits behind it.
+    const s = scenario({ declared: ["a", "b", "c"], blocked: ["b"] });
+    try {
+      const r = s.run();
+      expect(r.ok).toBe(true);
+      expect(s.moved()).toEqual(["a", "c"]);
+      expect(s.holdback()).toContain("`b`");
+      expect(s.holdback()).toContain("resolves dep to a different major");
+      expect(s.holdback()).not.toContain("`a`");
+      // The reason reaches the PR body through the step output, not off
+      // disk — the checks below it run dependency code.
+      expect(s.output()).toMatch(/holdback<<HOLDBACK_EOF\n[^\n]*rebuilt one package at a time[\s\S]*- `b`:/);
+    } finally {
+      rmSync(s.scratch, { recursive: true, force: true });
+    }
+  });
+
+  it("holds back a package npm itself cannot resolve rather than failing the batch", () => {
+    // Reached only through the fallback, so the scenario needs something
+    // blocked to get there — an npm that fails on the bulk resolve is a
+    // dead batch long before this step, and shaped nothing like this.
+    const s = scenario({ declared: ["a", "b", "c"], blocked: ["c"], npmFails: ["a"] });
+    try {
+      const r = s.run();
+      expect(r.ok).toBe(true);
+      expect(s.moved()).toEqual(["b"]);
+      expect(s.holdback()).toContain("npm could not resolve it");
+      expect(s.holdback()).toContain("`c`");
+    } finally {
+      rmSync(s.scratch, { recursive: true, force: true });
+    }
+  });
+
+  it("survives an npm that fails with no output at all", () => {
+    // `set -o pipefail` plus a `grep` that matches nothing is a job-killer,
+    // and the input that produces it — a silent npm failure — is exactly
+    // the one the wording code below it is trying to describe. The batch
+    // must still ship what it can.
+    const s = scenario({ declared: ["a", "b", "c"], blocked: ["c"], npmFails: ["a"], npmSilent: true });
+    try {
+      const r = s.run();
+      expect(r.ok).toBe(true);
+      expect(s.moved()).toEqual(["b"]);
+      expect(s.holdback()).toContain("npm could not resolve it: no output");
+    } finally {
+      rmSync(s.scratch, { recursive: true, force: true });
+    }
+  });
+
+  it("restores a workspace manifest too, so the rebuild really starts from HEAD", () => {
+    // Codex's finding: --save rewrites the manifest that DECLARES the
+    // dependency, so a rebuild that restores only the root pair leaves a
+    // workspace range change behind — the tree is not at HEAD, and the
+    // reverted package's change survives in the file nobody restored.
+    const s = scenario({ declared: ["a", "b"], blocked: ["b"], workspace: "packages/app" });
+    try {
+      const r = s.run();
+      expect(r.ok).toBe(true);
+      expect(s.moved()).toEqual(["a"]);
+      // `b` was rejected, so the workspace manifest must show `a` — the
+      // last accepted state — not `b` and not the bulk resolve's content.
+      expect(s.workspaceManifest()).toBe("a\n");
+    } finally {
+      rmSync(s.scratch, { recursive: true, force: true });
+    }
+  });
+
+  it("reports a rebuild that held no declared package back, rather than claiming everything moved", () => {
+    // The gedmap pilot's actual shape: the crossing was under a
+    // subdependency only the bare `npm update` reaches, so rebuilding
+    // avoided it without any declared package needing to be held. Saying
+    // nothing would leave the PR body claiming every dependency moved while
+    // a subdependency deliberately did not.
+    const s = scenario({ declared: ["a", "b"], blocked: ["transitive-x"], bulkOnly: ["transitive-x"] });
+    try {
+      const r = s.run();
+      expect(r.ok).toBe(true);
+      expect(s.moved()).toEqual(["a", "b"]);
+      expect(s.holdback()).toContain("No declared package had to be held back");
+      // And it names the crossing that made the rebuild necessary, so the
+      // reader knows what did not move.
+      expect(s.holdback()).toContain("transitive-x");
+      expect(s.holdback()).not.toContain("::error::");
+    } finally {
+      rmSync(s.scratch, { recursive: true, force: true });
+    }
+  });
+
+  it("fails loudly when everything is blocked, instead of reporting a quiet week", () => {
+    // Nothing moved AND something was held back is not "no updates
+    // available": the next step would say exactly that and end the batch
+    // with no PR and no red run, which is the silence this pass exists to
+    // end.
+    const s = scenario({ declared: ["a", "b"], blocked: ["a", "b"] });
+    try {
+      const r = s.run();
+      expect(r.ok).toBe(false);
+      expect(r.stdout).toContain("nothing left to publish");
+      expect(r.stdout).toContain("`a`");
+      expect(r.stdout).toContain("`b`");
+    } finally {
+      rmSync(s.scratch, { recursive: true, force: true });
+    }
+  });
+
+  it("emits no ::error:: annotation for an attempt it recovered from", () => {
+    // A run that recovers is green. Annotating it with the failures of the
+    // attempts it discarded would make every recovered week look broken in
+    // the Actions UI, which is how a real failure stops being noticed.
+    const s = scenario({ declared: ["a", "b"], blocked: ["b"] });
+    try {
+      const r = s.run();
+      expect(r.ok).toBe(true);
+      expect(r.stdout).not.toContain("::error::");
+      // The reason is still reported, just as data rather than as a
+      // failure annotation.
+      expect(r.stdout).toContain("rebuilding it one package at a time");
+    } finally {
+      rmSync(s.scratch, { recursive: true, force: true });
     }
   });
 });

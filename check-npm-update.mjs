@@ -791,6 +791,64 @@ export function installedVersions(packages) {
  * the walk cannot read degrades to a manifest-only listing with a note
  * saying so, rather than an empty section that reads as "nothing moved".
  */
+/**
+ * Every dependency name the repository itself declares — the root manifest's,
+ * plus each workspace's. These are the names `npm update <name>` accepts, and
+ * the hold-back pass in the workflow walks them one at a time so a batch a
+ * breaking transitive would otherwise sink can still ship everything that
+ * transitive does not touch. Read from the BEFORE side: the point is to
+ * re-resolve from HEAD, so what HEAD declares is what there is to re-resolve.
+ *
+ * A workspace's own package name is excluded. It is a local link rather than
+ * something the registry resolves, so naming it would ask npm to update a
+ * package that only exists in this tree.
+ */
+/**
+ * Every manifest file in this repository the batch can rewrite: the root
+ * package.json and its lockfile, plus each workspace's package.json.
+ *
+ * `npm update --save` writes the new range into whichever manifest DECLARES
+ * the dependency, which for a workspace's dependency is that workspace's own
+ * package.json — so a hold-back pass that snapshots and restores only the
+ * root pair does not actually return the tree to HEAD, and a rejected
+ * workspace dependency keeps the range change that was supposed to be
+ * reverted (Codex, on review of the hold-back pass).
+ *
+ * Paths are repo-relative to the npm tree's root, in the form the workflow
+ * runs `git checkout` and `tar` against.
+ */
+export function manifestPaths({ lockBefore, lockAfter }) {
+  const paths = ["package.json", "package-lock.json"];
+  for (const dir of new Set([
+    ...workspacePaths(lockBefore?.packages ?? {}),
+    ...workspacePaths(lockAfter?.packages ?? {}),
+  ])) {
+    paths.push(`${dir}/package.json`);
+  }
+  return paths;
+}
+
+export function directDependencyNames({ manifestBefore, workspaces = {} }) {
+  const workspaceNames = new Set(
+    Object.values(workspaces)
+      .map((w) => w?.manifestBefore?.name)
+      .filter((name) => typeof name === "string" && name !== ""),
+  );
+  const names = new Set();
+  const collect = (manifest) => {
+    for (const section of DEP_SECTIONS) {
+      const declared = manifest?.[section];
+      if (declared === null || typeof declared !== "object") continue;
+      for (const name of Object.keys(declared)) {
+        if (!workspaceNames.has(name)) names.add(name);
+      }
+    }
+  };
+  collect(manifestBefore);
+  for (const workspace of Object.values(workspaces)) collect(workspace?.manifestBefore);
+  return [...names].sort();
+}
+
 export function updateSummary({ manifestBefore, manifestAfter, lockBefore, lockAfter, workspaces = {} }) {
   const isObject = (v) => typeof v === "object" && v !== null;
   const walkable = isObject(lockBefore?.packages) && isObject(lockAfter?.packages);
@@ -992,16 +1050,37 @@ function main() {
   const mode = process.argv[2];
   // A typo'd mode must not fall through to validation: the caller wanted the
   // summary, and a green validation run on stdout would be quietly embedded
-  // in the PR body in its place.
-  if (mode !== undefined && mode !== "summary") {
+  // in the PR body in its place. The same applies to `names`, whose caller
+  // would otherwise read "Dependency diff validated" as its list of packages
+  // and hold back every one of them.
+  const MODES = ["summary", "names", "manifests"];
+  if (mode !== undefined && !MODES.includes(mode)) {
     console.error(
-      `Unknown mode "${mode}". Run with no arguments to validate, or "summary" for the PR-body section.`,
+      `Unknown mode "${mode}". Run with no arguments to validate, "summary" for the PR-body section, "names" for the declared dependency names, or "manifests" for the manifest paths the batch can rewrite.`,
     );
     process.exit(2);
   }
 
   if (mode === "summary") {
     process.stdout.write(updateSummary(gatherInputs()));
+    return;
+  }
+
+  // One name per line, for the workflow's hold-back pass. Printed from the
+  // same clean read of HEAD the validation uses, so the list cannot disagree
+  // with what the validator walks.
+  if (mode === "names") {
+    const names = directDependencyNames(gatherInputs());
+    process.stdout.write(names.length ? names.join("\n") + "\n" : "");
+    return;
+  }
+
+  // Every file the hold-back pass has to snapshot before it re-resolves and
+  // restore when it rejects the result. Printed from the same read of the
+  // lockfiles that discovers workspaces for the validation, so the two cannot
+  // disagree about which manifests exist.
+  if (mode === "manifests") {
+    process.stdout.write(manifestPaths(gatherInputs()).join("\n") + "\n");
     return;
   }
 

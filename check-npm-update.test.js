@@ -35,6 +35,8 @@ import {
   majorOf,
   resolveEdge,
   allFailures,
+  directDependencyNames,
+  manifestPaths,
   updateSummary,
   workspacePaths,
 } from './check-npm-update.mjs'
@@ -1945,6 +1947,44 @@ describe('updateSummary', () => {
 // regression this pins is the pathspec's cwd-relativity, and a repo-rooted
 // `HEAD:package.json` would look identical to every pure-function test while
 // failing from any nested directory.
+describe('manifestPaths', () => {
+  // The hold-back pass restores these before it re-resolves and after it
+  // rejects a package. A path missing here is a file the rebuild silently
+  // does not return to HEAD.
+  const lock = (packages) => ({ packages })
+
+  it('is the root pair when there are no workspaces', () => {
+    expect(
+      manifestPaths({ lockBefore: lock({ '': {}, 'node_modules/a': {} }), lockAfter: lock({ '': {} }) }),
+    ).toEqual(['package.json', 'package-lock.json'])
+  })
+
+  it('adds every workspace manifest, from either side of the diff', () => {
+    // Either side, because a workspace that only exists on one of them is
+    // still a file this batch can have rewritten.
+    expect(
+      manifestPaths({
+        lockBefore: lock({ '': {}, 'packages/a': {}, 'node_modules/dep': {} }),
+        lockAfter: lock({ '': {}, 'packages/a': {}, 'packages/b': {} }),
+      }),
+    ).toEqual([
+      'package.json',
+      'package-lock.json',
+      'packages/a/package.json',
+      'packages/b/package.json',
+    ])
+  })
+
+  it('survives a lockfile with no packages map rather than throwing', () => {
+    // allFailures fails the run on that shape; this one only has to not
+    // blow up before it gets there.
+    expect(manifestPaths({ lockBefore: {}, lockAfter: {} })).toEqual([
+      'package.json',
+      'package-lock.json',
+    ])
+  })
+})
+
 describe('the CLI run from a nested npm tree', () => {
   const CLI = fileURLToPath(new URL('./check-npm-update.mjs', import.meta.url))
 
@@ -2003,5 +2043,82 @@ describe('the CLI run from a nested npm tree', () => {
     const summary = runFrom(cwd, 'summary')
     expect(summary).toContain('## Updated packages')
     expect(summary).toContain('`dep` 1.0.0 → 1.0.1')
+  })
+
+  it('lists the declared names from the same subdirectory, one per line', () => {
+    const cwd = join(repoWithNestedTree(), 'backend')
+    expect(runFrom(cwd, 'names')).toBe('dep\n')
+  })
+
+  it('lists the manifest paths from the same subdirectory', () => {
+    const cwd = join(repoWithNestedTree(), 'backend')
+    expect(runFrom(cwd, 'manifests')).toBe('package.json\npackage-lock.json\n')
+  })
+
+  it('refuses an unknown mode rather than falling through to validation', () => {
+    const cwd = join(repoWithNestedTree(), 'backend')
+    let code = 0
+    try {
+      execFileSync(process.execPath, [CLI, 'nmaes'], { cwd, encoding: 'utf8', stdio: 'pipe' })
+    } catch (err) {
+      code = err.status
+    }
+    expect(code).toBe(2)
+  })
+})
+
+describe('directDependencyNames', () => {
+  // The hold-back pass re-resolves one declared package at a time, so this
+  // list IS the search space: a name missing from it is a package the pass
+  // can never move, and a name that does not belong is an `npm update` the
+  // pass spends a round on for nothing.
+  it('names every section the root manifest declares, sorted and deduped', () => {
+    expect(
+      directDependencyNames({
+        manifestBefore: {
+          dependencies: { vite: '^8.0.0', react: '^19.0.0' },
+          devDependencies: { vitest: '^4.0.0', vite: '^8.0.0' },
+          optionalDependencies: { fsevents: '^2.3.0' },
+          peerDependencies: { typescript: '^6.0.0' },
+        },
+      }),
+    ).toEqual(['fsevents', 'react', 'typescript', 'vite', 'vitest'])
+  })
+
+  it('includes what a workspace declares, since a root npm update moves it too', () => {
+    expect(
+      directDependencyNames({
+        manifestBefore: { dependencies: { react: '^19.0.0' } },
+        workspaces: {
+          'packages/a': {
+            manifestBefore: { name: 'a', dependencies: { lodash: '^4.0.0' } },
+            manifestAfter: { name: 'a', dependencies: { lodash: '^4.0.0' } },
+          },
+        },
+      }),
+    ).toEqual(['lodash', 'react'])
+  })
+
+  it('excludes a workspace\'s own name, which npm resolves from this tree rather than the registry', () => {
+    expect(
+      directDependencyNames({
+        manifestBefore: { dependencies: { a: '^1.0.0', react: '^19.0.0' } },
+        workspaces: {
+          'packages/a': {
+            manifestBefore: { name: 'a', version: '1.0.0' },
+            manifestAfter: { name: 'a', version: '1.0.0' },
+          },
+        },
+      }),
+    ).toEqual(['react'])
+  })
+
+  it('survives a manifest section that is absent or not an object', () => {
+    expect(
+      directDependencyNames({
+        manifestBefore: { dependencies: null, devDependencies: { a: '^1.0.0' } },
+      }),
+    ).toEqual(['a'])
+    expect(directDependencyNames({ manifestBefore: {} })).toEqual([])
   })
 })

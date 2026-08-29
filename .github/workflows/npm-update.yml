@@ -102,6 +102,7 @@ jobs:
       lock_sha: ${{ steps.changed.outputs.lock_sha }}
       checks_sha: ${{ steps.checks.outputs.checks_sha }}
       deps_stat_sha: ${{ steps.checks.outputs.deps_stat_sha }}
+      holdback_sha: ${{ steps.checks.outputs.holdback_sha }}
       regen_sha: ${{ steps.regen.outputs.files_sha }}
       regen_mode: ${{ steps.regen.outputs.files_mode }}
     steps:
@@ -156,6 +157,45 @@ jobs:
           prefix=$(git rev-parse --show-prefix)
           echo "prefix=$prefix" >> "$GITHUB_OUTPUT"
           echo "dir=${prefix%/}" >> "$GITHUB_OUTPUT"
+
+      # The canonical checker, from THIS repository — the same one the publish
+      # job uses, at the same `job.workflow_sha` pin (so the workflow and the
+      # checker it loads are always the pair that was reviewed together; see
+      # that job's own step for the full reasoning). It is needed here too
+      # because the hold-back pass below has to ask, before any dependency
+      # code has run, whether what `npm update` just resolved is publishable.
+      #
+      # Cloned into $RUNNER_TEMP rather than checked out into the tree, and
+      # that is not a style choice: actions/checkout can only write inside
+      # the workspace, and a directory of .test.js files sitting in the
+      # consumer's repository is picked up by the consumer's OWN test run a
+      # few steps later. A gedmap pilot proved it — vitest collected this
+      # repository's suite out of npm-update-hub/, failed on it, and the
+      # batch opened its PR titled CHECKS FAILING over tests that have
+      # nothing to do with the consumer. Out of the tree, nothing globs it,
+      # nothing has to allowlist it, and the tree check stays exactly as
+      # tight as it was.
+      #
+      # The verdict this copy produces is NOT trusted: publish re-validates
+      # the final diff from its own clean checkout regardless, so the worst a
+      # tampered copy here can do is produce a batch publish then refuses.
+      - name: Fetch the canonical checker outside the tree
+        id: checker
+        env:
+          # The pinned revision, via env: rather than spliced into the script
+          # — same habit as every other `${{ }}` in this file.
+          CHECKER_REF: ${{ job.workflow_sha }}
+        run: |
+          set -euo pipefail
+          dir="$RUNNER_TEMP/npm-update-hub"
+          # A fixed public URL and a pinned commit, so this is the same
+          # content actions/checkout would fetch; --filter/--depth keep it to
+          # the one revision. No credentials: the repository is public and
+          # nothing here needs to write.
+          git clone --quiet --filter=blob:none --no-checkout \
+            https://github.com/mikelward/npm-update "$dir"
+          git -C "$dir" checkout --quiet --detach "$CHECKER_REF"
+          echo "path=$dir/check-npm-update.mjs" >> "$GITHUB_OUTPUT"
 
       # Pinned and handed to the publish job. Publishing from "the default
       # branch" instead would take whatever the tip is by then — if someone
@@ -237,6 +277,169 @@ jobs:
       - name: Resolve updates within their declared ranges
         run: npm update --save --ignore-scripts
 
+      # A single package's breaking transitive move used to sink the whole
+      # batch: the publish job re-validates the diff, finds a subdependency
+      # that crossed a major (or a 0.x minor, which caret pins), and stops —
+      # so no PR opens and every OTHER package that moved perfectly well that
+      # week waits for a human who is not watching a failed scheduled run.
+      # gedmap, newshacker and readmo sat blocked for two consecutive weeks on
+      # one such move (rolldown resolving @oxc-project/types across 0.144 →
+      # 0.146) with nothing else wrong in any of them.
+      #
+      # So: hold back only what is blocked. The bulk resolve above is still
+      # what ships in the ordinary week — this pass costs nothing when it
+      # validates, which is the common case. When it does not, the tree goes
+      # back to HEAD and the batch is rebuilt one declared package at a time,
+      # validating after each: a package whose own move breaks the diff is
+      # reverted and named, and everything else lands as usual. Rebuilding
+      # incrementally is what makes the result correct by construction rather
+      # than by attribution — the state after every accepted step validates,
+      # so the state at the end does too, including for a pair of packages
+      # that only cross in combination (the second one is what gets held).
+      #
+      # One package at a time rather than a bisect: the counts here are tens
+      # of packages, the resolve is seconds with `--ignore-scripts` and no
+      # network beyond the registry metadata npm already fetched, and this
+      # only runs in a week that would otherwise have shipped nothing at all.
+      #
+      # This still executes no dependency code — every resolve below carries
+      # `--ignore-scripts`, exactly like the bulk one above — so it stays
+      # inside the window where the manifests are trustworthy, ahead of the
+      # fingerprints the next step takes.
+      - name: Hold back only what a breaking transitive blocks
+        id: holdback
+        env:
+          # The clone step's own output, not a path spelled twice.
+          CHECKER: ${{ steps.checker.outputs.path }}
+        run: |
+          set -euo pipefail
+          : > holdback.md
+
+          rebuilt=false
+          # Captured, not printed: the checker reports through `::error::`
+          # annotations, and a run that recovers by holding one package back
+          # must not decorate itself with red annotations for the attempts it
+          # discarded — an Actions run that shows errors on every recovered
+          # week is one nobody reads on the week it matters. The messages are
+          # kept as data and reported in the PR body instead.
+          if ! bulk=$(node "$CHECKER" 2>&1 >/dev/null); then
+            rebuilt=true
+            echo 'The bulk resolve is not publishable as-is; rebuilding it one package at a time.'
+            printf '%s\n' "$bulk" | sed 's/^::error:://'
+
+            # EVERY manifest the batch can rewrite, not just the root pair:
+            # `npm update --save` writes the new range into whichever
+            # manifest declares the dependency, which for a workspace's
+            # dependency is that workspace's own package.json. Restoring two
+            # files would leave a workspace range change behind and the
+            # rebuild would not actually start from HEAD (Codex).
+            #
+            # Read into an array rather than word-split: a workspace
+            # directory is a repository path and can contain a space.
+            manifests=()
+            while IFS= read -r m; do
+              [ -n "$m" ] && manifests+=("$m")
+            done <<< "$(node "$CHECKER" manifests)"
+            git checkout HEAD -- "${manifests[@]}"
+            # Its own assignment rather than inline in the `for` list below:
+            # a command substitution that fails there yields an EMPTY list
+            # and the loop simply does nothing, so a checker that could not
+            # read the manifests at all would look exactly like a repository
+            # with no dependencies. As a simple command, `set -e` stops the
+            # job on it.
+            names=$(node "$CHECKER" names)
+            # A byte-exact copy to roll back to, so a rejected package leaves
+            # no trace — restoring from a shell variable would drop the
+            # trailing newline npm writes and register as a change of its
+            # own. tar rather than cp, so a workspace manifest comes back at
+            # its own path rather than flattened into one directory. A temp
+            # directory is safe here specifically because no dependency code
+            # has run in this job yet.
+            snapshot=$(mktemp -d)
+            for name in $names; do
+              tar -cf "$snapshot/manifests.tar" -- "${manifests[@]}"
+              if ! attempt=$(npm update --save --ignore-scripts -- "$name" 2>&1); then
+                # `|| true` on both extractions below, and only there: the
+                # failure that matters — npm's — is already caught by the
+                # `if` above, and what follows is only the wording for it.
+                # Without it, `grep` finding no non-empty line (an npm that
+                # failed silently) or `head` closing the pipe early trips
+                # pipefail and takes the whole job down over the phrasing of
+                # a message.
+                reason=$(printf '%s\n' "$attempt" | grep -v '^$' | tail -n 1 || true)
+                reason="npm could not resolve it: ${reason:-no output}"
+              elif ! attempt=$(node "$CHECKER" 2>&1 >/dev/null); then
+                # The first reported failure. A package can produce several
+                # and they are all the same verdict — one line each in the PR
+                # body would bury the packages that DID move.
+                reason=$(printf '%s\n' "$attempt" | sed -n 's/^::error:://p' | head -n 1 || true)
+                reason=${reason:-$(printf '%s\n' "$attempt" | head -n 1 || true)}
+                reason=${reason:-the checker rejected the resulting diff}
+              else
+                continue
+              fi
+              tar -xf "$snapshot/manifests.tar"
+              printf -- '- `%s`: %s\n' "$name" "$reason" >> holdback.md
+            done
+            rm -rf -- "$snapshot"
+
+            # The rebuild is reported whether or not it held a DECLARED
+            # package back, because it changes what ships either way. The
+            # gedmap pilot landed exactly in the second case: the crossing
+            # was under a subdependency that only a bare `npm update` reaches
+            # (it updates the whole tree; `npm update <name>` re-resolves one
+            # package's subtree), so rebuilding avoided it without any
+            # declared package needing to be held. Saying nothing there would
+            # leave the PR claiming every dependency moved while a
+            # subdependency deliberately did not.
+            if [ -s holdback.md ]; then
+              printf '%s\n\n%s\n' 'The bulk resolve crossed a breaking boundary, so this batch was rebuilt one package at a time. These were held back:' "$(cat holdback.md)" > holdback.md
+            else
+              {
+                echo 'The bulk resolve crossed a breaking boundary, so this batch was rebuilt one package at a time. No declared package had to be held back — the crossing was under a subdependency the rebuild simply does not take:'
+                echo
+                printf '%s\n' "$bulk" | sed 's/^::error:://;s/^/- /'
+              } > holdback.md
+            fi
+          fi
+
+          # `if`/`fi`, not `[ ... ] &&`: bash exempts a failing first command
+          # of an AND list from `set -e`, so the short form works — but the
+          # same construct has already cost this workflow a whole aborted
+          # batch once in a position where it is NOT exempt (see the tree
+          # check's own note), and the long form is never the wrong one.
+          if [ -s holdback.md ]; then
+            cat holdback.md >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+          # A rebuild that ends with nothing moved: the next step would report
+          # "no dependency updates available this run" and end the batch
+          # quietly, which is not what happened and is exactly the silence
+          # this pass exists to end. Fail loudly instead — whatever is left
+          # needs a deliberate migration, and a red run is the only channel
+          # once there is no PR to carry the note. Keyed on the rebuild
+          # having happened rather than on holdback.md having content, so a
+          # rebuild that somehow held nothing back and still moved nothing —
+          # a repository declaring no dependencies at all, say — is not the
+          # one shape that slips through silently.
+          if [ "$rebuilt" = true ] && git diff --quiet -- package.json package-lock.json; then
+            echo '::error::Nothing survived the rebuild, so there is nothing left to publish. Whatever is named below needs a deliberate migration:'
+            sed 's/^- //' holdback.md
+            exit 1
+          fi
+
+          # Captured as a step OUTPUT, before any dependency code runs, for
+          # the same reason deps-stat.txt is: holdback.md is an allowlisted
+          # path this job writes itself, so a lifecycle script during the
+          # checks below could rewrite it and have that content land in the
+          # PR body unread. The checks step rewrites the file from this
+          # trusted copy once they have all finished.
+          {
+            echo 'holdback<<HOLDBACK_EOF'
+            cat holdback.md
+            echo 'HOLDBACK_EOF'
+          } >> "$GITHUB_OUTPUT"
+
       - name: Stop early if nothing moved
         id: changed
         run: |
@@ -298,6 +501,9 @@ jobs:
           # is trusted (captured before any dependency code ran). Safe habit,
           # cheap to keep.
           DEPS_STAT: ${{ steps.changed.outputs.deps_stat }}
+          # Same treatment, same reason — written before any dependency code
+          # ran, rewritten from this copy once the checks are done.
+          HOLDBACK: ${{ steps.holdback.outputs.holdback }}
         run: |
           set +e
           # Accumulated in a shell variable, not appended to checks.md as
@@ -346,6 +552,16 @@ jobs:
           # put the PR body's closing ``` fence on the diffstat's last line
           # instead of its own, breaking the code block for everything after.
           printf '%s\n' "$DEPS_STAT" > deps-stat.txt
+          # Empty stays EMPTY: the multiline capture yields the empty string
+          # when nothing was held back, and a `printf '%s\n'` of that would
+          # leave a one-byte file that every `[ -s holdback.md ]` test below
+          # reads as "something was held back" — a PR body announcing a
+          # hold-back section with nothing in it.
+          if [ -n "$HOLDBACK" ]; then
+            printf '%s\n' "$HOLDBACK" > holdback.md
+          else
+            : > holdback.md
+          fi
           # Both files just got their real, final content — fingerprint them
           # now, the same way pkg_sha/lock_sha were fingerprinted right after
           # the resolve step. Every check above ran dependency code in THIS
@@ -357,6 +573,7 @@ jobs:
           # — verifies the downloaded artifact against it below.
           echo "checks_sha=$(sha256sum checks.md | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
           echo "deps_stat_sha=$(sha256sum deps-stat.txt | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          echo "holdback_sha=$(sha256sum holdback.md | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
           cat checks.md >> "$GITHUB_STEP_SUMMARY"
           # No pass/fail boolean written as this step's own OUTPUT — publish
           # derives that itself, from checks.md's own (fingerprint-verified)
@@ -433,7 +650,7 @@ jobs:
               exit 1
             fi
             case "$f" in
-              package.json|package-lock.json|checks.md|deps-stat.txt|regen-handoff.tar|regen-stat.txt)
+              package.json|package-lock.json|checks.md|deps-stat.txt|holdback.md|regen-handoff.tar|regen-stat.txt)
                 echo "::error::regenerated-files must not name a file the workflow itself owns: $f"
                 exit 1 ;;
               npm-update-hub|npm-update-hub/*)
@@ -489,7 +706,7 @@ jobs:
                     fi ;;
                 esac
               done \
-            | grep -Ev '^(package\.json|package-lock\.json|checks\.md|deps-stat\.txt)$' || true)
+            | grep -Ev '^(package\.json|package-lock\.json|checks\.md|deps-stat\.txt|holdback\.md)$' || true)
           pretree=$(printf '%s\n' "$pretree" | sed 's/\t$//')
           if [ -n "$pretree" ]; then
             echo '::error::The checks changed the tree outside the dependency manifests before regeneration ran. Not opening a PR — inspect these first:'
@@ -497,11 +714,12 @@ jobs:
             exit 1
           fi
           # Fingerprinted before the regenerate commands run, verified
-          # after: checks.md and deps-stat.txt already exist by now, but
+          # after: checks.md, deps-stat.txt and holdback.md already exist by
+          # now, but
           # nothing before this point stops a regenerate command — the same
           # dependency-adjacent code as the checks — from writing to them
           # too.
-          reports_sha_before=$(sha256sum checks.md deps-stat.txt)
+          reports_sha_before=$(sha256sum checks.md deps-stat.txt holdback.md)
           # Same containment as the checks, but a failure here is a STOP,
           # not a flag: a batch whose derived files could not be rebuilt
           # would publish stale ones.
@@ -514,8 +732,8 @@ jobs:
               eval "$cmd" )
             echo '::endgroup::'
           done <<< "$REGENERATE"
-          if [ "$(sha256sum checks.md deps-stat.txt)" != "$reports_sha_before" ]; then
-            echo '::error::a regenerate command modified checks.md or deps-stat.txt — fix the regenerate input; these files belong to the workflow, not to a regeneration command.'
+          if [ "$(sha256sum checks.md deps-stat.txt holdback.md)" != "$reports_sha_before" ]; then
+            echo '::error::a regenerate command modified checks.md, deps-stat.txt or holdback.md — fix the regenerate input; these files belong to the workflow, not to a regeneration command.'
             exit 1
           fi
           # sha256sum's own "hash  path" lines, so the publish job can
@@ -664,7 +882,7 @@ jobs:
                 ;;
             esac
             case "$path" in
-              package.json|package-lock.json|checks.md|deps-stat.txt)
+              package.json|package-lock.json|checks.md|deps-stat.txt|holdback.md)
                 continue ;;
             esac
             # Checked against the regenerated-files declaration as whole
@@ -847,7 +1065,7 @@ jobs:
           # `with:` paths don't inherit the job-level working-directory
           # default (only `run:` steps do), so each one is spelled out via
           # the layout step's prefix — empty for every existing consumer,
-          # reproducing these five bare names exactly. upload-artifact
+          # reproducing these six bare names exactly. upload-artifact
           # keys the archived paths off their common parent, so publish's
           # download-artifact step (its own `path:` input, same reasoning)
           # restores them at the matching location either way.
@@ -856,6 +1074,7 @@ jobs:
             ${{ steps.layout.outputs.prefix }}package-lock.json
             ${{ steps.layout.outputs.prefix }}checks.md
             ${{ steps.layout.outputs.prefix }}deps-stat.txt
+            ${{ steps.layout.outputs.prefix }}holdback.md
             ${{ steps.layout.outputs.prefix }}regen-handoff.tar
           retention-days: 1
           if-no-files-found: error
@@ -922,7 +1141,7 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           name: npm-update
-          # Matches the update job's upload: its five paths shared
+          # Matches the update job's upload: its six paths shared
           # working-directory as their common parent (empty for every
           # existing consumer, so upload-artifact stripped nothing and this
           # is the same as omitting `path:` entirely), so restoring them
@@ -948,6 +1167,7 @@ jobs:
           LOCK_SHA: ${{ needs.update.outputs.lock_sha }}
           CHECKS_SHA: ${{ needs.update.outputs.checks_sha }}
           DEPS_STAT_SHA: ${{ needs.update.outputs.deps_stat_sha }}
+          HOLDBACK_SHA: ${{ needs.update.outputs.holdback_sha }}
         run: |
           set -euo pipefail
           [ "$(sha256sum package.json | cut -d" " -f1)" = "$PKG_SHA" ] \
@@ -964,6 +1184,13 @@ jobs:
             || { echo '::error::checks.md does not match what the update job wrote.'; exit 1; }
           [ "$(sha256sum deps-stat.txt | cut -d" " -f1)" = "$DEPS_STAT_SHA" ] \
             || { echo '::error::deps-stat.txt does not match what the update job wrote.'; exit 1; }
+          # holdback.md is the third file of that kind: written by the update
+          # job before any dependency code ran, read into the PR body here
+          # unread. It names packages this batch deliberately left behind, so
+          # a rewrite could hide one — the PR would then claim a batch moved
+          # everything when it did not.
+          [ "$(sha256sum holdback.md | cut -d" " -f1)" = "$HOLDBACK_SHA" ] \
+            || { echo '::error::holdback.md does not match what the update job wrote.'; exit 1; }
 
       # regen-handoff.tar travels through the same machine that ran
       # dependency code, so nothing in it is trusted by name: it is
@@ -1339,11 +1566,35 @@ jobs:
               >> "$GITHUB_STEP_SUMMARY"
           fi
 
+          # The opening claim has to survive a hold-back: "every dependency
+          # moved" is simply false for the ones listed below it, and a
+          # reader has no way to tell a package that had nothing new from
+          # one this batch refused to take.
+          if [ -s holdback.md ]; then
+            scope='every dependency it could take without crossing a breaking boundary (see **Held back**)'
+          else
+            scope='every dependency'
+          fi
           {
-            echo "\`npm update --save\` — every dependency moved to the newest version its"
+            echo "\`npm update --save\` — $scope moved to the newest version its"
             echo 'existing range in `package.json` allows. **No majors**: those need a'
             echo 'deliberate migration and this job cannot produce one.'
             echo
+            # Named up front, next to the claim it qualifies, rather than
+            # after the diffstat where a reader who stopped at the checks
+            # would never reach it.
+            if [ -s holdback.md ]; then
+              echo '## Held back'
+              echo
+              # The file says which shape this is — packages reverted, or a
+              # subdependency crossing the rebuild avoided — because only the
+              # job that ran it knows.
+              cat holdback.md
+              echo
+              echo 'Whatever is named above needs a deliberate migration; this job cannot'
+              echo 'produce one, and will keep leaving it behind until someone does.'
+              echo
+            fi
             echo '## Checks'
             echo
             cat checks.md

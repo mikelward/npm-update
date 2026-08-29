@@ -51,9 +51,9 @@ has stopped biting.
   forged `passed=true` could sail past the gate even while `checks.md`
   itself showed a failure, since the two were computed and trusted
   independently.
-- **`checks.md` and `deps-stat.txt` still carry a residual gap the manifests
-  don't have, and this doesn't close it.** Both files, and their
-  fingerprints, are still computed *inside* the same untrusted step that
+- **`checks.md`, `deps-stat.txt` and `holdback.md` still carry a residual gap
+  the manifests don't have, and this doesn't close it.** All three files, and
+  their fingerprints, are still computed *inside* the same untrusted step that
   runs `npm update` — unlike `package.json`/`package-lock.json`, whose
   fingerprints `publish` independently verifies against a clean checkout.
   A sufficiently sophisticated lifecycle script could in principle leave a
@@ -69,12 +69,54 @@ has stopped biting.
   other. But a forger sophisticated enough to fake `checks.md`'s content
   consistently with its own fingerprint still isn't caught, and
   `deps-stat.txt`'s content (purely informational — the PR body's diffstat,
-  never gates anything) is untouched either way. Closing that fully would
+  never gates anything) is untouched either way. `holdback.md` sits with
+  `deps-stat.txt` on that scale: it gates nothing, but it is the only place
+  the PR admits a package was left behind, so an emptied copy turns an honest
+  body into one claiming the batch moved everything. What it names is
+  independently checkable against the diff by anyone reading the PR — a
+  held-back package is one that did not move. Closing that fully would
   need `publish` to re-derive the verdict from a clean re-execution, not
   just re-read a file the untrusted job already wrote — out of scope here.
   Read the PR body's check results as evidence from the batch, not proof
   independently established — the same posture the sibling per-repo copies
   already took before this repository existed.
+
+## Holding back only what is blocked
+
+- **One package's breaking transitive move must not sink the batch.** It did,
+  for two consecutive weeks in gedmap, newshacker and readmo: `rolldown`
+  resolving `@oxc-project/types` across 0.144 → 0.146 failed the diff, so no
+  PR opened anywhere and every other package that moved cleanly waited behind
+  it, with nothing but a failed scheduled run to say so.
+- **The rebuild is incremental, not attributive.** The hold-back step goes
+  back to HEAD and re-resolves one declared package at a time, validating
+  after each and reverting the ones that fail. That makes the result correct
+  by construction — every accepted state validates, so the final one does —
+  rather than depending on tracing a crossing back to whichever direct
+  dependency "caused" it, which a hoisted or shared subdependency makes a
+  guess. It runs only in a week the batch would otherwise have shipped
+  nothing.
+- **It changes nothing about what gets trusted.** The step runs inside the
+  window before any dependency code executes (`--ignore-scripts`, like the
+  bulk resolve), and its verdicts are the untrusted job's own: `publish`
+  re-validates the final diff from its own clean checkout regardless, so the
+  worst a tampered checker copy there can do is produce a batch publish then
+  refuses.
+- **The checker is fetched OUTSIDE the consumer's tree, and that is
+  load-bearing.** A gedmap pilot checked it out into the repository with
+  `actions/checkout` (which cannot write anywhere else) and the consumer's own
+  `npm test` collected this repository's `*.test.js` files a few steps later —
+  the batch opened its PR titled CHECKS FAILING over tests that have nothing to
+  do with it. A clone into `$RUNNER_TEMP` also means no tree-check allowlist
+  entry, so the check that catches dependency code writing to the repository
+  stays exactly as tight as it was.
+- **Restore every manifest, not the root pair.** `npm update --save` writes the
+  new range into whichever manifest declares the dependency, so a workspace's
+  `package.json` is part of what the rebuild has to snapshot and roll back;
+  `manifestPaths` in the checker is what names them.
+- **A week where everything is blocked fails loudly.** Silence would be
+  indistinguishable from "nothing to update", which is the failure this
+  whole pass exists to end.
 
 ## What this repository must not grow
 
