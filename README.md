@@ -127,7 +127,10 @@ jobs:
 ```
 
 Both take one entry per line for more than one command or file. `regenerate`
-runs after the check suite, reusing the real install the checks already did;
+runs between the install and the rest of the checks — reusing that install
+rather than installing twice, and rebuilding the derived file *before*
+lint/test/build read it, so a suite that asserts the file matches the lockfile
+sees the rebuilt one;
 a failing command stops the batch rather than publishing stale derived
 output. `regenerated-files` is the commit allowlist: every path it names
 must already be a tracked file (this rebuilds an existing one, it does not

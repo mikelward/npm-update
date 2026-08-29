@@ -34,9 +34,12 @@ on:
         description: >-
           Commands that rebuild a file derived from the dependency set (an
           import map kept in sync with the lockfile, say), one per line.
-          They run after the check suite, reusing the real install the
-          checks already did rather than installing a second time, in the
-          same untrusted window. A failure stops the run: publishing a
+          They run after `npm ci` and BEFORE lint, test and build, reusing
+          that install rather than installing a second time, in the same
+          untrusted window — so a suite that asserts the derived file
+          matches the lockfile sees the rebuilt one rather than the stale
+          one. A command that needs build OUTPUT rather than the installed
+          tree does not fit here. A failure stops the run: publishing a
           batch whose derived files are stale is the silent drift this
           input exists to end. Empty disables.
         type: string
@@ -489,113 +492,66 @@ jobs:
       # checks have to happen HERE or they do not happen at all, and a PR with
       # no red tick would read as verified when nothing had verified it.
       #
-      # Every check runs even after one fails, so the PR body reports the whole
-      # picture rather than only the first thing to break.
-      - name: Run the full check suite
+      # The install is its own step, ahead of the regenerate hook, so a
+      # derived file is rebuilt BEFORE the checks that read it. readmo is the
+      # case that forced this: its suite asserts the Deno import map pins
+      # exactly what the lockfile installs, the batch moved two packages the
+      # map pins, and with regeneration running after the suite every such
+      # batch reported `npm test ❌` against a map that was correct by the
+      # time the PR opened — three failures, a CHECKS FAILING title, and
+      # auto-merge withheld, on a branch whose own CI then passed. A check
+      # suite that cries wolf on every real batch is the one nobody reads.
+      #
+      # It stays a REPORTED check rather than a plain step, for the reason it
+      # always was one: as a step, a postinstall that fails would kill the job
+      # before the artifact existed, and the batch would surface only as a red
+      # Actions run nobody is looking at. As a check it lands in the PR body
+      # with the rest, and the PR still opens saying which package broke.
+      - name: Install with lifecycle scripts, as the first reported check
         if: steps.changed.outputs.changed == 'true'
-        id: checks
-        env:
-          # Passed as an env var, not interpolated directly into the script
-          # below via ${{ }} — the same template-injection shape as any other
-          # untrusted-looking expression, even though this particular value
-          # is trusted (captured before any dependency code ran). Safe habit,
-          # cheap to keep.
-          DEPS_STAT: ${{ steps.changed.outputs.deps_stat }}
-          # Same treatment, same reason — written before any dependency code
-          # ran, rewritten from this copy once the checks are done.
-          HOLDBACK: ${{ steps.holdback.outputs.holdback }}
+        id: install
         run: |
           set +e
-          # Accumulated in a shell variable, not appended to checks.md as
-          # each check finishes. checks.md is a predictable, allowlisted
-          # path (the tree-verification step below has to accept it, since
-          # this job writes it legitimately) — appending to it DURING the
-          # loop would let a lifecycle or build script overwrite or extend
-          # it with arbitrary content while later checks still trusted it,
-          # and that content lands in the PR body unread. Keeping the report
-          # in memory until every check has finished, then writing the file
-          # ONCE below, means nothing dependency code does mid-loop can
-          # survive into the file at all.
-          report=""
-          check() {
-            echo "::group::$1"
-            eval "$1"
-            rc=$?
-            echo '::endgroup::'
-            if [ $rc -eq 0 ]; then
-              report="${report}- ✅ \`$1\`"$'\n'
-            else
-              report="${report}- ❌ \`$1\` (exit $rc)"$'\n'
-            fi
-          }
           # The real install, with lifecycle scripts, so everything below runs
-          # against the tree a consumer of this lockfile would get. It goes
-          # THROUGH check() rather than in a step of its own: as a step, a
-          # postinstall that fails would kill the job before the artifact
-          # existed, and the whole batch would surface only as a red Actions run
-          # nobody is looking at. As a check it lands in the body with the rest,
-          # and the PR still opens saying which package broke.
-          check 'npm ci'
-          check 'npm run lint'
-          check 'npm test'
-          check 'npm run build'
-          # Both report files written for the first time HERE, now that every
-          # check has run — checks.md from the in-memory report above,
-          # deps-stat.txt from the step output captured before any dependency
-          # code ran. Either write clobbers whatever a lifecycle or build
-          # script may have planted at these paths during the checks above.
-          printf '%s' "$report" > checks.md
-          # \n restored: the multiline GITHUB_OUTPUT capture that produced
-          # $DEPS_STAT strips exactly the one trailing newline `git diff
-          # --stat` always ends with (the value is the joined content
-          # lines, with no newline after the last one). Losing it here would
-          # put the PR body's closing ``` fence on the diffstat's last line
-          # instead of its own, breaking the code block for everything after.
-          printf '%s\n' "$DEPS_STAT" > deps-stat.txt
-          # Empty stays EMPTY: the multiline capture yields the empty string
-          # when nothing was held back, and a `printf '%s\n'` of that would
-          # leave a one-byte file that every `[ -s holdback.md ]` test below
-          # reads as "something was held back" — a PR body announcing a
-          # hold-back section with nothing in it.
-          if [ -n "$HOLDBACK" ]; then
-            printf '%s\n' "$HOLDBACK" > holdback.md
+          # against the tree a consumer of this lockfile would get. This is
+          # where dependency code starts executing in this job.
+          echo '::group::npm ci'
+          npm ci
+          rc=$?
+          echo '::endgroup::'
+          if [ $rc -eq 0 ]; then
+            report="- ✅ \`npm ci\`"
           else
-            : > holdback.md
+            report="- ❌ \`npm ci\` (exit $rc)"
           fi
-          # Both files just got their real, final content — fingerprint them
-          # now, the same way pkg_sha/lock_sha were fingerprinted right after
-          # the resolve step. Every check above ran dependency code in THIS
-          # job; a lifecycle script's background process could still be
-          # alive and rewrite either file on disk before upload-artifact
-          # reads it. A step OUTPUT is out of that process's reach (it lives
-          # in the runner's control plane, not the filesystem), and the
-          # publish job — a fresh runner that never executes dependency code
-          # — verifies the downloaded artifact against it below.
-          echo "checks_sha=$(sha256sum checks.md | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
-          echo "deps_stat_sha=$(sha256sum deps-stat.txt | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
-          echo "holdback_sha=$(sha256sum holdback.md | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
-          cat checks.md >> "$GITHUB_STEP_SUMMARY"
-          # No pass/fail boolean written as this step's own OUTPUT — publish
-          # derives that itself, from checks.md's own (fingerprint-verified)
-          # content, rather than trusting a second, independently-forgeable
-          # value from this same untrusted step. See AGENTS.md "Trust
-          # model" and the "Derive the check verdict" step in publish.
-          #
-          # Every check above ran dependency code, so this step owes the same
-          # containment as the installs: the verify step below invokes `git` and
-          # `sha256sum`, and a planted pair on $GITHUB_PATH would let source
-          # edits through the check whose entire job is catching them.
+          # Handed to the check step below as a step OUTPUT rather than
+          # written to checks.md here: that file is written ONCE, at the end
+          # of the suite, from values nothing in between can reach — see that
+          # step. This output travels in the runner's control plane and joins
+          # checks.md/deps-stat.txt/holdback.md in the residual gap AGENTS.md
+          # "Trust model" already describes, since npm ci's own lifecycle
+          # scripts ran before it was written.
+          {
+            echo 'report<<INSTALL_REPORT_EOF'
+            echo "$report"
+            echo 'INSTALL_REPORT_EOF'
+          } >> "$GITHUB_OUTPUT"
+          # Same containment as every other step that runs dependency code:
+          # the regenerate hook and the checks below invoke git, node and npm,
+          # and a planted pair on $GITHUB_PATH would be theirs to inherit.
           : > "$GITHUB_PATH"
           : > "$GITHUB_ENV"
 
       # Rebuilds a file derived from the dependency set (readmo's import map
       # kept in sync with package-lock.json is the motivating case), one
       # command per line — the npm-update analog of gradle-update's
-      # `regenerate` input. Runs after the checks, reusing the real install
-      # they already did rather than installing a second time, in the SAME
-      # untrusted window. A failure here is a STOP, unlike a failed check
-      # above: publishing a batch whose derived files are stale is the
-      # silent drift this input exists to end.
+      # `regenerate` input. Runs between the install and the rest of the
+      # checks: it reuses that install rather than installing a second time,
+      # and it runs BEFORE lint/test/build so a suite that asserts the
+      # derived file matches the lockfile sees the rebuilt one (see the
+      # install step for the batch that proved why). A failure here is a
+      # STOP, unlike a failed check: publishing a batch whose derived files
+      # are stale is the silent drift this input exists to end.
       - name: Regenerate derived files
         if: steps.changed.outputs.changed == 'true' && inputs.regenerate != ''
         id: regen
@@ -713,13 +669,15 @@ jobs:
             echo "$pretree"
             exit 1
           fi
-          # Fingerprinted before the regenerate commands run, verified
-          # after: checks.md, deps-stat.txt and holdback.md already exist by
-          # now, but
-          # nothing before this point stops a regenerate command — the same
-          # dependency-adjacent code as the checks — from writing to them
-          # too.
-          reports_sha_before=$(sha256sum checks.md deps-stat.txt holdback.md)
+          # holdback.md is the only report file that exists yet — checks.md
+          # and deps-stat.txt are written by the check step AFTER this one,
+          # from values a regenerate command cannot reach, so anything it
+          # planted at those paths is overwritten rather than published.
+          # holdback.md is rewritten there too, from the same kind of trusted
+          # copy; this fingerprint pair is what catches a regenerate command
+          # touching it in the meantime, when the run would otherwise look
+          # clean.
+          reports_sha_before=$(sha256sum holdback.md)
           # Same containment as the checks, but a failure here is a STOP,
           # not a flag: a batch whose derived files could not be rebuilt
           # would publish stale ones.
@@ -732,8 +690,8 @@ jobs:
               eval "$cmd" )
             echo '::endgroup::'
           done <<< "$REGENERATE"
-          if [ "$(sha256sum checks.md deps-stat.txt holdback.md)" != "$reports_sha_before" ]; then
-            echo '::error::a regenerate command modified checks.md, deps-stat.txt or holdback.md — fix the regenerate input; these files belong to the workflow, not to a regeneration command.'
+          if [ "$(sha256sum holdback.md)" != "$reports_sha_before" ]; then
+            echo '::error::a regenerate command modified holdback.md — fix the regenerate input; this file belongs to the workflow, not to a regeneration command.'
             exit 1
           fi
           # sha256sum's own "hash  path" lines, so the publish job can
@@ -773,6 +731,107 @@ jobs:
       # Anything outside the dependency files is a stop, not something to strip
       # silently: a dependency that rewrites your source during install or test
       # is a decision for a human.
+      # The rest of the suite, against a tree the regenerate hook above has
+      # already brought up to date. Every check runs even after one fails, so
+      # the PR body reports the whole picture rather than only the first thing
+      # to break.
+      - name: Run the rest of the check suite
+        if: steps.changed.outputs.changed == 'true'
+        id: checks
+        env:
+          # Passed as an env var, not interpolated directly into the script
+          # below via ${{ }} — the same template-injection shape as any other
+          # untrusted-looking expression, even though this particular value
+          # is trusted (captured before any dependency code ran). Safe habit,
+          # cheap to keep.
+          DEPS_STAT: ${{ steps.changed.outputs.deps_stat }}
+          # Same treatment, same reason — written before any dependency code
+          # ran, rewritten from this copy once the checks are done.
+          HOLDBACK: ${{ steps.holdback.outputs.holdback }}
+          # The install step's own line of the report. Untrusted in exactly
+          # the way checks.md is (see that step) and routed through env: like
+          # every other expression in this file.
+          INSTALL_REPORT: ${{ steps.install.outputs.report }}
+        run: |
+          set +e
+          # Accumulated in a shell variable, not appended to checks.md as
+          # each check finishes. checks.md is a predictable, allowlisted
+          # path (the tree-verification step below has to accept it, since
+          # this job writes it legitimately) — appending to it DURING the
+          # loop would let a lifecycle or build script overwrite or extend
+          # it with arbitrary content while later checks still trusted it,
+          # and that content lands in the PR body unread. Keeping the report
+          # in memory until every check has finished, then writing the file
+          # ONCE below, means nothing dependency code does mid-loop can
+          # survive into the file at all.
+          # Seeded with the install step's line, so checks.md ends up
+          # holding all four checks in the order they ran even though the
+          # first one happened in a different step. The multiline capture
+          # strips the trailing newline, so it goes back on here.
+          report="$INSTALL_REPORT"$'\n'
+          check() {
+            echo "::group::$1"
+            eval "$1"
+            rc=$?
+            echo '::endgroup::'
+            if [ $rc -eq 0 ]; then
+              report="${report}- ✅ \`$1\`"$'\n'
+            else
+              report="${report}- ❌ \`$1\` (exit $rc)"$'\n'
+            fi
+          }
+          check 'npm run lint'
+          check 'npm test'
+          check 'npm run build'
+          # Both report files written for the first time HERE, now that every
+          # check has run — checks.md from the in-memory report above,
+          # deps-stat.txt from the step output captured before any dependency
+          # code ran. Either write clobbers whatever a lifecycle or build
+          # script may have planted at these paths during the checks above.
+          printf '%s' "$report" > checks.md
+          # \n restored: the multiline GITHUB_OUTPUT capture that produced
+          # $DEPS_STAT strips exactly the one trailing newline `git diff
+          # --stat` always ends with (the value is the joined content
+          # lines, with no newline after the last one). Losing it here would
+          # put the PR body's closing ``` fence on the diffstat's last line
+          # instead of its own, breaking the code block for everything after.
+          printf '%s\n' "$DEPS_STAT" > deps-stat.txt
+          # Empty stays EMPTY: the multiline capture yields the empty string
+          # when nothing was held back, and a `printf '%s\n'` of that would
+          # leave a one-byte file that every `[ -s holdback.md ]` test below
+          # reads as "something was held back" — a PR body announcing a
+          # hold-back section with nothing in it.
+          if [ -n "$HOLDBACK" ]; then
+            printf '%s\n' "$HOLDBACK" > holdback.md
+          else
+            : > holdback.md
+          fi
+          # Both files just got their real, final content — fingerprint them
+          # now, the same way pkg_sha/lock_sha were fingerprinted right after
+          # the resolve step. Every check above ran dependency code in THIS
+          # job; a lifecycle script's background process could still be
+          # alive and rewrite either file on disk before upload-artifact
+          # reads it. A step OUTPUT is out of that process's reach (it lives
+          # in the runner's control plane, not the filesystem), and the
+          # publish job — a fresh runner that never executes dependency code
+          # — verifies the downloaded artifact against it below.
+          echo "checks_sha=$(sha256sum checks.md | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          echo "deps_stat_sha=$(sha256sum deps-stat.txt | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          echo "holdback_sha=$(sha256sum holdback.md | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          cat checks.md >> "$GITHUB_STEP_SUMMARY"
+          # No pass/fail boolean written as this step's own OUTPUT — publish
+          # derives that itself, from checks.md's own (fingerprint-verified)
+          # content, rather than trusting a second, independently-forgeable
+          # value from this same untrusted step. See AGENTS.md "Trust
+          # model" and the "Derive the check verdict" step in publish.
+          #
+          # Every check above ran dependency code, so this step owes the same
+          # containment as the installs: the verify step below invokes `git` and
+          # `sha256sum`, and a planted pair on $GITHUB_PATH would let source
+          # edits through the check whose entire job is catching them.
+          : > "$GITHUB_PATH"
+          : > "$GITHUB_ENV"
+
       - name: Verify only dependency files changed
         if: steps.changed.outputs.changed == 'true'
         env:

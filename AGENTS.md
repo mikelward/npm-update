@@ -118,6 +118,25 @@ has stopped biting.
   indistinguishable from "nothing to update", which is the failure this
   whole pass exists to end.
 
+## Ordering inside the update job
+
+- **The regenerate hook runs between the install and the rest of the checks.**
+  It used to run after the whole suite, which meant a consumer whose tests
+  assert a derived file matches the lockfile failed those tests on every batch
+  that moved a pinned package — readmo, whose Deno import map pins
+  `fast-xml-parser` and `sanitize-html`, reported three failures, a
+  `CHECKS FAILING` title and withheld auto-merge on a branch whose own CI then
+  passed. A suite that cries wolf on every real batch is the one nobody reads.
+- **The install is therefore its own step, and still a reported check.** Its
+  verdict travels to the check step as a step output and is prepended to the
+  report, so `checks.md` still holds all four checks exactly once — which is
+  what publish's verdict step requires, and what would close every batch if the
+  hand-off ever dropped it.
+- **Fingerprint-then-check still brackets the derived files.** They are
+  produced and fingerprinted in the same step, and the tree-verification step
+  re-verifies those fingerprints after lint/test/build — so a later check that
+  rewrites one is still caught, exactly as when regeneration ran last.
+
 ## What this repository must not grow
 
 - **No dependencies. No `package.json`, no lockfile, no build step.** What a
