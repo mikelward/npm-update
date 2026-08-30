@@ -1847,6 +1847,166 @@ describe("the working-directory input", () => {
     }
   });
 
+  describe("ignored build outputs a consumer declares", () => {
+    // clothescast's batch aborted here every week from June onward: its
+    // Cloud Functions build emits a gitignored functions/lib/, which is not
+    // one of the built-in outputs, so `npm run build` left the tree
+    // "planted" by this check's reading and no PR ever opened — a security
+    // bump sat open for two months behind it.
+    const verifyStep = doc.jobs.update.steps.find(
+      (s) => s.name === "Verify only dependency files changed",
+    );
+
+    const treeWith = ({ ignoredDir, declared, workingDirectory = "" }) => {
+      const scratch = mkdtempSync(join(tmpdir(), "npm-update-ignored-"));
+      const repo = join(scratch, "repo");
+      const dir = workingDirectory ? join(repo, workingDirectory) : repo;
+      mkdirSync(dir, { recursive: true });
+      const git = (...a) => execFileSync("git", ["-C", repo, ...a], { encoding: "utf8" });
+      const prefix = workingDirectory ? `${workingDirectory}/` : "";
+      writeFileSync(join(dir, "package.json"), "{}\n");
+      writeFileSync(join(dir, "package-lock.json"), "{}\n");
+      writeFileSync(join(repo, ".gitignore"), `${prefix}${ignoredDir}\n`);
+      git("init", "-q");
+      git("config", "user.email", "t@example.com");
+      git("config", "user.name", "t");
+      git("add", "-A");
+      git("-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null", "commit", "-q", "-m", "seed");
+      // What the build leaves behind.
+      mkdirSync(join(dir, ignoredDir), { recursive: true });
+      writeFileSync(join(dir, ignoredDir, "index.js"), "// built\n");
+      writeFileSync(join(dir, "checks.md"), "- ✅ `npm ci`\n");
+      writeFileSync(join(dir, "deps-stat.txt"), " 1 file changed\n");
+      writeFileSync(join(dir, "holdback.md"), "");
+      const sha = (f) =>
+        execFileSync("sh", ["-c", `sha256sum ${f} | cut -d' ' -f1`], { cwd: dir })
+          .toString()
+          .trim();
+      const outPath = join(scratch, "out.txt");
+      const summaryPath = join(scratch, "summary.txt");
+      for (const p of [outPath, summaryPath]) writeFileSync(p, "");
+      try {
+        execFileSync("bash", ["-c", verifyStep.run], {
+          cwd: dir,
+          env: {
+            ...process.env,
+            PKG_SHA: sha("package.json"),
+            LOCK_SHA: sha("package-lock.json"),
+            REGENERATED_FILES: "",
+            REGEN_SHA: "",
+            REGEN_MODE: "",
+            WORKING_DIRECTORY: workingDirectory,
+            IGNORED_BUILD_OUTPUTS: declared,
+            RUNNER_TEMP: scratch,
+            GITHUB_OUTPUT: outPath,
+            GITHUB_STEP_SUMMARY: summaryPath,
+          },
+        });
+        return { ok: true, scratch };
+      } catch (e) {
+        return { ok: false, stdout: e.stdout?.toString() ?? "", scratch };
+      }
+    };
+
+    it("still refuses an undeclared one, so the check keeps its teeth", () => {
+      const r = treeWith({ ignoredDir: "lib", declared: "" });
+      try {
+        expect(r.ok).toBe(false);
+        expect(r.stdout).toContain("Dependency code left IGNORED files in the tree");
+        expect(r.stdout).toContain("lib/");
+      } finally {
+        rmSync(r.scratch, { recursive: true, force: true });
+      }
+    });
+
+    it("accepts exactly what the consumer declared", () => {
+      const r = treeWith({ ignoredDir: "lib", declared: "lib/" });
+      try {
+        expect(r.ok).toBe(true);
+      } finally {
+        rmSync(r.scratch, { recursive: true, force: true });
+      }
+    });
+
+    it("accepts it inside a working directory, where the prefix is stripped first", () => {
+      // clothescast's real shape: the declaration is relative to
+      // working-directory, like regenerated-files and the manifests.
+      const r = treeWith({ ignoredDir: "lib", declared: "lib/", workingDirectory: "functions" });
+      try {
+        expect(r.ok).toBe(true);
+      } finally {
+        rmSync(r.scratch, { recursive: true, force: true });
+      }
+    });
+
+    it("does not let a declaration wave through a path OUTSIDE the working directory", () => {
+      // A repo-root lib/ is not the functions/lib/ the consumer declared,
+      // and the trailing-tab marker the outside branch adds is what keeps
+      // the bare name from satisfying the allowlist.
+      const scratch = mkdtempSync(join(tmpdir(), "npm-update-ignored-outside-"));
+      const repo = join(scratch, "repo");
+      const dir = join(repo, "functions");
+      mkdirSync(dir, { recursive: true });
+      const git = (...a) => execFileSync("git", ["-C", repo, ...a], { encoding: "utf8" });
+      writeFileSync(join(dir, "package.json"), "{}\n");
+      writeFileSync(join(dir, "package-lock.json"), "{}\n");
+      writeFileSync(join(repo, ".gitignore"), "lib/\n");
+      git("init", "-q");
+      git("config", "user.email", "t@example.com");
+      git("config", "user.name", "t");
+      git("add", "-A");
+      git("-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null", "commit", "-q", "-m", "seed");
+      mkdirSync(join(repo, "lib"));
+      writeFileSync(join(repo, "lib", "planted.js"), "// not ours\n");
+      writeFileSync(join(dir, "checks.md"), "- ✅ `npm ci`\n");
+      writeFileSync(join(dir, "deps-stat.txt"), " 1 file changed\n");
+      writeFileSync(join(dir, "holdback.md"), "");
+      const sha = (f) =>
+        execFileSync("sh", ["-c", `sha256sum ${f} | cut -d' ' -f1`], { cwd: dir })
+          .toString()
+          .trim();
+      const outPath = join(scratch, "out.txt");
+      const summaryPath = join(scratch, "summary.txt");
+      for (const p of [outPath, summaryPath]) writeFileSync(p, "");
+      let ok = true;
+      let stdout = "";
+      try {
+        execFileSync("bash", ["-c", verifyStep.run], {
+          cwd: dir,
+          env: {
+            ...process.env,
+            PKG_SHA: sha("package.json"),
+            LOCK_SHA: sha("package-lock.json"),
+            REGENERATED_FILES: "",
+            REGEN_SHA: "",
+            REGEN_MODE: "",
+            WORKING_DIRECTORY: "functions",
+            IGNORED_BUILD_OUTPUTS: "lib/",
+            RUNNER_TEMP: scratch,
+            GITHUB_OUTPUT: outPath,
+            GITHUB_STEP_SUMMARY: summaryPath,
+          },
+        });
+      } catch (e) {
+        ok = false;
+        stdout = e.stdout?.toString() ?? "";
+      } finally {
+        rmSync(scratch, { recursive: true, force: true });
+      }
+      expect(ok).toBe(false);
+      expect(stdout).toContain("Dependency code left IGNORED files in the tree");
+    });
+
+    it("declares the input and routes it through env:, like every other consumer value", () => {
+      expect(doc.on.workflow_call.inputs["ignored-build-outputs"].default).toBe("");
+      expect(verifyStep.env.IGNORED_BUILD_OUTPUTS).toBe("${{ inputs.ignored-build-outputs }}");
+      // Compared as whole records in a loop, never spliced into the grep
+      // pattern: a declared path is data and can hold a metacharacter.
+      expect(verifyStep.run).not.toMatch(/grep -Ev[^\n]*IGNORED_BUILD_OUTPUTS/);
+      expect(verifyStep.run).toContain('for o in "${allowed_ignored[@]}"; do');
+    });
+  });
+
   it("still runs the verify step's tree check exactly as before when working-directory is unset", () => {
     // The default-consumer path, run for real rather than inferred from
     // the fact that the shared step text hasn't changed -- WORKING_DIRECTORY

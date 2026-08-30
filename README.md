@@ -140,6 +140,32 @@ enforces this too, fingerprinting each declared file the same way. Leaving
 both empty (the default) disables the hook entirely — no change for an
 existing consumer that doesn't set them.
 
+## A build that leaves other ignored files behind
+
+The batch refuses to publish when dependency code leaves **gitignored** files
+in the tree — a gitignored file a build step *loads* can inject values into the
+shipped output while the tree still reads as clean. It knows the common build
+outputs (`node_modules/`, `dist/`, `dist-ssr/`, `dev-dist/`, `coverage/`,
+`*.tsbuildinfo`); a build that emits anything else declares it:
+
+```yaml
+    with:
+      working-directory: functions
+      ignored-build-outputs: lib/
+```
+
+One entry per line, relative to `working-directory` (repo-relative when that is
+unset), spelled as `git status --ignored` reports it — a directory keeps its
+trailing slash. Declare only what the build produces: each entry is a path this
+check stops looking at, and a path outside the working directory is still
+refused however it is spelled.
+
+Without it the run aborts *after* its own build step, every week, with
+`Dependency code left IGNORED files in the tree`. clothescast is the case that
+added this input: its Cloud Functions build emits `functions/lib/`, so its
+batch could never open a PR — and a security bump sat open for two months
+behind the batch that should have carried it.
+
 ## Working in a subdirectory
 
 A consumer whose npm tree isn't at the repository root — an Android app with
