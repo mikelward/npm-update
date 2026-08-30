@@ -26,6 +26,14 @@ Deferred work, recorded here so it isn't lost.
 
 ## The extracted workflow
 
+- [ ] **Retire `dispatch-workflows` once every consumer supplies a
+      credential.** It patches one required check at a time; the `token` /
+      `app-id` secrets make the whole `pull_request` round run, which covers
+      the checks nobody has added yet. Keeping both is right while consumers
+      are mid-migration — the dispatch is the fallback when no credential is
+      set — but a consumer that supplies one no longer needs its declared
+      list, and leaving it means two mechanisms for one problem.
+
 - [ ] **Support a consumer with npm workspaces end to end.** The checker
       validates workspace manifests and the hold-back pass now snapshots and
       restores them, but the surrounding workflow still assumes the root pair

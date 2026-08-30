@@ -17,15 +17,22 @@ name: npm update
 # and does not cover. Read "no majors" as guaranteed for what package.json
 # declares, best-effort beneath it.
 
-# The dispatch and PR-open steps below authenticate with the caller's
-# ordinary `GITHUB_TOKEN` — no GitHub App installation token. On a repo
-# where only allowlisted collaborators can trigger CI without approval,
-# that can mean each week's run still needs a human to approve the
-# dispatched checks before they execute, which is an acceptable interim
-# state on the way to full automation, not the end state: swapping in an
-# App-minted token for these steps (e.g. via
-# actions/create-github-app-token) is the planned follow-up once one is
-# set up, so the run stops needing that approval.
+# The push and PR-open steps below authenticate with whichever credential the
+# caller supplied: the `token` secret (a PAT), else an App installation token
+# minted from `app-id`/`app-private-key`, else the ordinary `GITHUB_TOKEN`.
+# That choice decides more than who the pull request is attributed to. A pull
+# request opened by `GITHUB_TOKEN` starts NO `on: pull_request` workflow, so
+# every check the consumer's ruleset requires has to be dispatched by hand —
+# the two hard-coded dispatches below, plus whatever `dispatch-workflows`
+# names — and a required check nobody thought to name holds the batch open
+# forever on a status nothing produces. Opened with a real collaborator's
+# identity the whole `pull_request` round runs on its own, covering the checks
+# required today and the ones added later. The dispatches stay regardless:
+# harmless once redundant, and the fallback when no credential is supplied.
+#
+# The credential lives only in the publish job, which installs nothing and
+# runs no dependency code. The update job — the one that executes whatever the
+# batch resolved — never sees it and keeps its read-only `GITHUB_TOKEN`.
 
 on:
   workflow_call:
@@ -101,6 +108,37 @@ on:
           of which sets this.
         type: string
         default: ''
+    secrets:
+      token:
+        description: >-
+          A personal access token to push the branch and open the pull
+          request with instead of GITHUB_TOKEN. A pull request opened by
+          GITHUB_TOKEN starts no `on: pull_request` workflow, so every check
+          the consumer's ruleset requires has to be dispatched by name, and
+          a required check nobody thought to name holds the batch open
+          forever on a status nothing produces. Opened with a real
+          collaborator's token the whole pull_request round runs on its own,
+          covering the required checks that exist today and the ones added
+          later. Simpler one-time setup than app-id/app-private-key, at the
+          cost of tying the weekly PR to a real user account rather than a
+          scoped, independently-revocable App installation. Optional; omit
+          to keep using GITHUB_TOKEN. Takes priority over
+          app-id/app-private-key if both are set.
+        required: false
+      app-id:
+        description: >-
+          A GitHub App's ID, for minting a short-lived installation token to
+          push and open the pull request with instead of GITHUB_TOKEN — the
+          same effect as `token`, with a credential scoped to an App
+          installation rather than to a person. Optional; omit both this and
+          app-private-key to keep using GITHUB_TOKEN. Providing one without
+          the other is refused: a partial credential mints no token, and
+          failing loudly beats silently falling back to the weaker one.
+        required: false
+      app-private-key:
+        description: The App's private key (the full .pem contents), paired with app-id.
+        required: false
+
 
 # No permissions at the workflow level. The job that runs unreviewed
 # dependency code gets a read-only token; only the publish job, which runs
@@ -1224,6 +1262,15 @@ jobs:
       pull-requests: write
       # Dispatching `ci.yml` on the pushed branch is a write to the Actions API.
       actions: write
+    # Read once into env rather than named as secrets.token / secrets.app-id
+    # directly in the `if:` conditions below: the secrets context is not
+    # available there for a reusable workflow's own workflow_call secrets, so
+    # an `if:` naming them outright would simply never select the intended
+    # branch.
+    env:
+      PAT: ${{ secrets.token }}
+      APP_ID: ${{ secrets.app-id }}
+      APP_PRIVATE_KEY: ${{ secrets.app-private-key }}
     # Same reasoning as the update job's own defaults block: every relative
     # path this job's run: steps read, write, stage, and commit moves inside
     # working-directory together. `inputs.working-directory` is available
@@ -1233,6 +1280,40 @@ jobs:
       run:
         working-directory: ${{ inputs.working-directory || '.' }}
     steps:
+      # A partial App credential mints no token either way, so refuse it
+      # rather than silently falling back to GITHUB_TOKEN — which would read
+      # as "the App is wired up" while the batch quietly went back to opening
+      # pull requests that start no workflows. Skipped once `token` is set:
+      # the App path is irrelevant then (the PAT wins the resolution below),
+      # so a leftover half-removed app-id from a PAT migration must not fail
+      # a run it can no longer affect.
+      - name: Refuse a half-supplied App credential
+        if: env.PAT == '' && (env.APP_ID == '') != (env.APP_PRIVATE_KEY == '')
+        run: |
+          echo "::error::app-id and app-private-key must both be set, or both left empty — one without the other mints no token."
+          exit 1
+
+      # Optional: a consumer that registered an App gets a short-lived
+      # installation token here, so the pull request is authored by a real
+      # collaborator and the consumer's own `on: pull_request` workflows run
+      # for it. Skipped when `token` is set — the PAT takes priority, and
+      # minting a credential the resolution below would discard unused is
+      # pointless.
+      - name: Mint a GitHub App installation token
+        id: app-token
+        if: env.PAT == '' && env.APP_ID != ''
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ env.APP_ID }}
+          private-key: ${{ env.APP_PRIVATE_KEY }}
+          # Named explicitly rather than inheriting the App's whole
+          # installation grant, so the minted token can never be wider than
+          # what this job actually uses even if the App is later installed
+          # with more (zizmor: github-app). Actions is deliberately absent:
+          # the dispatches below stay on GITHUB_TOKEN, which always has it.
+          permission-contents: write
+          permission-pull-requests: write
+
       - uses: actions/checkout@v7
         with:
           # The exact commit the update job tested, not the branch tip.
@@ -1515,7 +1596,26 @@ jobs:
 
       - name: Open the pull request
         env:
-          GH_TOKEN: ${{ github.token }}
+          # The push and the `gh pr` calls below: the PAT if the caller
+          # supplied one, else a minted App token, else GITHUB_TOKEN. The
+          # identity is what decides whether the consumer's own
+          # `on: pull_request` workflows run for this pull request at all —
+          # see the note at the top of this file.
+          GH_TOKEN: ${{ env.PAT || steps.app-token.outputs.token || github.token }}
+          # Always GITHUB_TOKEN, never the PAT or App token: the dispatches
+          # below are Actions API writes, and `permission-contents` /
+          # `permission-pull-requests` are all the minted token is granted.
+          # GITHUB_TOKEN always has actions: write here — it belongs to the
+          # run doing the dispatching — so the dispatch path does not
+          # constrain what scopes a consumer's PAT needs either.
+          DEFAULT_TOKEN: ${{ github.token }}
+          # Whether this run authored with a real collaborator's identity
+          # rather than GITHUB_TOKEN. The body below explains to a reader
+          # which checks ran and why, and that explanation is different in
+          # the two cases — telling a reviewer "CI does not start here on
+          # its own" when it demonstrably did is a false account of what
+          # verified this batch (Codex).
+          NONDEFAULT_TOKEN: ${{ env.PAT != '' || steps.app-token.outputs.token != '' }}
           # From THIS job's own "Derive the check verdict" step, not a
           # `needs.update.outputs.*` value — see AGENTS.md "Trust model".
           # `passed` also drives the auto-merge decision later in this same
@@ -1679,7 +1779,7 @@ jobs:
             pr=${pr_url##*/}
           fi
 
-          if gh workflow run ci.yml --ref "$branch" -f pr="$pr"; then
+          if GH_TOKEN="$DEFAULT_TOKEN" gh workflow run ci.yml --ref "$branch" -f pr="$pr"; then
             ci_started=true
           else
             ci_started=false
@@ -1695,7 +1795,7 @@ jobs:
           # fall back on the way the codex sweep does. So once the ruleset
           # requires it, a batch without this dispatch would block forever.
           # Its `workflow_dispatch` trigger exists for exactly this call.
-          if gh workflow run codex-review-check.yml --ref "$branch"; then
+          if GH_TOKEN="$DEFAULT_TOKEN" gh workflow run codex-review-check.yml --ref "$branch"; then
             check_started=true
           else
             check_started=false
@@ -1714,7 +1814,7 @@ jobs:
             # Blank lines are skipped: an empty input, and the trailing
             # newline a YAML block scalar leaves, both arrive as one.
             [ -n "$wf" ] || continue
-            if ! gh workflow run "$wf" --ref "$branch"; then
+            if ! GH_TOKEN="$DEFAULT_TOKEN" gh workflow run "$wf" --ref "$branch"; then
               undispatched="${undispatched:+$undispatched, }\`$wf\`"
               echo "Could not start $wf on $branch; the PR body says so." \
                 >> "$GITHUB_STEP_SUMMARY"
@@ -1756,7 +1856,18 @@ jobs:
             echo
             echo "$verdict"
             echo
-            if [ "$ci_started" = true ]; then
+            if [ "$NONDEFAULT_TOKEN" = true ]; then
+              # Opened as a real collaborator, so the ordinary pull_request
+              # round ran for this PR on its own and the dispatches above
+              # were belt-and-braces. Saying otherwise would credit the
+              # dispatch for checks the PR started itself, and would tell a
+              # reader that a check absent from the PR was never going to
+              # appear — the opposite of true here.
+              echo '> These ran in the workflow job, not on this PR. This PR was opened'
+              echo '> with a collaborator token rather than `GITHUB_TOKEN`, so the'
+              echo '> ordinary `on: pull_request` workflows started for it as they would'
+              echo '> for any pull request, and report here alongside them.'
+            elif [ "$ci_started" = true ]; then
               echo '> These ran in the workflow job, not on this PR. A PR opened by'
               echo '> `GITHUB_TOKEN` does not trigger `on: pull_request` workflows, so CI'
               echo '> does not start here on its own — this job dispatched `ci.yml` against'
@@ -1771,7 +1882,14 @@ jobs:
             # Reported outside the branch above, so a failed CI dispatch cannot
             # hide a failed check dispatch -- they are separate workflows and
             # either can fail alone.
-            if [ "$check_started" != true ]; then
+            # Both failure notes below explain what the reader should do about a
+            # missing check, and "it cannot start on its own here" is only true
+            # under GITHUB_TOKEN. Opened with a collaborator token the workflow
+            # did start on its own, so a failed dispatch is a duplicate that
+            # failed and says nothing about whether the check reported — claiming
+            # otherwise would send a reader chasing a check that is already
+            # there.
+            if [ "$check_started" != true ] && [ "$NONDEFAULT_TOKEN" != true ]; then
               echo
               echo '> **`codex-review-check` could not be dispatched**, so the workflow pin'
               echo '> is unverified on this PR. It cannot start on its own here either, for'
@@ -1782,7 +1900,7 @@ jobs:
             # workflow that did not start is the case where the PR sits on a
             # required status nothing will ever post, so the reader needs it
             # named rather than inferred from a missing check.
-            if [ -n "$undispatched" ]; then
+            if [ -n "$undispatched" ] && [ "$NONDEFAULT_TOKEN" != true ]; then
               echo
               echo "> **Could not dispatch $undispatched**, so any check it reports is"
               echo '> missing from this PR — and if the ruleset requires one, this PR cannot'

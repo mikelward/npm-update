@@ -827,6 +827,124 @@ describe("npm-update reusable workflow", () => {
 // extraction"), the npm-update analog of gradle-update's `regenerate` /
 // `regenerated-files` inputs, scoped down to this workflow's simpler
 // two-job (update/publish, no review job) shape.
+describe("the credential the pull request is opened with", () => {
+  // What this decides is not attribution but whether the consumer's own
+  // `on: pull_request` workflows run for the batch at all. A PR opened by
+  // GITHUB_TOKEN starts none of them, so every required check has to be
+  // dispatched by name and a check nobody named holds the batch open
+  // forever — the failure `dispatch-workflows` exists to patch one name at
+  // a time, and that a real collaborator's token closes wholesale.
+  const publish = doc.jobs.publish;
+
+  it("declares all three credentials optional, so an unwired consumer is unaffected", () => {
+    const secrets = doc.on.workflow_call.secrets;
+    expect(Object.keys(secrets).sort()).toEqual([
+      "app-id",
+      "app-private-key",
+      "token",
+    ]);
+    for (const name of Object.keys(secrets)) {
+      expect(secrets[name].required).toBe(false);
+    }
+  });
+
+  it("reads them into job env, since `if:` cannot see the secrets context", () => {
+    // For a reusable workflow's OWN workflow_call secrets the secrets
+    // context is unavailable in an `if:`, so a condition naming
+    // secrets.token directly would never select the branch it looks like it
+    // selects — it would read as working and silently always take the
+    // fallback.
+    expect(publish.env).toEqual({
+      PAT: "${{ secrets.token }}",
+      APP_ID: "${{ secrets.app-id }}",
+      APP_PRIVATE_KEY: "${{ secrets.app-private-key }}",
+    });
+  });
+
+  it("refuses half an App credential rather than falling back quietly", () => {
+    // Falling back to GITHUB_TOKEN here would read as "the App is wired up"
+    // while the batch quietly went back to opening pull requests that start
+    // no workflows.
+    const step = publish.steps.find((s) => s.name === "Refuse a half-supplied App credential");
+    expect(step === undefined).toBe(false);
+    expect(step.if).toBe(
+      "env.PAT == '' && (env.APP_ID == '') != (env.APP_PRIVATE_KEY == '')",
+    );
+  });
+
+  it("mints an App token only when no PAT was supplied, and narrows it", () => {
+    const step = publish.steps.find((s) => s.name === "Mint a GitHub App installation token");
+    expect(step === undefined).toBe(false);
+    expect(step.if).toBe("env.PAT == '' && env.APP_ID != ''");
+    expect(step.uses).toMatch(/^actions\/create-github-app-token@/);
+    // Explicitly named rather than inheriting the App's whole installation
+    // grant, so a later widening of the App cannot widen this token.
+    expect(step.with["permission-contents"]).toBe("write");
+    expect(step.with["permission-pull-requests"]).toBe("write");
+    expect("permission-actions" in step.with).toBe(false);
+  });
+
+  it("resolves PAT, then App token, then GITHUB_TOKEN for the push and the PR", () => {
+    const step = publish.steps.find((s) => s.name === "Open the pull request");
+    expect(step.env.GH_TOKEN).toBe(
+      "${{ env.PAT || steps.app-token.outputs.token || github.token }}",
+    );
+  });
+
+  it("keeps the dispatches on GITHUB_TOKEN, so no consumer PAT needs Actions scope", () => {
+    // The minted App token is granted contents and pull-requests only, and
+    // a dispatch is an Actions API write. GITHUB_TOKEN always has it here —
+    // it belongs to the run doing the dispatching — so routing the
+    // dispatches through it keeps them working under every credential and
+    // keeps the scope a consumer's PAT needs down to the two this job
+    // actually uses for authorship.
+    const step = publish.steps.find((s) => s.name === "Open the pull request");
+    expect(step.env.DEFAULT_TOKEN).toBe("${{ github.token }}");
+    const dispatches = [...step.run.matchAll(/^ *(?:if !? ?)?(\S*) ?gh workflow run/gm)];
+    expect(dispatches.length).toBe(3);
+    for (const [, prefix] of dispatches) {
+      expect(prefix).toBe('GH_TOKEN="$DEFAULT_TOKEN"');
+    }
+  });
+
+  it("tells the reader which checks actually ran, per credential", () => {
+    // The body explains what verified the batch. Under GITHUB_TOKEN that is
+    // "CI does not start here on its own, so this job dispatched it"; under a
+    // collaborator token the ordinary pull_request round ran and the dispatch
+    // was belt-and-braces. Printing the first sentence in the second case is
+    // a false account of what checked this PR (Codex) — and the two failure
+    // notes are worse, sending a reader to chase a check that is already
+    // there.
+    const step = publish.steps.find((s) => s.name === "Open the pull request");
+    expect(step.env.NONDEFAULT_TOKEN).toBe(
+      "${{ env.PAT != '' || steps.app-token.outputs.token != '' }}",
+    );
+    expect(step.run).toContain('if [ "$NONDEFAULT_TOKEN" = true ]; then');
+    expect(step.run).toContain("opened'");
+    // Every claim that a check cannot start on its own is gated on the
+    // default token being the one that opened the pull request.
+    for (const guard of [
+      'if [ "$check_started" != true ] && [ "$NONDEFAULT_TOKEN" != true ]; then',
+      'if [ -n "$undispatched" ] && [ "$NONDEFAULT_TOKEN" != true ]; then',
+    ]) {
+      expect(step.run).toContain(guard);
+    }
+  });
+
+  it("never lets the credential reach the job that runs dependency code", () => {
+    // The whole reason a stronger credential is safe here: the update job
+    // installs the batch and runs its lifecycle scripts, and it holds only
+    // a read-only GITHUB_TOKEN. A secret referenced anywhere in that job
+    // would hand an unreviewed package the token that can push to main.
+    const update = JSON.stringify(doc.jobs.update);
+    expect(update).not.toContain("secrets.token");
+    expect(update).not.toContain("secrets.app-id");
+    expect(update).not.toContain("secrets.app-private-key");
+    expect(update).not.toContain("app-token");
+    expect("PAT" in (doc.jobs.update.env ?? {})).toBe(false);
+  });
+});
+
 describe("the regenerate hook", () => {
   it("declares both inputs, defaulting to disabled", () => {
     expect(workflow).toMatch(/^\s*regenerate:\n/m);
