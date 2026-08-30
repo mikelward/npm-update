@@ -137,6 +137,27 @@ has stopped biting.
   re-verifies those fingerprints after lint/test/build — so a later check that
   rewrites one is still caught, exactly as when regeneration ran last.
 
+## A guard that fires on every run is a broken guard
+
+- **The ignored-file check has to be declarable, or the consumer it fires on
+  publishes nothing.** clothescast's Cloud Functions build emits a gitignored
+  `functions/lib/`, which was not one of the built-in build outputs, so every
+  weekly batch aborted after its own build step from June onward — 42 runs, no
+  PR, and a Dependabot security bump left open for two months behind the batch
+  that should have carried it. Nothing alerts on a scheduled workflow that
+  fails, so the symptom was silence. `ignored-build-outputs` is the input the
+  step's own comment had already anticipated.
+- **A declared path is data, so compare it as a whole record.** Splicing
+  consumer values into the `grep -E` pattern would let a metacharacter widen it
+  to paths nobody declared; the loop matches the regenerated-files loop in the
+  tracked scan for the same reason.
+- **Filter declared entries BEFORE stripping the outside-directory marker.**
+  An entry outside `working-directory` carries a trailing tab precisely so a
+  bare name cannot satisfy the allowlist meant for the one inside it — filter
+  after the strip and a repository-root `lib/` passes on a declaration that
+  named `functions/lib/`. Written the wrong way round first; the test that
+  plants exactly that is what caught it.
+
 ## What this repository must not grow
 
 - **No dependencies. No `package.json`, no lockfile, no build step.** What a

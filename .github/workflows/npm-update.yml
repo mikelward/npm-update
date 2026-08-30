@@ -55,6 +55,23 @@ on:
           has. Required when regenerate is set.
         type: string
         default: ''
+      ignored-build-outputs:
+        description: >-
+          Extra GITIGNORED paths this repository's own build leaves behind,
+          one per line, relative to working-directory (repo-relative when
+          that is unset) and spelled as `git status --ignored` reports
+          them — a directory with its trailing slash, e.g. `lib/`. The
+          batch refuses to publish when dependency code leaves ignored
+          files in the tree (a gitignored file a build step LOADS can
+          inject values into the shipped output while the tree still reads
+          as clean), and it already knows the common outputs:
+          node_modules/, dist/, dist-ssr/, dev-dist/, coverage/ and
+          *.tsbuildinfo. A build that emits anything else — a Cloud
+          Functions `lib/`, say — declares it here, or every batch aborts
+          after its own build step. Declare only what the build produces:
+          each entry is a path this check stops looking at.
+        type: string
+        default: ''
       working-directory:
         description: >-
           Directory holding the npm project (package.json,
@@ -852,6 +869,7 @@ jobs:
           # The canonical form the layout step already derived from git, not
           # the raw input — see that step's comment for why.
           WORKING_DIRECTORY: ${{ steps.layout.outputs.dir }}
+          IGNORED_BUILD_OUTPUTS: ${{ inputs.ignored-build-outputs }}
         run: |
           shopt -s lastpipe
           set -euo pipefail
@@ -997,13 +1015,29 @@ jobs:
           # (`!! node_modules/`), which is what makes looking at ignored paths
           # affordable at all. Keep the two calls apart.
           #
-          # The allowlist is build OUTPUTS. A repo whose build leaves other
-          # ignored paths behind needs its own copy of this workflow until this
-          # list becomes an input — see AGENTS.md "The extraction".
+          # The allowlist is build OUTPUTS: the common ones are baked in
+          # below, and a repository whose build emits anything else declares
+          # it in `ignored-build-outputs` (clothescast's Cloud Functions
+          # `lib/` is the motivating case — its batch aborted here every
+          # week from June onward, which is how a security bump sat open for
+          # two months while the weekly batch that should have carried it
+          # could never open a PR).
+          #
+          # Declared entries are compared as WHOLE RECORDS in a loop rather
+          # than spliced into the grep pattern below: a consumer's value is
+          # data, and a path holding a regex metacharacter would otherwise
+          # widen the pattern to match paths nobody declared — the same
+          # reasoning as the regenerated-files loop in the tracked scan
+          # above, which also takes a loop rather than a multi-pattern grep.
           #
           # Same reason as the git status call above: run bare, not inside
           # the pipe that ends in `|| true`, so a genuine git-status failure
           # trips `set -e` instead of being read as "no planted files."
+          allowed_ignored=()
+          while IFS= read -r o; do
+            [ -z "$o" ] && continue
+            allowed_ignored+=("$o")
+          done <<< "${IGNORED_BUILD_OUTPUTS:-}"
           status_ignored=$(git status --porcelain --ignored)
           planted=$(printf '%s\n' "$status_ignored" \
             | grep '^!! ' \
@@ -1029,6 +1063,31 @@ jobs:
                 esac
               done \
             | grep -Ev '^(node_modules/|dist/|dist-ssr/|dev-dist/|coverage/|[^/]*\.tsbuildinfo)$' || true)
+          # The declared outputs, dropped from what survived the built-in
+          # allowlist — BEFORE the trailing tab is stripped below, which is
+          # load-bearing rather than incidental: an entry outside the
+          # working directory still carries that tab, precisely so a bare
+          # name cannot satisfy an allowlist meant for the one inside it,
+          # and filtering after the strip would let a repository-root
+          # `lib/` through on a declaration that named `functions/lib/`.
+          # Caught by the test that plants exactly that.
+          if [ "${#allowed_ignored[@]}" -gt 0 ] && [ -n "$planted" ]; then
+            remaining=""
+            while IFS= read -r p; do
+              [ -z "$p" ] && continue
+              keep=1
+              for o in "${allowed_ignored[@]}"; do
+                if [ "$p" = "$o" ]; then
+                  keep=0
+                  break
+                fi
+              done
+              if [ "$keep" -eq 1 ]; then
+                remaining="$remaining$p"$'\n'
+              fi
+            done <<< "$planted"
+            planted=${remaining%$'\n'}
+          fi
           planted=$(printf '%s\n' "$planted" | sed 's/\t$//')
           if [ -n "$planted" ]; then
             echo '::error::Dependency code left IGNORED files in the tree. Git would not commit them, but the build could read them. Not opening a PR — inspect these:'
