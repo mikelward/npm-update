@@ -727,6 +727,47 @@ describe("npm-update reusable workflow", () => {
     ).toBeGreaterThan(ciElse);
   });
 
+  it("dispatches every workflow the consumer declared, by name", () => {
+    // Same failure as ci.yml and codex-review-check above -- a PR opened by
+    // GITHUB_TOKEN starts no `on: pull_request` workflow -- but WHICH other
+    // workflows a repository's ruleset requires differs per consumer, so
+    // they are declared rather than hard-coded. Read through env: like every
+    // other consumer-declared value, never spliced into the script.
+    expect(workflow).toContain("dispatch-workflows:");
+    expect(publish).toContain(
+      "DISPATCH_WORKFLOWS: ${{ inputs.dispatch-workflows }}",
+    );
+    expect(publish).toContain('gh workflow run "$wf" --ref "$branch"');
+    expect(publish).toContain('done <<< "${DISPATCH_WORKFLOWS:-}"');
+    // Dispatched before the body is composed, like the other two, so the
+    // body can state what actually happened rather than promise a run.
+    expect(publish.indexOf('gh workflow run "$wf"')).toBeLessThan(
+      publish.indexOf("} > body.md"),
+    );
+  });
+
+  it("names an undispatched workflow in the PR body, after the other two", () => {
+    // The whole point of the input is a REQUIRED check nothing can produce,
+    // so a silent failure here is the exact state it exists to prevent: the
+    // PR would sit pending with no explanation on the artifact its reader
+    // actually opens.
+    expect(publish).toContain("**Could not dispatch $undispatched**");
+    // Reported on its own, not inside either sibling's else-branch: the
+    // three dispatches fail independently, and one hiding another is the
+    // bug this ordering is asserted against.
+    const ciElse = publish.indexOf("**CI could not be started on this branch");
+    const checkElse = publish.indexOf(
+      "**`codex-review-check` could not be dispatched**",
+    );
+    const declaredElse = publish.indexOf("**Could not dispatch $undispatched**");
+    expect(declaredElse).toBeGreaterThan(ciElse);
+    expect(declaredElse).toBeGreaterThan(checkElse);
+    // A blank declaration must dispatch nothing rather than run `gh workflow
+    // run ""` once -- the trailing newline of a YAML block scalar arrives
+    // the same way an empty input does.
+    expect(publish).toMatch(/\[ -n "\$wf" \] \|\| continue/);
+  });
+
   it("puts the PR in front of a human, derived from the consumer's own owner", () => {
     expect(publish).toContain("--add-assignee");
     expect(publish).toContain("--add-reviewer");

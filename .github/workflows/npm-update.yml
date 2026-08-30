@@ -72,6 +72,22 @@ on:
           each entry is a path this check stops looking at.
         type: string
         default: ''
+      dispatch-workflows:
+        description: >-
+          Extra workflow files to dispatch against the pushed branch, one
+          per line, named as the file (`zizmor.yml`). `ci.yml` and
+          `codex-review-check.yml` are always dispatched and are not
+          declared here. This exists because a PR opened by `GITHUB_TOKEN`
+          starts no `on: pull_request` workflow, so a check the consumer's
+          ruleset REQUIRES but nothing dispatches leaves every batch pending
+          forever on a status that cannot be produced. Each file needs its
+          own `workflow_dispatch` trigger on the default branch — a workflow
+          GitHub cannot see there is not dispatchable, however the branch
+          under test spells it. Declare only required checks: a dispatch
+          that fails is reported in the PR body, so naming a workflow the
+          batch does not need buys a warning and nothing else.
+        type: string
+        default: ''
       working-directory:
         description: >-
           Directory holding the npm project (package.json,
@@ -1521,6 +1537,10 @@ jobs:
           RUN_NUMBER: ${{ github.run_number }}
           RUN_ATTEMPT: ${{ github.run_attempt }}
           REGENERATED_FILES: ${{ inputs.regenerated-files }}
+          # Consumer-declared, so inert-by-env matters here for the usual
+          # reason — and the loop below reads each line as a workflow file
+          # name handed to `gh workflow run`, never as shell.
+          DISPATCH_WORKFLOWS: ${{ inputs.dispatch-workflows }}
           # Empty unless the update job's regenerate step actually ran and
           # fingerprinted the declared files — drives the title/verdict
           # branch and withholds auto-merge below. See AGENTS.md "Trust
@@ -1684,6 +1704,24 @@ jobs:
               >> "$GITHUB_STEP_SUMMARY"
           fi
 
+          # Whatever else this consumer's ruleset requires. Same rule as the
+          # two above and the same failure if it is missed -- a required
+          # check nothing can dispatch holds the batch open forever -- but
+          # which workflows those are differs per repository, so they are
+          # declared rather than hard-coded. Collected into one list rather
+          # than a flag each, since the body reports them by name.
+          undispatched=''
+          while IFS= read -r wf; do
+            # Blank lines are skipped: an empty input, and the trailing
+            # newline a YAML block scalar leaves, both arrive as one.
+            [ -n "$wf" ] || continue
+            if ! gh workflow run "$wf" --ref "$branch"; then
+              undispatched="${undispatched:+$undispatched, }\`$wf\`"
+              echo "Could not start $wf on $branch; the PR body says so." \
+                >> "$GITHUB_STEP_SUMMARY"
+            fi
+          done <<< "${DISPATCH_WORKFLOWS:-}"
+
           # The opening claim has to survive a hold-back: "every dependency
           # moved" is simply false for the ones listed below it, and a
           # reader has no way to tell a package that had nothing new from
@@ -1740,6 +1778,17 @@ jobs:
               echo '> is unverified on this PR. It cannot start on its own here either, for'
               echo '> the same reason CI cannot. Push any commit to the branch, or re-run'
               echo '> that workflow against it by hand.'
+            fi
+            # Same reasoning again, and reported separately again: a declared
+            # workflow that did not start is the case where the PR sits on a
+            # required status nothing will ever post, so the reader needs it
+            # named rather than inferred from a missing check.
+            if [ -n "$undispatched" ]; then
+              echo
+              echo "> **Could not dispatch $undispatched**, so any check it reports is"
+              echo '> missing from this PR — and if the ruleset requires one, this PR cannot'
+              echo '> merge until it runs. Push any commit to the branch, or re-run those'
+              echo '> workflows against it by hand.'
             fi
             echo
             # Which packages moved, direct vs transitive, with ranges and
