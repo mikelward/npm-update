@@ -80,20 +80,27 @@ did. Beneath the manifest the promise is weaker: a subdependency whose own
 range is `*` or `>=x` can take a major, or a 0.x minor (which a caret pins),
 without anything showing up in the `package.json` diff.
 
-When that happens the batch is **not** abandoned. The workflow rebuilds it
-one declared package at a time, validating after each, and reverts only the
-package whose own move drags a subdependency across a breaking boundary;
-everything else lands as usual. The PR body says so under **Held back**, with
-the crossing that blocked each package, and they stay held until someone does
-the migration deliberately — which is the point, since that migration is
-exactly what an unattended weekly job must not attempt.
+When that happens the batch is **not** abandoned. The workflow rebuilds it one
+package at a time, validating after each, and reverts only the package whose
+own move drags a subdependency across a breaking boundary; everything else
+lands as usual. The PR body says so under **Held back**, with the crossing that
+blocked each package, and they stay held until someone does the migration
+deliberately — which is the point, since that migration is exactly what an
+unattended weekly job must not attempt.
 
-Sometimes the rebuild holds back *nothing* and still changes the outcome: a
-bare `npm update` walks the whole tree, while `npm update <name>` re-resolves
-one package's subtree, so a crossing can live in a subdependency the rebuild
-simply never reaches. The PR body reports that case too, naming the crossing —
-otherwise it would claim every dependency moved while one deliberately did
-not.
+"One package at a time" means every name the repository declares *and* every
+name the bulk resolve moved underneath them. The transitives have to be in
+that list: a bare `npm update` walks the whole tree, while
+`npm update <name>` re-resolves one package's subtree, so a rebuild driven by
+the declared names alone keeps the direct moves and quietly drops every
+transitive one — including, on the run that exposed this, a security fix the
+batch existed to carry. A transitive name is a fine argument to `npm update`
+and writes to no manifest, so it costs a round and nothing else.
+
+Sometimes the rebuild holds back *nothing* and still changes the outcome: the
+shape npm resolved the whole tree into is not always reachable one package at
+a time. The PR body reports that case too, naming the crossing — otherwise it
+would claim every dependency moved while one deliberately did not.
 
 Two consequences worth knowing:
 
@@ -102,9 +109,10 @@ Two consequences worth knowing:
   silence either.
 - The rebuild only runs in a week the batch would otherwise have shipped
   nothing at all, so the ordinary week costs exactly what it did before. On a
-  week it does run, the job takes one `npm update` per declared package —
-  minutes rather than the usual seconds, on the same free Actions runners, for
-  a batch that would otherwise not have happened.
+  week it does run, the job takes one `npm update` per candidate — the
+  declared names plus whatever the bulk resolve moved beneath them, so minutes
+  rather than the usual seconds, on the same free Actions runners, for a batch
+  that would otherwise not have happened.
 
 ## Regenerating a derived file
 

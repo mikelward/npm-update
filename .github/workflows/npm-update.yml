@@ -347,6 +347,14 @@ jobs:
             echo 'The bulk resolve is not publishable as-is; rebuilding it one package at a time.'
             printf '%s\n' "$bulk" | sed 's/^::error:://'
 
+            # BEFORE the restore below, and that ordering is load-bearing:
+            # half of what this reports is the set of names the BULK resolve
+            # moved, which is only on disk until the manifests go back to
+            # HEAD. Its own assignment for the same reason `manifests` has
+            # one — a command substitution that fails inside the `for` list
+            # yields an empty list and the loop silently does nothing.
+            candidates=$(node "$CHECKER" candidates)
+
             # EVERY manifest the batch can rewrite, not just the root pair:
             # `npm update --save` writes the new range into whichever
             # manifest declares the dependency, which for a workspace's
@@ -361,13 +369,6 @@ jobs:
               [ -n "$m" ] && manifests+=("$m")
             done <<< "$(node "$CHECKER" manifests)"
             git checkout HEAD -- "${manifests[@]}"
-            # Its own assignment rather than inline in the `for` list below:
-            # a command substitution that fails there yields an EMPTY list
-            # and the loop simply does nothing, so a checker that could not
-            # read the manifests at all would look exactly like a repository
-            # with no dependencies. As a simple command, `set -e` stops the
-            # job on it.
-            names=$(node "$CHECKER" names)
             # A byte-exact copy to roll back to, so a rejected package leaves
             # no trace — restoring from a shell variable would drop the
             # trailing newline npm writes and register as a change of its
@@ -376,7 +377,7 @@ jobs:
             # directory is safe here specifically because no dependency code
             # has run in this job yet.
             snapshot=$(mktemp -d)
-            for name in $names; do
+            for name in $candidates; do
               tar -cf "$snapshot/manifests.tar" -- "${manifests[@]}"
               if ! attempt=$(npm update --save --ignore-scripts -- "$name" 2>&1); then
                 # `|| true` on both extractions below, and only there: the
@@ -403,20 +404,18 @@ jobs:
             done
             rm -rf -- "$snapshot"
 
-            # The rebuild is reported whether or not it held a DECLARED
-            # package back, because it changes what ships either way. The
-            # gedmap pilot landed exactly in the second case: the crossing
-            # was under a subdependency that only a bare `npm update` reaches
-            # (it updates the whole tree; `npm update <name>` re-resolves one
-            # package's subtree), so rebuilding avoided it without any
-            # declared package needing to be held. Saying nothing there would
-            # leave the PR claiming every dependency moved while a
-            # subdependency deliberately did not.
+            # The rebuild is reported whether or not it held anything back,
+            # because it changes what ships either way. The second branch is
+            # the case where no single candidate reproduced the crossing —
+            # npm resolved the whole tree into a shape none of the individual
+            # re-resolves reaches. Saying nothing there would leave the PR
+            # claiming every dependency moved while something deliberately
+            # did not.
             if [ -s holdback.md ]; then
               printf '%s\n\n%s\n' 'The bulk resolve crossed a breaking boundary, so this batch was rebuilt one package at a time. These were held back:' "$(cat holdback.md)" > holdback.md
             else
               {
-                echo 'The bulk resolve crossed a breaking boundary, so this batch was rebuilt one package at a time. No declared package had to be held back — the crossing was under a subdependency the rebuild simply does not take:'
+                echo 'The bulk resolve crossed a breaking boundary, so this batch was rebuilt one package at a time. No package had to be held back — no single re-resolve reproduced the crossing:'
                 echo
                 printf '%s\n' "$bulk" | sed 's/^::error:://;s/^/- /'
               } > holdback.md
