@@ -36,7 +36,9 @@ import {
   resolveEdge,
   allFailures,
   directDependencyNames,
+  isWalkableLock,
   manifestPaths,
+  rebuildCandidates,
   updateSummary,
   workspacePaths,
 } from './check-npm-update.mjs'
@@ -1947,6 +1949,163 @@ describe('updateSummary', () => {
 // regression this pins is the pathspec's cwd-relativity, and a repo-rooted
 // `HEAD:package.json` would look identical to every pure-function test while
 // failing from any nested directory.
+describe('rebuildCandidates', () => {
+  // The hold-back pass re-resolves one candidate at a time, so this list IS
+  // the search space. A transitive the bulk resolve moved and this list omits
+  // is a move the rebuild silently drops — which is how clothescast's first
+  // batch shipped without the security fix it was meant to carry.
+  // Every fixture carries a root record, because every real lockfile does
+  // and the walkability guard now requires one — a rootless map is refused
+  // outright, which the dedicated test below covers.
+  const lock = (entries) => ({
+    packages: { '': {}, ...Object.fromEntries(entries.map(([path, version]) => [path, { version }])) },
+  })
+
+  it('offers the declared names first, then the transitives the bulk moved', () => {
+    expect(
+      rebuildCandidates({
+        manifestBefore: { dependencies: { react: '^19.0.0' } },
+        lockBefore: lock([['', undefined], ['node_modules/react', '19.0.0'], ['node_modules/form-data', '2.5.5']]),
+        lockAfter: lock([['', undefined], ['node_modules/react', '19.1.0'], ['node_modules/form-data', '2.5.6']]),
+      }),
+    ).toEqual(['react', 'form-data'])
+  })
+
+  it('leaves out a transitive that did not move, so no round is spent on it', () => {
+    expect(
+      rebuildCandidates({
+        manifestBefore: { dependencies: { react: '^19.0.0' } },
+        lockBefore: lock([['node_modules/react', '19.0.0'], ['node_modules/stable', '1.0.0']]),
+        lockAfter: lock([['node_modules/react', '19.1.0'], ['node_modules/stable', '1.0.0']]),
+      }),
+    ).toEqual(['react'])
+  })
+
+  it('counts a nested copy appearing or vanishing as the name having moved', () => {
+    // Same version, one more copy: the multiset changed, so the name is a
+    // candidate. A plain set of versions would call this unchanged.
+    expect(
+      rebuildCandidates({
+        manifestBefore: {},
+        lockBefore: lock([['node_modules/dep', '1.0.0']]),
+        lockAfter: lock([['node_modules/dep', '1.0.0'], ['node_modules/a/node_modules/dep', '1.0.0']]),
+      }),
+    ).toEqual(['dep'])
+  })
+
+  it('does not repeat a declared name that also moved as a nested copy', () => {
+    expect(
+      rebuildCandidates({
+        manifestBefore: { dependencies: { dep: '^1.0.0' } },
+        lockBefore: lock([['node_modules/dep', '1.0.0']]),
+        lockAfter: lock([['node_modules/dep', '1.1.0'], ['node_modules/a/node_modules/dep', '1.0.0']]),
+      }),
+    ).toEqual(['dep'])
+  })
+
+  it('counts two copies trading versions between paths, whose multiset is unchanged', () => {
+    // Codex's finding: comparing the sorted versions alone calls this pair
+    // unmoved — the multiset is ['1.0.0', '2.0.0'] on both sides — so the
+    // name is never attempted and the bulk's reshuffle is dropped in
+    // silence.
+    expect(
+      rebuildCandidates({
+        manifestBefore: {},
+        lockBefore: lock([['node_modules/a/node_modules/dep', '1.0.0'], ['node_modules/b/node_modules/dep', '2.0.0']]),
+        lockAfter: lock([['node_modules/a/node_modules/dep', '2.0.0'], ['node_modules/b/node_modules/dep', '1.0.0']]),
+      }),
+    ).toEqual(['dep'])
+  })
+
+  it('counts a copy that relocated at the same version, erring toward one wasted round', () => {
+    // Coarser than the PR-body summary on purpose: it stays silent here,
+    // because the inventory is identical. A missed candidate costs a
+    // dropped move that nothing reports; an extra one costs an `npm update`
+    // that does nothing.
+    expect(
+      rebuildCandidates({
+        manifestBefore: {},
+        lockBefore: lock([['node_modules/a/node_modules/dep', '1.0.0']]),
+        lockAfter: lock([['node_modules/dep', '1.0.0']]),
+      }),
+    ).toEqual(['dep'])
+  })
+
+  it('sorts the transitives, so a lockfile\'s path order cannot change what ships', () => {
+    expect(
+      rebuildCandidates({
+        manifestBefore: {},
+        lockBefore: lock([['node_modules/zeta', '1.0.0'], ['node_modules/alpha', '1.0.0']]),
+        lockAfter: lock([['node_modules/zeta', '1.1.0'], ['node_modules/alpha', '1.1.0']]),
+      }),
+    ).toEqual(['alpha', 'zeta'])
+  })
+
+  it('degrades to the declared names for a packages map with no root record', () => {
+    // Codex's finding: `allFailures` refuses this shape too — a map with no
+    // root record seeds no consumer — so diffing it for candidates enqueues
+    // the whole readable tree ahead of a validation that fails regardless.
+    const rootless = { packages: { 'node_modules/a': { version: '1.0.0' } } }
+    const walkable = lock([['', undefined], ['node_modules/a', '2.0.0']])
+    expect(
+      rebuildCandidates({ manifestBefore: { dependencies: { react: '^19.0.0' } }, lockBefore: rootless, lockAfter: walkable }),
+    ).toEqual(['react'])
+  })
+
+  it('asks the same walkability question the validator refuses on', () => {
+    // The two must not drift: a shape `allFailures` calls unwalkable is one
+    // whose diff means nothing. Asserted across the shapes rather than by
+    // sharing a branch, since allFailures reports each with its own message.
+    const manifest = { dependencies: {} }
+    const shapes = [
+      { lockfileVersion: 1 },
+      { packages: null },
+      { packages: {} },
+      { packages: { 'node_modules/a': { version: '1.0.0' } } },
+      { packages: { '': {} } },
+      { packages: { '': {}, 'node_modules/a': { version: '1.0.0' } } },
+    ]
+    // The fixtures have to exercise both answers, or an assertion that every
+    // shape agrees is vacuously true.
+    expect(shapes.filter(isWalkableLock).length).toBe(2)
+    for (const shape of shapes) {
+      const refused = allFailures({
+        manifestBefore: manifest,
+        manifestAfter: manifest,
+        lockBefore: shape,
+        lockAfter: shape,
+      }).some((f) => f.includes('no "packages" section') || f.includes('no root record'))
+      expect(isWalkableLock(shape)).toBe(!refused)
+    }
+  })
+
+  it('degrades to the declared names when only ONE side is walkable', () => {
+    // Codex's finding: an empty map substituted for just the unreadable side
+    // makes every package on the other side look moved — the whole tree in
+    // the candidate list, a registry resolve each. Both directions, since a
+    // format change can go either way.
+    const walkable = lock([['node_modules/a', '1.0.0'], ['node_modules/b', '2.0.0']])
+    expect(
+      rebuildCandidates({ manifestBefore: { dependencies: { react: '^19.0.0' } }, lockBefore: {}, lockAfter: walkable }),
+    ).toEqual(['react'])
+    expect(
+      rebuildCandidates({ manifestBefore: { dependencies: { react: '^19.0.0' } }, lockBefore: walkable, lockAfter: {} }),
+    ).toEqual(['react'])
+  })
+
+  it('degrades to the declared names when the lockfile is not walkable', () => {
+    // Not to an empty list: that would hold every package back and fail the
+    // batch loudly on a lockfile shape the walk simply cannot read.
+    expect(
+      rebuildCandidates({
+        manifestBefore: { dependencies: { react: '^19.0.0' } },
+        lockBefore: {},
+        lockAfter: {},
+      }),
+    ).toEqual(['react'])
+  })
+})
+
 describe('manifestPaths', () => {
   // The hold-back pass restores these before it re-resolves and after it
   // rejects a package. A path missing here is a file the rebuild silently
@@ -2045,9 +2204,9 @@ describe('the CLI run from a nested npm tree', () => {
     expect(summary).toContain('`dep` 1.0.0 → 1.0.1')
   })
 
-  it('lists the declared names from the same subdirectory, one per line', () => {
+  it('lists the rebuild candidates from the same subdirectory, one per line', () => {
     const cwd = join(repoWithNestedTree(), 'backend')
-    expect(runFrom(cwd, 'names')).toBe('dep\n')
+    expect(runFrom(cwd, 'candidates')).toBe('dep\n')
   })
 
   it('lists the manifest paths from the same subdirectory', () => {
@@ -2068,10 +2227,9 @@ describe('the CLI run from a nested npm tree', () => {
 })
 
 describe('directDependencyNames', () => {
-  // The hold-back pass re-resolves one declared package at a time, so this
-  // list IS the search space: a name missing from it is a package the pass
-  // can never move, and a name that does not belong is an `npm update` the
-  // pass spends a round on for nothing.
+  // These lead the hold-back pass's candidate list, so a name missing from
+  // here is a package the pass can never move, and a name that does not
+  // belong is an `npm update` the pass spends a round on for nothing.
   it('names every section the root manifest declares, sorted and deduped', () => {
     expect(
       directDependencyNames({

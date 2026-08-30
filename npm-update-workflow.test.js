@@ -2357,7 +2357,7 @@ describe("the hold-back pass, run", () => {
   // moved, one per line. The stub npm appends the name it is told to
   // update; the stub checker fails when that list contains a name the
   // scenario declares blocked, reporting it the way the real one does.
-  const scenario = ({ declared, blocked, npmFails = [], npmSilent = false, workspace = null, bulkOnly = [] }) => {
+  const scenario = ({ declared, blocked, npmFails = [], npmNoops = [], npmSilent = false, workspace = null, bulkOnly = [] }) => {
     const scratch = mkdtempSync(join(tmpdir(), "npm-update-holdback-"));
     const repo = join(scratch, "repo");
     mkdirSync(repo);
@@ -2390,8 +2390,15 @@ describe("the hold-back pass, run", () => {
         `const declared = ${JSON.stringify(declared)}`,
         `const blocked = ${JSON.stringify(blocked)}`,
         `const workspace = ${JSON.stringify(workspace)}`,
-        "if (process.argv[2] === 'names') {",
-        "  process.stdout.write(declared.join('\\n') + '\\n')",
+        // Declared names, then whatever else the resolve on disk moved —
+        // the real checker's own shape, and read from the lockfile that is
+        // present WHEN IT IS CALLED, so a call made after the restore would
+        // report a shorter list. That ordering is what the step has to get
+        // right.
+        "if (process.argv[2] === 'candidates') {",
+        "  const onDisk = readFileSync('package-lock.json', 'utf8').split('\\n').filter(Boolean)",
+        "  const extra = onDisk.filter((n) => !declared.includes(n)).sort()",
+        "  process.stdout.write([...declared, ...extra].join('\\n') + '\\n')",
         "  process.exit(0)",
         "}",
         "if (process.argv[2] === 'manifests') {",
@@ -2417,6 +2424,12 @@ describe("the hold-back pass, run", () => {
         'name="${@: -1}"',
         `for f in ${npmFails.join(" ") || "__none__"}; do`,
         `  if [ "$f" = "$name" ]; then ${npmSilent ? "" : 'echo "npm error code E404" >&2; '}exit 1; fi`,
+        "done",
+        // A name npm resolves successfully and moves nothing for — the
+        // ordinary answer for a transitive already at the newest version
+        // its parent's range allows.
+        `for n in ${npmNoops.join(" ") || "__none__"}; do`,
+        '  if [ "$n" = "$name" ]; then exit 0; fi',
         "done",
         'printf "%s\\n" "$name" >> package-lock.json',
         'printf "{\\"$name\\":1}\\n" > package.json',
@@ -2558,18 +2571,44 @@ describe("the hold-back pass, run", () => {
     }
   });
 
-  it("reports a rebuild that held no declared package back, rather than claiming everything moved", () => {
-    // The gedmap pilot's actual shape: the crossing was under a
-    // subdependency only the bare `npm update` reaches, so rebuilding
-    // avoided it without any declared package needing to be held. Saying
-    // nothing would leave the PR body claiming every dependency moved while
-    // a subdependency deliberately did not.
-    const s = scenario({ declared: ["a", "b"], blocked: ["transitive-x"], bulkOnly: ["transitive-x"] });
+  it("keeps the transitives the bulk moved, instead of shipping the direct moves alone", () => {
+    // The regression that let clothescast's first batch ship two direct
+    // moves and silently drop the security fix it existed to carry. A bare
+    // `npm update` walks the whole tree; `npm update <name>` re-resolves one
+    // package's subtree — so a rebuild driven by the DECLARED names alone
+    // keeps nothing the bulk took transitively, and the PR body then reports
+    // "0 transitive" as though there had been nothing to take.
+    const s = scenario({ declared: ["a", "b"], blocked: ["x"], bulkOnly: ["form-data", "x"] });
+    try {
+      const r = s.run();
+      expect(r.ok).toBe(true);
+      // The transitive that moved cleanly survives; only the crossing one is
+      // held back, and it is named rather than described as a bulk error.
+      expect(s.moved()).toEqual(["a", "b", "form-data"]);
+      expect(s.holdback()).toContain("`x`");
+      expect(s.holdback()).not.toContain("`form-data`");
+    } finally {
+      rmSync(s.scratch, { recursive: true, force: true });
+    }
+  });
+
+  it("reports a rebuild that held nothing back, rather than claiming everything moved", () => {
+    // The crossing no single re-resolve reproduces: every candidate is
+    // attempted and accepted, and the shape the bulk produced is simply not
+    // reachable one package at a time. Saying nothing would leave the PR
+    // body claiming every dependency moved while something deliberately did
+    // not.
+    const s = scenario({
+      declared: ["a", "b"],
+      blocked: ["transitive-x"],
+      bulkOnly: ["transitive-x"],
+      npmNoops: ["transitive-x"],
+    });
     try {
       const r = s.run();
       expect(r.ok).toBe(true);
       expect(s.moved()).toEqual(["a", "b"]);
-      expect(s.holdback()).toContain("No declared package had to be held back");
+      expect(s.holdback()).toContain("No package had to be held back");
       // And it names the crossing that made the rebuild necessary, so the
       // reader knows what did not move.
       expect(s.holdback()).toContain("transitive-x");

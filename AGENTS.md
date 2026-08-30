@@ -89,13 +89,43 @@ has stopped biting.
   PR opened anywhere and every other package that moved cleanly waited behind
   it, with nothing but a failed scheduled run to say so.
 - **The rebuild is incremental, not attributive.** The hold-back step goes
-  back to HEAD and re-resolves one declared package at a time, validating
-  after each and reverting the ones that fail. That makes the result correct
-  by construction — every accepted state validates, so the final one does —
+  back to HEAD and re-resolves one package at a time, validating after each
+  and reverting the ones that fail. That makes the result correct by
+  construction — every accepted state validates, so the final one does —
   rather than depending on tracing a crossing back to whichever direct
   dependency "caused" it, which a hoisted or shared subdependency makes a
   guess. It runs only in a week the batch would otherwise have shipped
   nothing.
+- **The candidate set is the declared names PLUS every name the bulk resolve
+  moved.** Declared names alone silently narrow the batch: a bare
+  `npm update` walks the whole tree, `npm update <name>` re-resolves one
+  package's subtree, so a rebuild driven by the declared list keeps the
+  direct moves and drops every transitive one — and the PR body then reports
+  "0 transitive" as if there had been nothing to take. clothescast's first
+  batch shipped exactly that, leaving behind the `form-data` security fix a
+  Dependabot PR had been waiting on since June, because a crossing under an
+  unrelated subdependency had sent it down the rebuild path. A transitive
+  name is a fine argument to `npm update` — it writes to no manifest — so
+  this needed a longer list, not a new mechanism.
+- **A candidate is a name whose copies differ by PATH or by version.** Two
+  copies trading versions between lockfile paths leave the version multiset
+  identical while the tree really changed, so a multiset comparison drops that
+  move in silence (Codex, on review of this pass). Being coarser than the
+  PR-body summary here is deliberate: an extra candidate costs one `npm
+  update` that does nothing, a missing one costs a move nothing reports.
+- **An unreadable lockfile on EITHER side degrades to the declared names.**
+  Substituting an empty map for just the unreadable one makes every package on
+  the other side look moved — the whole tree in the candidate list, a registry
+  resolve each, which is the opposite of degrading (Codex). "Unreadable" is
+  `isWalkableLock`, the same question the validator refuses on — no `packages`
+  map, or one with no root record to seed the walk — since a shape the walk
+  rejects is one whose diff means nothing. A test asserts the two agree rather
+  than trusting them to be edited together.
+- **`candidates` is read BEFORE the manifests go back to HEAD.** Half of what
+  it reports is what the bulk resolve moved, and that only exists on disk
+  until the restore. Move the call below `git checkout HEAD` and the list
+  quietly collapses to the declared names — the same silent narrowing, with
+  the tests still green unless they assert a transitive survived.
 - **It changes nothing about what gets trusted.** The step runs inside the
   window before any dependency code executes (`--ignore-scripts`, like the
   bulk resolve), and its verdicts are the untrusted job's own: `publish`

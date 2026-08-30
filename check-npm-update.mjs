@@ -593,6 +593,23 @@ export function workspacePaths(packages) {
     .sort();
 }
 
+/**
+ * Whether the walk can read this lockfile at all: a `packages` map, and a
+ * root record to seed the walk from. `allFailures` refuses each of those
+ * shapes with its own message — this is the same question as a boolean, for
+ * callers that only need to know whether to try.
+ *
+ * `rebuildCandidates` asks it because the two must agree: a lockfile the walk
+ * refuses is one whose diff means nothing, and diffing it anyway puts the
+ * whole tree into the candidate list to be re-resolved one package at a time
+ * before the batch fails validation regardless (Codex). `agrees with
+ * allFailures` in the test suite is what keeps them from drifting apart.
+ */
+export function isWalkableLock(lock) {
+  const isObject = (v) => typeof v === "object" && v !== null;
+  return isObject(lock?.packages) && isObject(lock.packages[""]);
+}
+
 export function allFailures({ manifestBefore, manifestAfter, lockBefore, lockAfter, workspaces = {} }) {
   // Fail closed on a lockfile shape the walk cannot see. A lockfileVersion 1
   // file has no `packages` map at all, so falling through to `{}` here would
@@ -793,11 +810,11 @@ export function installedVersions(packages) {
  */
 /**
  * Every dependency name the repository itself declares — the root manifest's,
- * plus each workspace's. These are the names `npm update <name>` accepts, and
- * the hold-back pass in the workflow walks them one at a time so a batch a
- * breaking transitive would otherwise sink can still ship everything that
- * transitive does not touch. Read from the BEFORE side: the point is to
- * re-resolve from HEAD, so what HEAD declares is what there is to re-resolve.
+ * plus each workspace's. These lead the hold-back pass's candidate list (see
+ * `rebuildCandidates`), so a batch a breaking transitive would otherwise sink
+ * can still ship everything that transitive does not touch. Read from the
+ * BEFORE side: the point is to re-resolve from HEAD, so what HEAD declares is
+ * what there is to re-resolve.
  *
  * A workspace's own package name is excluded. It is a local link rather than
  * something the registry resolves, so naming it would ask npm to update a
@@ -847,6 +864,71 @@ export function directDependencyNames({ manifestBefore, workspaces = {} }) {
   collect(manifestBefore);
   for (const workspace of Object.values(workspaces)) collect(workspace?.manifestBefore);
   return [...names].sort();
+}
+
+/**
+ * The candidate set the workflow's hold-back pass walks: every name the
+ * repository declares, followed by every name the BULK resolve moved that it
+ * does not declare.
+ *
+ * The declared names alone are not enough, and the gap is silent. `npm update`
+ * with no argument walks the whole tree, so a bulk resolve moves transitives
+ * their parents' ranges allow; `npm update <name>` re-resolves that package's
+ * subtree and does not. So a rebuild driven by the declared names only keeps
+ * the direct moves and drops every transitive one the bulk had taken — and
+ * the PR body then reports "0 transitive" as if there had been nothing to
+ * take. clothescast's first batch shipped exactly that: two direct moves, and
+ * the `form-data` 2.5.5 -> 2.5.6 security fix its Dependabot PR had been
+ * waiting on since June silently left behind, because a crossing under an
+ * unrelated subdependency had sent the batch down the rebuild path.
+ *
+ * A transitive name is a fine argument to `npm update` — it re-resolves that
+ * package wherever the tree holds it, writing nothing to any manifest — so
+ * attempting them needs no new mechanism, only a longer list. The list is
+ * bounded by what the bulk actually moved, and the pass only runs in a week
+ * the batch would otherwise have shipped nothing at all.
+ *
+ * Declared names lead, so a direct move is attempted before the transitives
+ * it may bring along by itself; the rest are sorted, so the order a lockfile
+ * happens to enumerate paths in cannot change what a batch ships.
+ *
+ * A name counts as moved when its installed copies differ by PATH or by
+ * VERSION. Comparing versions alone would miss two copies trading versions
+ * between paths — a real change to the tree that leaves the version multiset
+ * identical — and a missed candidate is a move silently dropped.
+ *
+ * EITHER lockfile being unreadable degrades to the declared names — today's
+ * behavior — rather than to an empty list, which would hold everything back.
+ * Both sides are tested together, before the diff: substituting an empty map
+ * for just the unreadable one makes every package on the readable side look
+ * moved, which is not a degradation but the opposite — a lockfile rewritten
+ * from a format without a `packages` map would put the whole tree into the
+ * candidate list and spend a registry resolve on each (Codex). "Unreadable"
+ * is `isWalkableLock`'s answer, the same one the walk itself refuses on, so
+ * a shape the validator will reject anyway is never diffed for candidates.
+ */
+export function rebuildCandidates({ manifestBefore, lockBefore, lockAfter, workspaces = {} }) {
+  const declared = directDependencyNames({ manifestBefore, workspaces });
+  if (!isWalkableLock(lockBefore) || !isWalkableLock(lockAfter)) return declared;
+  const seen = new Set(declared);
+  const before = installedVersions(lockBefore.packages);
+  const after = installedVersions(lockAfter.packages);
+  // Path AND version, not the multiset of versions: two copies that trade
+  // versions between paths leave the multiset identical while the tree
+  // really did change, and the name would then never be attempted (Codex).
+  // This is deliberately coarser than the PR-body summary, which stays
+  // silent about a copy relocating at an unchanged version — here that costs
+  // one wasted `npm update` round, and the opposite error costs a dropped
+  // move nothing reports. Over-inclusive is the safe direction.
+  const copiesOf = (copies) =>
+    [...(copies?.entries() ?? [])].map(([path, version]) => `${path}\u0000${version}`).sort().join("\n");
+  const moved = [];
+  for (const name of new Set([...before.keys(), ...after.keys()])) {
+    if (seen.has(name)) continue;
+    if (copiesOf(before.get(name)) === copiesOf(after.get(name))) continue;
+    moved.push(name);
+  }
+  return [...declared, ...moved.sort()];
 }
 
 export function updateSummary({ manifestBefore, manifestAfter, lockBefore, lockAfter, workspaces = {} }) {
@@ -1053,10 +1135,10 @@ function main() {
   // in the PR body in its place. The same applies to `names`, whose caller
   // would otherwise read "Dependency diff validated" as its list of packages
   // and hold back every one of them.
-  const MODES = ["summary", "names", "manifests"];
+  const MODES = ["summary", "candidates", "manifests"];
   if (mode !== undefined && !MODES.includes(mode)) {
     console.error(
-      `Unknown mode "${mode}". Run with no arguments to validate, "summary" for the PR-body section, "names" for the declared dependency names, or "manifests" for the manifest paths the batch can rewrite.`,
+      `Unknown mode "${mode}". Run with no arguments to validate, "summary" for the PR-body section, "candidates" for the names the hold-back pass re-resolves, or "manifests" for the manifest paths the batch can rewrite.`,
     );
     process.exit(2);
   }
@@ -1066,11 +1148,12 @@ function main() {
     return;
   }
 
-  // One name per line, for the workflow's hold-back pass. Printed from the
-  // same clean read of HEAD the validation uses, so the list cannot disagree
-  // with what the validator walks.
-  if (mode === "names") {
-    const names = directDependencyNames(gatherInputs());
+  // One name per line, for the workflow's hold-back pass. Read from the same
+  // pair of lockfiles the validation walks, so the list cannot disagree with
+  // what the validator rejected — and read while the BULK resolve is still on
+  // disk, since the names it moved are half of what this reports.
+  if (mode === "candidates") {
+    const names = rebuildCandidates(gatherInputs());
     process.stdout.write(names.length ? names.join("\n") + "\n" : "");
     return;
   }
