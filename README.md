@@ -71,6 +71,54 @@ pr: ${{ github.event.pull_request.number || inputs.pr }}
 
 gedmap's own `ci.yml` follows this pattern for its mikelward/lanes gate.
 
+## Opening the pull request as a real collaborator
+
+All of the above is a workaround for one fact: a pull request opened by
+`GITHUB_TOKEN` starts **no** `on: pull_request` workflow. Every check the
+consumer's ruleset requires therefore has to be dispatched by name, and a
+required check nobody thought to name holds the batch open forever on a
+status nothing produces — no red tick, no explanation, which reads as
+verified.
+
+Supplying a credential removes the whole class. Opened with a real
+collaborator's identity, the ordinary `pull_request` round runs on its own,
+covering the checks required today and the ones added later:
+
+```yaml
+    uses: mikelward/npm-update/.github/workflows/npm-update.yml@main
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: write
+    secrets:
+      token: ${{ secrets.NPM_UPDATE_PAT }}
+```
+
+A **repository** secret (Settings → Secrets and variables → Actions), not an
+environment secret — the publish job declares no `environment:`, so it could
+not read one. The token needs `contents: write` and `pull-requests: write`
+and nothing else: the dispatches deliberately stay on `GITHUB_TOKEN`, which
+always has `actions: write` here, so no consumer's PAT needs Actions or
+workflow scope.
+
+`app-id` + `app-private-key` are the alternative, minting a short-lived
+installation token instead — scoped to an App installation rather than to a
+person, and independently revocable. `token` wins if both are supplied.
+Supplying one half of the App pair without the other is refused rather than
+falling back, since a silent fallback reads as "the App is wired up" while
+the batch quietly goes on opening pull requests that start no workflows.
+
+All three are optional. A consumer that supplies none keeps today's behavior
+exactly: `GITHUB_TOKEN`, plus the dispatches above. The dispatches stay
+either way — harmless once redundant, and the fallback when no credential is
+supplied.
+
+The credential reaches only the publish job, which installs nothing and runs
+no dependency code. The update job — the one that executes whatever the batch
+resolved — never sees it and keeps its read-only `GITHUB_TOKEN`. That
+separation is what makes handing this job a stronger credential safe, and
+it is pinned by a test.
+
 ## What gets held back
 
 `npm update` moves each dependency to the newest release its existing range

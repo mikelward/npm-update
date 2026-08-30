@@ -188,6 +188,40 @@ has stopped biting.
   named `functions/lib/`. Written the wrong way round first; the test that
   plants exactly that is what caught it.
 
+## Who opens the pull request
+
+- **A pull request opened by `GITHUB_TOKEN` starts no `on: pull_request`
+  workflow, and that is the root of a whole class of stuck batches.** Every
+  required check has to be dispatched by name — the two hard-coded ones plus
+  whatever `dispatch-workflows` declares — and a required check nobody
+  thought to name holds the batch open forever on a status nothing produces.
+  readmo hit it when `zizmor` became required there; clothescast's batch PRs
+  get their scan only when a `pull_request: edited` event happens to fire.
+- **The `token` / `app-id` credential closes the class, where
+  `dispatch-workflows` closes one name at a time.** Opened as a real
+  collaborator, the ordinary `pull_request` round runs on its own — including
+  for checks added later, which is the half a declared list can never cover.
+  Both stay: the dispatches are the fallback when no credential is supplied,
+  and harmless once redundant.
+- **The credential goes to the publish job only.** That job installs nothing
+  and runs no dependency code, which is the entire reason a stronger
+  credential is safe here; the update job runs whatever the batch resolved and
+  keeps its read-only `GITHUB_TOKEN`. A test asserts the update job names none
+  of the three secrets — put a credential there and an unreviewed package gets
+  the token that can push to `main`.
+- **The PR body says which checks actually ran, and that differs by
+  credential.** Under `GITHUB_TOKEN` the honest sentence is "CI does not
+  start here on its own, so this job dispatched it"; opened as a
+  collaborator, the ordinary `pull_request` round ran and the dispatches were
+  belt-and-braces. Printing the first in the second case misreports what
+  verified the batch, and the two dispatch-failure notes are worse — they
+  send a reader chasing a check that is already there (Codex).
+- **The dispatches stay on `GITHUB_TOKEN` deliberately.** A dispatch is an
+  Actions API write; the minted App token is granted contents and
+  pull-requests only. Routing them through the default token keeps them
+  working under every credential and keeps a consumer's PAT down to the two
+  scopes this job uses for authorship.
+
 ## What this repository must not grow
 
 - **No dependencies. No `package.json`, no lockfile, no build step.** What a
