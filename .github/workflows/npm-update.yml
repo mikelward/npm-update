@@ -289,12 +289,19 @@ jobs:
           # working-directory when set, alongside the package.json it
           # governs the engines.npm floor for below.
           node-version-file: ${{ steps.layout.outputs.prefix }}.nvmrc
-          cache: npm
-          # setup-node's own default glob (**/package-lock.json) would still
-          # find a lockfile scoped to working-directory, but naming it
-          # explicitly is one less thing to get right if a repo ever
-          # legitimately has more than one lockfile in its tree.
-          cache-dependency-path: ${{ steps.layout.outputs.prefix }}package-lock.json
+          # No `cache: npm`, deliberately. This job checks out the default
+          # branch, so a cache it saved would be scoped to that branch and
+          # restorable by every workflow in the repository — the consumer's
+          # own ci.yml uses the same setting and the same lockfile-derived
+          # key. Lifecycle scripts run here with sudo and can write anything
+          # into ~/.npm, and setup-node's post step saves whatever is there
+          # whenever the primary key missed: a forged packument with a long
+          # max-age would then feed the consumer's next `npm ci` and this
+          # workflow's next resolve, ahead of the fingerprint. setup-node has
+          # no read-only mode, so the cache is simply off — the posture
+          # gradle-update takes with `cache-read-only: true` and rust-update
+          # with no cargo cache in this job. The cost is one registry fetch
+          # of the lockfile per weekly run.
 
       # `.nvmrc` holds a bare major and setup-node may serve a CACHED Node 24,
       # whose bundled npm can predate 11.10.0 — the release that added

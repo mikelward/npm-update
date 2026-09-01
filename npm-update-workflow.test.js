@@ -1799,6 +1799,23 @@ describe("the working-directory input", () => {
     expect([...publish.matchAll(/^\s*defaults:\n/gm)].length).toBe(1);
   });
 
+  it("never saves the npm cache from the update job", () => {
+    // The job checks out the default branch, so a cache it saved would be
+    // scoped there and restorable by every workflow in the repository —
+    // the consumer's own ci.yml uses `cache: npm` with the same
+    // lockfile-derived key. Lifecycle scripts run here with sudo, and
+    // setup-node's post step saves whatever ~/.npm holds whenever the
+    // primary key missed, so a forged packument would ride into the
+    // consumer's next install and this workflow's next resolve, ahead of
+    // the fingerprint. setup-node has no read-only mode; the cache is off.
+    const setupNode = doc.jobs.update.steps.find((s) => s.name === "Set up Node");
+    expect(!!setupNode).toBe(true);
+    expect(setupNode.uses).toMatch(/^actions\/setup-node@/);
+    expect(setupNode.with.cache).toBe(undefined);
+    expect(setupNode.with["cache-dependency-path"]).toBe(undefined);
+    expect(update).not.toMatch(/^\s*cache: npm\s*$/m);
+  });
+
   it("computes the working-directory prefix from git, not the raw input string, so equivalent spellings agree", () => {
     // upload-artifact's `with: path:` list and setup-node's `with:` fields
     // don't inherit the job-level default above -- only run: steps do --
@@ -1814,9 +1831,10 @@ describe("the working-directory input", () => {
     expect(!!layoutStep).toBe(true);
     expect(layoutStep.run).toContain("git rev-parse --show-prefix");
     expect(update).toContain("node-version-file: ${{ steps.layout.outputs.prefix }}.nvmrc");
-    expect(update).toContain(
-      "cache-dependency-path: ${{ steps.layout.outputs.prefix }}package-lock.json",
-    );
+    // No cache-dependency-path: the update job configures no npm cache at
+    // all (see "never saves the npm cache" below), so the only setup-node
+    // field the prefix has to reach is the .nvmrc one above.
+    expect(update).not.toContain("cache-dependency-path:");
     expect(update).toContain("${{ steps.layout.outputs.prefix }}package.json");
     expect(update).toContain("${{ steps.layout.outputs.prefix }}regen-handoff.tar");
 

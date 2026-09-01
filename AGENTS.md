@@ -80,6 +80,16 @@ has stopped biting.
   Read the PR body's check results as evidence from the batch, not proof
   independently established — the same posture the sibling per-repo copies
   already took before this repository existed.
+- **The update job caches nothing.** It checks out the default branch, so a
+  cache it saved would be scoped there and restorable by every workflow in the
+  repository, the consumer's own `ci.yml` included (same `cache: npm`, same
+  lockfile-derived key). Lifecycle scripts run here with sudo, and setup-node's
+  post step saves whatever `~/.npm` holds whenever the primary key missed — a
+  forged packument with a long `max-age` would then feed the consumer's next
+  `npm ci` and this workflow's next resolve, ahead of the fingerprint.
+  setup-node has no read-only mode, so `cache: npm` is simply absent — the
+  posture gradle-update takes with `cache-read-only: true` and rust-update
+  with no cargo cache in that job.
 
 ## Holding back only what is blocked
 
