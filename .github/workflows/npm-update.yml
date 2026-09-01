@@ -1648,9 +1648,8 @@ jobs:
           # name handed to `gh workflow run`, never as shell.
           DISPATCH_WORKFLOWS: ${{ inputs.dispatch-workflows }}
           # Empty unless the update job's regenerate step actually ran and
-          # fingerprinted the declared files — drives the title/verdict
-          # branch and withholds auto-merge below. See AGENTS.md "Trust
-          # model".
+          # fingerprinted the declared files — names the rebuilt content in
+          # the verdict below. See AGENTS.md "Trust model".
           REGEN_SHA: ${{ needs.update.outputs.regen_sha }}
           # See the regenerate step's own comment: `git add -- "$f"` below
           # reads $f as a pathspec, and pathspec magic in a declared path
@@ -1674,19 +1673,17 @@ jobs:
           if [ "$PASSED" != 'true' ]; then
             title="Update dependencies ($today) — CHECKS FAILING"
             verdict='**One or more checks failed.** Do not merge until they are fixed — the failures are real, not flakes to route around.'
-          elif [ -n "$REGEN_SHA" ]; then
-            # See AGENTS.md "Trust model": unlike the manifests, a
-            # regenerated file's content is never independently re-derived
-            # in a clean context here — publish only re-verifies the
-            # fingerprint the untrusted update job itself took, the same
-            # residual gap checks.md/deps-stat.txt already carry. Auto-
-            # merge is withheld so a human looks at the regenerated diff
-            # before it lands, even though the ordinary checks passed.
-            title="Update dependencies ($today) — REGENERATED FILES, REVIEW BEFORE MERGE"
-            verdict='All checks passed, but this batch also regenerated a derived file (see AGENTS.md "Trust model") — that content is not independently re-derived the way the manifests are, so auto-merge is deliberately not armed. Review the regenerated diff below before merging by hand.'
           else
             title="Update dependencies ($today)"
             verdict='All checks passed in the job that produced this branch.'
+            if [ -n "$REGEN_SHA" ]; then
+              # See AGENTS.md "Trust model": a regenerated file's content is
+              # fingerprint-checked in publish, never re-derived there, so
+              # the body says which gate vouches for it — the checks on the
+              # PR head, which auto-merge waits for. In the verdict, not the
+              # title: the title becomes the merge commit's subject.
+              verdict="$verdict This batch also rebuilt a derived file (diffstat below). That content is fingerprint-checked here rather than re-derived, so the checks on this PR are what vouch for it; auto-merge waits for those like any other batch."
+            fi
           fi
 
           remote="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
@@ -2009,14 +2006,15 @@ jobs:
           # allowed just fall back to manual — and on a failing batch, that
           # fallback (no auto-merge armed) is the correct outcome anyway.
           #
-          # Also withheld when this batch regenerated a derived file (see
-          # AGENTS.md "Trust model" and the title/verdict branch above):
-          # unlike the manifests, a regenerated file's content is only
-          # fingerprint-checked here, never independently re-derived, so
-          # untrusted update-job code could otherwise determine what
-          # auto-merges through a regenerated file even while every
-          # ordinary check passes.
-          if [ "$PASSED" = 'true' ] && [ -z "$REGEN_SHA" ]; then
+          # Armed on a batch that regenerated a derived file too (maintainer,
+          # 2026-09-01; see AGENTS.md "Trust model"). That content is only
+          # fingerprint-checked here, never re-derived, and it used to hold
+          # auto-merge back for a human — but what actually vouches for it
+          # is the consumer's own checks on the PR head, which auto-merge
+          # waits for anyway: readmo's suite asserts every import-map entry
+          # against the lockfile publish DID re-validate. A weekly PR parked
+          # for a review the checks already gave is the one nobody sees.
+          if [ "$PASSED" = 'true' ]; then
             if ! gh pr merge --auto --rebase "$pr"; then
               echo "Could not arm auto-merge — the PR is open and waits for a manual merge." \
                 >> "$GITHUB_STEP_SUMMARY"

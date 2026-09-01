@@ -80,6 +80,17 @@ has stopped biting.
   Read the PR body's check results as evidence from the batch, not proof
   independently established — the same posture the sibling per-repo copies
   already took before this repository existed.
+- **A regenerated file auto-merges like any other batch** (maintainer,
+  2026-09-01). Its content is fingerprint-checked in `publish`, never
+  re-derived there — the consumer's `regenerate` command runs in the untrusted
+  window, after the install with lifecycle scripts — and the first version
+  withheld auto-merge for that reason, retitling the PR for a human. Reversed:
+  what vouches for the content is the consumer's own checks on the PR head,
+  which auto-merge waits for regardless, and readmo's suite asserts every
+  import-map entry against the lockfile `publish` did re-validate. The hold
+  bought a parked weekly PR, which is the PR that goes unnoticed. A consumer
+  declaring `regenerate` owes its derived file a check of that kind; the batch
+  names the rebuilt file in the PR body either way.
 - **The update job caches nothing.** It checks out the default branch, so a
   cache it saved would be scoped there and restorable by every workflow in the
   repository, the consumer's own `ci.yml` included (same `cache: npm`, same

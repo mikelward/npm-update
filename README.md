@@ -196,6 +196,14 @@ enforces this too, fingerprinting each declared file the same way. Leaving
 both empty (the default) disables the hook entirely — no change for an
 existing consumer that doesn't set them.
 
+A batch that rebuilt a derived file arms auto-merge like any other. The
+rebuilt content is fingerprint-checked by the publish job rather than
+re-derived there, so what vouches for it is the consumer's own required checks
+on the PR head — declare `regenerate` alongside a test that holds the derived
+file to the manifests (readmo's `import_map.test.ts` checks every entry
+against `package-lock.json`), and the PR body names the rebuilt file so a
+reader knows to look.
+
 ## A build that leaves other ignored files behind
 
 The batch refuses to publish when dependency code leaves **gitignored** files
