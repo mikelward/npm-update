@@ -101,6 +101,22 @@ has stopped biting.
   setup-node has no read-only mode, so `cache: npm` is simply absent — the
   posture gradle-update takes with `cache-read-only: true` and rust-update
   with no cargo cache in that job.
+- **The batch credential lives in an environment only the publish job
+  declares.** A secret passed through `workflow_call` reaches the runner of
+  every job in the called workflow, the update job included — a runner holds a
+  job's whole secrets context for log masking whether or not a step references
+  it — so "the credential lives only in the publish job" was never what the
+  platform delivered. An environment secret reaches only the job that declares
+  the environment. So publish declares `inputs.environment` (default
+  `npm-update`), the update job never declares one, the caller passes
+  `secrets: inherit`, and `NPM_UPDATE_PAT` (or the `NPM_UPDATE_APP_*` pair) is
+  set on that environment rather than on the repository —
+  `repo secrets --env npm-update` in mikelward/repo does exactly that. The
+  explicit `secrets:` block is the legacy route and still works. The cost
+  `inherit` carries is that every OTHER repository-level secret of the consumer
+  now reaches the update job too, which is why mikelward/repo's `repo audit`
+  reports repository-level secrets: a consumer running this batch keeps its
+  secrets environment-scoped.
 
 ## Holding back only what is blocked
 
