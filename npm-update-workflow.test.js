@@ -578,6 +578,21 @@ describe("npm-update reusable workflow", () => {
     );
   });
 
+  it("only the publish job declares the environment the batch credential lives in", () => {
+    // A secret passed through workflow_call reaches the runner of every
+    // job in the called workflow, the update job included — where
+    // lifecycle scripts run with sudo. An environment secret reaches only
+    // the job that declares the environment, so publish declares it, from
+    // the input, and update never does; the env block above prefers the
+    // hub-named secret the environment delivers under `secrets: inherit`.
+    const text = readFileSync(".github/workflows/npm-update.yml", "utf8");
+    expect(text).toMatch(/^      environment:\n        description: >-[^]*?\n        type: string\n        default: npm-update\n/m);
+    const environments = [...text.matchAll(/^    environment: (.*)$/gm)].map((m) => m[1]);
+    expect(environments).toEqual(["${{ inputs.environment }}"]);
+    expect(update).not.toMatch(/^\s*environment:/m);
+    expect(publish).toMatch(/^    environment: \$\{\{ inputs\.environment \}\}$/m);
+  });
+
   it("never splices ANY ${{ }} expression into any step's run: script, in either job", () => {
     // `${{ }}` substitution happens at workflow-parse time, before the
     // shell runs — splicing ANY expression directly into script text turns
@@ -855,9 +870,9 @@ describe("the credential the pull request is opened with", () => {
     // selects — it would read as working and silently always take the
     // fallback.
     expect(publish.env).toEqual({
-      PAT: "${{ secrets.token }}",
-      APP_ID: "${{ secrets.app-id }}",
-      APP_PRIVATE_KEY: "${{ secrets.app-private-key }}",
+      PAT: "${{ secrets.NPM_UPDATE_PAT || secrets.token }}",
+      APP_ID: "${{ secrets.NPM_UPDATE_APP_ID || secrets.app-id }}",
+      APP_PRIVATE_KEY: "${{ secrets.NPM_UPDATE_APP_PRIVATE_KEY || secrets.app-private-key }}",
     });
   });
 

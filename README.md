@@ -90,16 +90,29 @@ covering the checks required today and the ones added later:
       contents: write
       pull-requests: write
       actions: write
-    secrets:
-      token: ${{ secrets.NPM_UPDATE_PAT }}
+    # `inherit`, not a `secrets:` block naming the token: an environment
+    # secret reaches a called workflow no other way. zizmor flags this
+    # (secrets-inherit); allow it for this file in .github/zizmor.yml, with
+    # this reason.
+    secrets: inherit
 ```
 
-A **repository** secret (Settings → Secrets and variables → Actions), not an
-environment secret — the publish job declares no `environment:`, so it could
-not read one. The token needs `contents: write` and `pull-requests: write`
-and nothing else: the dispatches deliberately stay on `GITHUB_TOKEN`, which
-always has `actions: write` here, so no consumer's PAT needs Actions or
-workflow scope.
+An **environment** secret named `NPM_UPDATE_PAT` on the consumer's
+`npm-update` environment (Settings → Environments → `npm-update` →
+Environment secrets; or `repo secrets --name NPM_UPDATE_PAT --env npm-update
+--file token.txt OWNER/REPO...` from mikelward/repo, which creates the
+environment when it is missing), not a repository secret. The publish job
+declares that environment and nothing else does: a repository secret passed
+to a reusable workflow reaches the runner of every job in it, the update job
+included, where lifecycle scripts run with sudo, while an environment secret
+reaches only the job that declares the environment. The `environment` input
+renames it if a consumer needs to. A repository-level `NPM_UPDATE_PAT` left
+over from before is deleted once the environment one is set; the older
+`secrets: token: ${{ secrets.NPM_UPDATE_PAT }}` block still works but
+delivers the token to every job. The token needs `contents: write` and
+`pull-requests: write` and nothing else: the dispatches deliberately stay on
+`GITHUB_TOKEN`, which always has `actions: write` here, so no consumer's PAT
+needs Actions or workflow scope.
 
 `app-id` + `app-private-key` are the alternative, minting a short-lived
 installation token instead — scoped to an App installation rather than to a
