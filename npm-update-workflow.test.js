@@ -571,10 +571,10 @@ describe("npm-update reusable workflow", () => {
     // false pass an earlier version of this test had (it kept matching after
     // the gate was deleted, because the file's FIRST passed-check, for the
     // title/verdict branch far above, satisfied a bare lastIndexOf lookup).
-    // Also requires REGEN_SHA empty (see "the regenerate hook" describe
-    // block below) -- both gates live on this one line together.
+    // PASSED is the only gate on this line: a regenerated file no longer
+    // holds arming back (see "the regenerate hook" describe block below).
     expect(publish).toMatch(
-      /\n {10}if \[ "\$PASSED" = 'true' \] && \[ -z "\$REGEN_SHA" \]; then\n {12}if ! gh pr merge --auto --rebase "\$pr"; then\n/,
+      /\n {10}if \[ "\$PASSED" = 'true' \]; then\n {12}if ! gh pr merge --auto --rebase "\$pr"; then\n/,
     );
   });
 
@@ -1437,24 +1437,27 @@ describe("the regenerate hook", () => {
     }
   });
 
-  it("withholds auto-merge and flags the title when this batch regenerated a file, even though the ordinary checks passed", () => {
-    // A Codex finding on the original PR: a regenerated file's content is
-    // only fingerprint-checked in publish, never independently re-derived
-    // the way the manifests are (see AGENTS.md "Trust model") — so without
-    // this gate, untrusted update-job code could determine what
-    // auto-merges through a regenerated file while every ordinary check
-    // still passes.
+  it("arms auto-merge on a batch that regenerated a file, and names the gate that vouches for it in the verdict", () => {
+    // Reversed 2026-09-01 (maintainer). The original PR withheld auto-merge
+    // here, on a Codex finding: a regenerated file is only
+    // fingerprint-checked in publish, never re-derived. What vouches for
+    // that content is the consumer's own checks on the PR head — readmo's
+    // suite asserts every import-map entry against the re-validated
+    // lockfile — and auto-merge waits for those regardless, so the hold
+    // bought a parked weekly PR and nothing else. The body still names the
+    // rebuilt file (see AGENTS.md "Trust model").
     const openPr = doc.jobs.publish.steps.find((s) => s.name === "Open the pull request");
     expect(openPr.env.REGEN_SHA).toBe("${{ needs.update.outputs.regen_sha }}");
-    expect(openPr.run).toContain("REGENERATED FILES, REVIEW BEFORE MERGE");
+    expect(openPr.run).not.toContain("REVIEW BEFORE MERGE");
+    expect(openPr.run).not.toMatch(/-z "\$REGEN_SHA" \]; then\n\s*if ! gh pr merge/);
     expect(openPr.run).toMatch(
-      /if \[ "\$PASSED" = 'true' \] && \[ -z "\$REGEN_SHA" \]; then\n\s*if ! gh pr merge --auto --rebase "\$pr"; then/,
+      /if \[ "\$PASSED" = 'true' \]; then\n\s*if ! gh pr merge --auto --rebase "\$pr"; then/,
     );
-    // A failing check still outranks the regen flag in the title -- the
-    // batch is broken first, and "REGENERATED FILES" only applies once
-    // PASSED is already true.
+    // The title stays the plain subject either way — it becomes the merge
+    // commit's subject — and the rebuilt file is called out in the verdict,
+    // inside the passed branch, so a failing check still outranks it.
     expect(openPr.run).toMatch(
-      /if \[ "\$PASSED" != 'true' \]; then\n\s*title="Update dependencies \(\$today\) — CHECKS FAILING"[^]*?elif \[ -n "\$REGEN_SHA" \]; then\n\s*[^]*?title="Update dependencies \(\$today\) — REGENERATED FILES, REVIEW BEFORE MERGE"/,
+      /if \[ "\$PASSED" != 'true' \]; then\n\s*title="Update dependencies \(\$today\) — CHECKS FAILING"[^]*?else\n\s*title="Update dependencies \(\$today\)"\n\s*verdict='All checks passed in the job that produced this branch\.'\n\s*if \[ -n "\$REGEN_SHA" \]; then\n[^]*?verdict="\$verdict This batch also rebuilt a derived file/,
     );
   });
 
