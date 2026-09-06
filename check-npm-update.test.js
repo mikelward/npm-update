@@ -31,6 +31,7 @@ import {
   NOT_A_NODE_TARGET,
   installedVersions,
   lockfileFailures,
+  satisfiesRange,
   manifestFailures,
   majorOf,
   resolveEdge,
@@ -164,6 +165,679 @@ describe('lockfileFailures', () => {
       'node_modules/foo': pkg('1.4.2'),
     }
     expect(lockfileFailures(before, after)).toEqual([])
+  })
+
+  // An `overrides` entry is authoritative for npm, so it holds a copy in
+  // place while the dependent that declares it moves out from under. Nothing
+  // moves, so the major rules above see a perfectly still tree — this is the
+  // shape that shipped in clothescast's batch, where `firebase-functions`
+  // 7.2.5 -> 7.3.2 took its declared `express` from `^4.21.0` to `^5.2.1`
+  // while an `express: ^4` override kept 4.22.2 pinned underneath.
+  it('catches a pinned copy its dependent no longer declares', () => {
+    const before = {
+      ...root({ a: '^1.0.0' }),
+      'node_modules/a': pkg('1.0.0', { foo: '^1.0.0' }),
+      'node_modules/foo': pkg('1.5.0'),
+    }
+    const after = {
+      ...root({ a: '^1.0.0' }),
+      'node_modules/a': pkg('1.1.0', { foo: '^2.0.0' }),
+      'node_modules/foo': pkg('1.5.0'),
+    }
+    const failures = lockfileFailures(before, after)
+    // Nothing crossed a major and no version moved at all, so the rules above
+    // cannot fire: anything reported here is this check and only this check.
+    expect(failures).not.toEqual([])
+    expect(failures.join('\n')).toContain('foo')
+  })
+
+  // The same gap one shape over. The crossing rules iterate the BEFORE edge
+  // set, so an edge the bump added is never visited at all — and the fit
+  // check sat inside that loop, so an override pinning a newly declared
+  // dependency sailed straight through.
+  it('catches a pin under an edge the bump newly declared', () => {
+    const before = {
+      ...root({ a: '^1.0.0' }),
+      'node_modules/a': pkg('1.0.0'),
+      'node_modules/foo': pkg('1.5.0'),
+    }
+    const after = {
+      ...root({ a: '^1.0.0' }),
+      'node_modules/a': pkg('1.1.0', { foo: '^2.0.0' }),
+      'node_modules/foo': pkg('1.5.0'),
+    }
+    const failures = lockfileFailures(before, after)
+    expect(failures).not.toEqual([])
+    expect(failures.join('\n')).toContain('foo')
+  })
+
+  it('catches a pin one level under a newly declared edge', () => {
+    // The direct edge is fine; the misfit is inside the package it brought.
+    const before = {
+      ...root({ a: '^1.0.0' }),
+      'node_modules/a': pkg('1.0.0'),
+      'node_modules/bar': pkg('1.5.0'),
+    }
+    const after = {
+      ...root({ a: '^1.0.0' }),
+      'node_modules/a': pkg('1.1.0', { foo: '^1.0.0' }),
+      'node_modules/foo': pkg('1.0.0', { bar: '^2.0.0' }),
+      'node_modules/bar': pkg('1.5.0'),
+    }
+    const failures = lockfileFailures(before, after)
+    expect(failures).not.toEqual([])
+    expect(failures.join('\n')).toContain('bar')
+  })
+
+  it('catches a second copy whose new location resolves an edge differently', () => {
+    // The mirror of the relocation case, and why the test is per-edge rather
+    // than per-package: resolution is path-dependent, so another copy of the
+    // same name@version can resolve the same edge somewhere else entirely.
+    // `b`'s nested foo satisfies `bar ^2` from its own nested bar@2; the copy
+    // `a` newly brings falls through to the hoisted bar@1.5.
+    const before = {
+      ...root({ a: '^1.0.0', b: '^1.0.0' }),
+      'node_modules/a': pkg('1.0.0'),
+      'node_modules/b': pkg('1.0.0', { foo: '^1.0.0' }),
+      'node_modules/b/node_modules/foo': pkg('1.0.0', { bar: '^2.0.0' }),
+      'node_modules/b/node_modules/bar': pkg('2.0.0'),
+      'node_modules/bar': pkg('1.5.0'),
+    }
+    const after = {
+      ...root({ a: '^1.0.0', b: '^1.0.0' }),
+      'node_modules/a': pkg('1.1.0', { foo: '^1.0.0' }),
+      'node_modules/a/node_modules/foo': pkg('1.0.0', { bar: '^2.0.0' }),
+      'node_modules/b': pkg('1.0.0', { foo: '^1.0.0' }),
+      'node_modules/b/node_modules/foo': pkg('1.0.0', { bar: '^2.0.0' }),
+      'node_modules/b/node_modules/bar': pkg('2.0.0'),
+      'node_modules/bar': pkg('1.5.0'),
+    }
+    const failures = lockfileFailures(before, after)
+    expect(failures).not.toEqual([])
+    expect(failures.join('\n')).toContain('bar')
+  })
+
+  it('does not let an uninstallable copy vouch for a live one', () => {
+    // The main traversal prunes an optional package no Node target can
+    // install, and everything under it. Leaving those entries in the
+    // baseline let an impossible subtree certify a newly live edge as
+    // pre-existing.
+    const impossible = (version, deps) => ({
+      version,
+      optional: true,
+      cpu: ['wasm32'],
+      ...(deps ? { dependencies: deps } : {}),
+    })
+    const before = {
+      ...root({ a: '^1.0.0', b: '^1.0.0' }),
+      'node_modules/a': pkg('1.0.0'),
+      'node_modules/b': pkg('1.0.0', { opt: '^1.0.0' }),
+      'node_modules/opt': impossible('1.0.0', { foo: '^1.0.0' }),
+      'node_modules/opt/node_modules/foo': pkg('1.0.0', { bar: '^2.0.0' }),
+      'node_modules/bar': pkg('1.5.0'),
+    }
+    const after = {
+      ...before,
+      'node_modules/a': pkg('1.1.0', { foo: '^1.0.0' }),
+      'node_modules/foo': pkg('1.0.0', { bar: '^2.0.0' }),
+    }
+    const failures = lockfileFailures(before, after)
+    expect(failures).not.toEqual([])
+    expect(failures.join('\n')).toContain('bar')
+  })
+
+  it('catches a second version of a name whose new declaration misfits', () => {
+    // The baseline key needs the DECLARED RANGE too. Without it, `foo@1`
+    // declaring `bar ^1` and resolving the pinned `bar@1.5` vouches for a
+    // newly added `foo@2` declaring `bar ^2` and landing on the same pin —
+    // and `foo@1` survives, so no paired traversal covers the new copy.
+    const before = {
+      ...root({ a: '^1.0.0', b: '^1.0.0' }),
+      'node_modules/a': pkg('1.0.0'),
+      'node_modules/b': pkg('1.0.0', { foo: '^1.0.0' }),
+      'node_modules/foo': pkg('1.0.0', { bar: '^1.0.0' }),
+      'node_modules/bar': pkg('1.5.0'),
+    }
+    const after = {
+      ...root({ a: '^1.0.0', b: '^1.0.0' }),
+      'node_modules/a': pkg('1.1.0', { foo: '^2.0.0' }),
+      'node_modules/a/node_modules/foo': pkg('2.0.0', { bar: '^2.0.0' }),
+      'node_modules/b': pkg('1.0.0', { foo: '^1.0.0' }),
+      'node_modules/foo': pkg('1.0.0', { bar: '^1.0.0' }),
+      'node_modules/bar': pkg('1.5.0'),
+    }
+    const failures = lockfileFailures(before, after)
+    expect(failures).not.toEqual([])
+    expect(failures.join('\n')).toContain('bar')
+  })
+
+  it('does not report a standing pin when the consumer itself was bumped', () => {
+    // The batch bumps `foo` and makes `a` newly depend on it. Keying the
+    // baseline by name@version finds no prior copy of foo@1.1.0, calls every
+    // edge below it new, and blames `a` for a pin that was already there.
+    const before = {
+      ...root({ a: '^1.0.0', b: '^1.0.0' }),
+      'node_modules/a': pkg('1.0.0'),
+      'node_modules/b': pkg('1.0.0', { foo: '^1.0.0' }),
+      'node_modules/foo': pkg('1.0.0', { bar: '^2.0.0' }),
+      'node_modules/bar': pkg('1.5.0'),
+    }
+    const after = {
+      ...root({ a: '^1.0.0', b: '^1.0.0' }),
+      'node_modules/a': pkg('1.1.0', { foo: '^1.0.0' }),
+      'node_modules/b': pkg('1.0.0', { foo: '^1.0.0' }),
+      'node_modules/foo': pkg('1.1.0', { bar: '^2.0.0' }),
+      'node_modules/bar': pkg('1.5.0'),
+    }
+    expect(lockfileFailures(before, after)).toEqual([])
+  })
+
+  it('does not treat a relocated copy as a new package', () => {
+    // A new edge can hoist an existing copy. A path-only test calls the
+    // relocated package brand new and re-reports every standing override
+    // under it — blaming whichever package newly depended on it.
+    const before = {
+      ...root({ a: '^1.0.0', b: '^1.0.0' }),
+      'node_modules/a': pkg('1.0.0'),
+      'node_modules/b': pkg('1.0.0', { foo: '^1.0.0' }),
+      'node_modules/b/node_modules/foo': pkg('1.0.0', { bar: '^2.0.0' }),
+      'node_modules/bar': pkg('1.5.0'),
+    }
+    const after = {
+      ...root({ a: '^1.0.0', b: '^1.0.0' }),
+      'node_modules/a': pkg('1.1.0', { foo: '^1.0.0' }),
+      'node_modules/b': pkg('1.0.0', { foo: '^1.0.0' }),
+      'node_modules/foo': pkg('1.0.0', { bar: '^2.0.0' }),
+      'node_modules/bar': pkg('1.5.0'),
+    }
+    expect(lockfileFailures(before, after)).toEqual([])
+  })
+
+  it('does not descend into a package the before tree already had', () => {
+    // Its edges are not new, whatever newly pointed at it, and they belong to
+    // the both-sides arm — which knows how to suppress a standing override.
+    // Walking them here would re-report every deliberate pin in the tree the
+    // moment anything newly depended on it.
+    const shared = {
+      'node_modules/foo': pkg('1.0.0', { bar: '^2.0.0' }),
+      'node_modules/bar': pkg('1.5.0'),
+    }
+    const before = { ...root({ a: '^1.0.0' }), 'node_modules/a': pkg('1.0.0'), ...shared }
+    const after = {
+      ...root({ a: '^1.0.0' }),
+      'node_modules/a': pkg('1.1.0', { foo: '^1.0.0' }),
+      ...shared,
+    }
+    expect(lockfileFailures(before, after)).toEqual([])
+  })
+
+  it('catches a pin under a newly declared spaced comparator', () => {
+    // The after-only arm reports only a definite `false`, so a range it
+    // cannot parse slips through. A spaced comparator used to be exactly
+    // that, which made this an end-to-end false pass rather than a nicety.
+    const before = {
+      ...root({ a: '^1.0.0' }),
+      'node_modules/a': pkg('1.0.0'),
+      'node_modules/foo': pkg('1.5.0'),
+    }
+    const after = {
+      ...root({ a: '^1.0.0' }),
+      'node_modules/a': pkg('1.1.0', { foo: '>= 2.0.0' }),
+      'node_modules/foo': pkg('1.5.0'),
+    }
+    const failures = lockfileFailures(before, after)
+    expect(failures).not.toEqual([])
+    expect(failures.join('\n')).toContain('foo')
+  })
+
+  it('catches a prerelease pin under a newly declared wildcard edge', () => {
+    const before = {
+      ...root({ a: '^1.0.0' }),
+      'node_modules/a': pkg('1.0.0'),
+      'node_modules/foo': pkg('1.5.0-beta.1'),
+    }
+    const after = {
+      ...root({ a: '^1.0.0' }),
+      'node_modules/a': pkg('1.1.0', { foo: '*' }),
+      'node_modules/foo': pkg('1.5.0-beta.1'),
+    }
+    const failures = lockfileFailures(before, after)
+    expect(failures).not.toEqual([])
+    expect(failures.join('\n')).toContain('foo')
+  })
+
+  it('passes a newly declared edge whose resolution fits', () => {
+    const before = {
+      ...root({ a: '^1.0.0' }),
+      'node_modules/a': pkg('1.0.0'),
+      'node_modules/foo': pkg('1.5.0'),
+    }
+    const after = {
+      ...root({ a: '^1.0.0' }),
+      'node_modules/a': pkg('1.1.0', { foo: '^1.0.0' }),
+      'node_modules/foo': pkg('1.5.0'),
+    }
+    expect(lockfileFailures(before, after)).toEqual([])
+  })
+
+  it('refuses a newly declared edge whose range it cannot evaluate', () => {
+    // This arm used to report only a definite misfit, on the reasoning that a
+    // new dependency declared as a comparator range was ordinary and refusing
+    // would hold packages back weekly for nothing. That held when the grammar
+    // modeled almost nothing. With unions, comparators, intersections,
+    // partial and x-ranges and hyphen ranges modeled, an unevaluable range is
+    // a genuine outlier — and a new edge is exactly where a pin hides.
+    const before = {
+      ...root({ a: '^1.0.0' }),
+      'node_modules/a': pkg('1.0.0'),
+      'node_modules/foo': pkg('1.5.0'),
+    }
+    const after = {
+      ...root({ a: '^1.0.0' }),
+      'node_modules/a': pkg('1.1.0', { foo: '^2.0.0-beta.1' }),
+      'node_modules/foo': pkg('1.5.0'),
+    }
+    const failures = lockfileFailures(before, after)
+    expect(failures).not.toEqual([])
+    expect(failures.join('\n')).toContain('cannot evaluate')
+  })
+
+  it('still passes a newly declared edge whose modelable range fits', () => {
+    // The refusal above must not swallow the ordinary case: a comparator
+    // range the grammar handles is answered, not refused.
+    const before = {
+      ...root({ a: '^1.0.0' }),
+      'node_modules/a': pkg('1.0.0'),
+      'node_modules/foo': pkg('1.5.0'),
+    }
+    const after = {
+      ...root({ a: '^1.0.0' }),
+      'node_modules/a': pkg('1.1.0', { foo: '>=1.0.0' }),
+      'node_modules/foo': pkg('1.5.0'),
+    }
+    expect(lockfileFailures(before, after)).toEqual([])
+  })
+
+  it('passes a pin that was already outside its range before the batch', () => {
+    // A standing override the repo took deliberately. Re-reporting it would
+    // stop every batch forever rather than the one that broke something.
+    const tree = (foo) => ({
+      ...root({ a: '^1.0.0' }),
+      'node_modules/a': pkg('1.0.0', { foo: '^2.0.0' }),
+      'node_modules/foo': pkg(foo),
+    })
+    expect(lockfileFailures(tree('1.5.0'), tree('1.6.0'))).toEqual([])
+  })
+
+  it('reports a definite misfit even when the baseline range cannot be modeled', () => {
+    // `fitWas === null` says the OLD range is unmodelable, which is no
+    // evidence the pin was already standing. Suppressing a certain answer on
+    // the strength of an uncertain one is the wrong direction here.
+    const before = {
+      ...root({ a: '^1.0.0' }),
+      'node_modules/a': pkg('1.0.0', { foo: '>1.0' }),
+      'node_modules/foo': pkg('1.5.0'),
+    }
+    const after = {
+      ...root({ a: '^1.0.0' }),
+      'node_modules/a': pkg('1.1.0', { foo: '^2.0.0' }),
+      'node_modules/foo': pkg('1.5.0'),
+    }
+    const failures = lockfileFailures(before, after)
+    expect(failures).not.toEqual([])
+    expect(failures.join('\n')).toContain('cannot model')
+  })
+
+  it('refuses a changed declaration when neither range can be modeled', () => {
+    // The `null`/`null` pair was the last place an unknown still collapsed
+    // into "fine": a definite misfit was reported and a known-good-turned-
+    // unknown was reported, but two refusals fell out of the chain entirely.
+    // npm accepts the old fit here and rejects the new one.
+    const before = {
+      ...root({ a: '^1.0.0' }),
+      'node_modules/a': pkg('1.0.0', { foo: '^1.0.0-beta.1' }),
+      'node_modules/foo': pkg('1.5.0'),
+    }
+    const after = {
+      ...root({ a: '^1.0.0' }),
+      'node_modules/a': pkg('1.1.0', { foo: '^2.0.0-beta.1' }),
+      'node_modules/foo': pkg('1.5.0'),
+    }
+    const failures = lockfileFailures(before, after)
+    expect(failures).not.toEqual([])
+    expect(failures.join('\n')).toContain('cannot model either')
+  })
+
+  it('does not ask about an unmodelable range nothing changed under', () => {
+    // The other half of the rule above, and what keeps it from firing weekly:
+    // an exotic range that has sat there unchanged over an unchanged
+    // resolution is never put to the fit check at all.
+    const tree = {
+      ...root({ a: '^1.0.0' }),
+      'node_modules/a': pkg('1.0.0', { foo: '>= 1.0.0 < 3' }),
+      'node_modules/foo': pkg('1.5.0'),
+    }
+    expect(lockfileFailures(tree, { ...tree })).toEqual([])
+  })
+
+  it('checks a subtree that has just become installable', () => {
+    // Nothing under an optional package no platform could install was ever on
+    // disk, so "the range and the resolution both held" is not evidence a pin
+    // was standing — there was no baseline to stand on. The misfit becomes
+    // real the moment the `cpu` widens, and only installability changed.
+    const before = {
+      ...root({ foo: '^1.0.0' }),
+      'node_modules/foo': {
+        version: '1.0.0',
+        optional: true,
+        cpu: ['wasm32'],
+        dependencies: { bar: '^2.0.0' },
+      },
+      'node_modules/bar': pkg('1.5.0'),
+    }
+    const after = {
+      ...root({ foo: '^1.0.0' }),
+      'node_modules/foo': {
+        version: '1.1.0',
+        optional: true,
+        cpu: [process.arch],
+        dependencies: { bar: '^2.0.0' },
+      },
+      'node_modules/bar': pkg('1.5.0'),
+    }
+    const failures = lockfileFailures(before, after)
+    expect(failures).not.toEqual([])
+    expect(failures.join('\n')).toContain('bar')
+  })
+
+  it('checks a resolved copy that has just become installable', () => {
+    // The consumer is live throughout; it is the PINNED COPY that was never
+    // on disk. Both fits are false, so the standing-decision suppression
+    // spoke for a baseline that never existed.
+    const before = {
+      ...root({ a: '^1.0.0' }),
+      'node_modules/a': { version: '1.0.0', optionalDependencies: { bar: '^2.0.0' } },
+      'node_modules/bar': { version: '1.5.0', optional: true, cpu: ['wasm32'] },
+    }
+    const after = {
+      ...root({ a: '^1.0.0' }),
+      'node_modules/a': { version: '1.1.0', optionalDependencies: { bar: '^2.0.0' } },
+      'node_modules/bar': { version: '1.6.0', optional: true, cpu: [process.arch] },
+    }
+    const failures = lockfileFailures(before, after)
+    expect(failures).not.toEqual([])
+    expect(failures.join('\n')).toContain('bar')
+  })
+
+  it('still walks for crossings under a consumer that went off disk', () => {
+    // The after-side liveness gate skips the FIT checks only. A subtree
+    // leaving the tree can carry a major out with it, and the `onDisk` filter
+    // on the edge is what decides that — so the child pair still has to be
+    // queued. Written as a `continue` past the queueing, this went silent.
+    const before = {
+      ...root({ gated: '^1.0.0' }),
+      'node_modules/gated': {
+        version: '1.0.0',
+        optional: true,
+        cpu: [process.arch],
+        dependencies: { foo: '^1.0.0' },
+      },
+      'node_modules/gated/node_modules/foo': pkg('1.0.0', { bar: '*' }),
+      'node_modules/bar': pkg('1.5.0'),
+    }
+    const after = {
+      ...root({ gated: '^1.0.0' }),
+      'node_modules/gated': {
+        version: '1.1.0',
+        optional: true,
+        cpu: ['wasm32'],
+        dependencies: { foo: '^1.0.0' },
+      },
+      'node_modules/gated/node_modules/foo': pkg('1.0.0', { bar: '*' }),
+      'node_modules/bar': pkg('2.0.0'),
+    }
+    const failures = lockfileFailures(before, after)
+    expect(failures).not.toEqual([])
+    expect(failures.join('\n')).toContain('different major')
+  })
+
+  it('does not let an unrelated removed copy vouch for a new one', () => {
+    // `b` drops foo while `a` newly adds it, so the copy that went away is no
+    // predecessor of the one that arrived — nothing pairs them. Both declare
+    // the same range over the same pinned `bar`, which is what made a
+    // name-keyed baseline call the new combination old news.
+    const before = {
+      ...root({ a: '^1.0.0', b: '^1.0.0' }),
+      'node_modules/a': pkg('1.0.0'),
+      'node_modules/b': pkg('1.0.0', { foo: '^1.0.0' }),
+      'node_modules/b/node_modules/foo': pkg('1.0.0', { bar: '^2.0.0' }),
+      'node_modules/bar': pkg('1.5.0'),
+    }
+    const after = {
+      ...root({ a: '^1.0.0', b: '^1.0.0' }),
+      'node_modules/a': pkg('1.1.0', { foo: '^2.0.0' }),
+      'node_modules/a/node_modules/foo': pkg('2.0.0', { bar: '^2.0.0' }),
+      'node_modules/b': pkg('1.1.0'),
+      'node_modules/bar': pkg('1.5.0'),
+    }
+    const failures = lockfileFailures(before, after)
+    expect(failures).not.toEqual([])
+    expect(failures.join('\n')).toContain('bar')
+  })
+
+  it('does not let a surviving copy vouch for a new one beside it', () => {
+    // `foo@1` keeps its tolerated `bar` override and stays put; the batch adds
+    // a coexisting `foo@2` with the identical declaration and resolution.
+    // A copy still doing its own job is not a baseline for a different one.
+    const before = {
+      ...root({ x: '^1.0.0' }),
+      'node_modules/x': pkg('1.0.0', { foo: '^1.0.0' }),
+      'node_modules/foo': pkg('1.0.0', { bar: '^2.0.0' }),
+      'node_modules/bar': pkg('1.5.0'),
+    }
+    const after = {
+      ...root({ x: '^1.0.0', y: '^1.0.0' }),
+      'node_modules/x': pkg('1.0.0', { foo: '^1.0.0' }),
+      'node_modules/foo': pkg('1.0.0', { bar: '^2.0.0' }),
+      'node_modules/y': pkg('1.0.0', { foo: '^2.0.0' }),
+      'node_modules/y/node_modules/foo': pkg('2.0.0', { bar: '^2.0.0' }),
+      'node_modules/bar': pkg('1.5.0'),
+    }
+    const failures = lockfileFailures(before, after)
+    expect(failures).not.toEqual([])
+    expect(failures.join('\n')).toContain('2.0.0')
+  })
+
+  it('does not report a misfit under a consumer that went off disk', () => {
+    // A fit failure claims npm will install the combination. An optional
+    // package that goes uninstallable takes its edges with it, so there is no
+    // combination to hold anything back over.
+    const before = {
+      ...root({ foo: '^1.0.0' }),
+      'node_modules/foo': { version: '1.0.0', optional: true, dependencies: { bar: '^1.0.0' } },
+      'node_modules/bar': pkg('1.5.0'),
+    }
+    const after = {
+      ...root({ foo: '^1.0.0' }),
+      'node_modules/foo': {
+        version: '1.1.0',
+        optional: true,
+        cpu: ['wasm32'],
+        dependencies: { bar: '^2.0.0' },
+      },
+      'node_modules/bar': pkg('1.5.0'),
+    }
+    expect(lockfileFailures(before, after)).toEqual([])
+  })
+
+  it('does not report a misfit under an ancestor that went off disk', () => {
+    // The nested copy carries no `cpu` of its own, so only the ancestor chain
+    // says the subtree is unreachable.
+    const before = {
+      ...root({ p: '^1.0.0' }),
+      'node_modules/p': { version: '1.0.0', optional: true, dependencies: { foo: '^1.0.0' } },
+      'node_modules/p/node_modules/foo': pkg('1.0.0', { bar: '^1.0.0' }),
+      'node_modules/bar': pkg('1.5.0'),
+    }
+    const after = {
+      ...root({ p: '^1.0.0' }),
+      'node_modules/p': {
+        version: '1.1.0',
+        optional: true,
+        cpu: ['wasm32'],
+        dependencies: { foo: '^1.0.0' },
+      },
+      'node_modules/p/node_modules/foo': pkg('1.1.0', { bar: '^2.0.0' }),
+      'node_modules/bar': pkg('1.5.0'),
+    }
+    expect(lockfileFailures(before, after)).toEqual([])
+  })
+
+  it('still reports a misfit under a consumer that stayed on disk', () => {
+    // The same shape with the `cpu` left off, so the gate above cannot be
+    // hiding a real failure.
+    const before = {
+      ...root({ foo: '^1.0.0' }),
+      'node_modules/foo': { version: '1.0.0', optional: true, dependencies: { bar: '^1.0.0' } },
+      'node_modules/bar': pkg('1.5.0'),
+    }
+    const after = {
+      ...root({ foo: '^1.0.0' }),
+      'node_modules/foo': { version: '1.1.0', optional: true, dependencies: { bar: '^2.0.0' } },
+      'node_modules/bar': pkg('1.5.0'),
+    }
+    expect(lockfileFailures(before, after)).not.toEqual([])
+  })
+
+  it('does not re-report a standing pin under a consumer that stayed live', () => {
+    // The other direction, and what keeps the rule above from re-reporting
+    // every deliberate override the moment anything else moves: a consumer
+    // that was installable on both sides keeps its baseline.
+    const tree = (v) => ({
+      ...root({ foo: '^1.0.0' }),
+      'node_modules/foo': { version: v, dependencies: { bar: '^2.0.0' } },
+      'node_modules/bar': pkg('1.5.0'),
+    })
+    expect(lockfileFailures(tree('1.0.0'), tree('1.1.0'))).toEqual([])
+  })
+
+  it('honors optionalDependencies precedence over dependencies', () => {
+    // npm: "entries in optionalDependencies will override entries of the same
+    // name in dependencies". Reading the `dependencies` value first let an
+    // unchanged decoy range mask the move in the one that actually applies.
+    const before = {
+      ...root({ a: '^1.0.0' }),
+      'node_modules/a': {
+        version: '1.0.0',
+        dependencies: { foo: '^1' },
+        optionalDependencies: { foo: '^2' },
+      },
+      'node_modules/foo': pkg('2.1.0'),
+    }
+    const after = {
+      ...root({ a: '^1.0.0' }),
+      'node_modules/a': {
+        version: '1.1.0',
+        dependencies: { foo: '^1' },
+        optionalDependencies: { foo: '^3' },
+      },
+      'node_modules/foo': pkg('2.1.0'),
+    }
+    const failures = lockfileFailures(before, after)
+    expect(failures).not.toEqual([])
+    expect(failures.join('\n')).toContain('^3')
+  })
+
+  it('refuses a name two fields declare differently', () => {
+    // Past the one rule npm documents there is no precedence to apply, so
+    // which range it installed is not something field order can answer.
+    const before = {
+      ...root({ a: '^1.0.0' }),
+      'node_modules/a': {
+        version: '1.0.0',
+        dependencies: { foo: '^1.0.0' },
+        peerDependencies: { foo: '^1.0.0' },
+      },
+      'node_modules/foo': pkg('1.5.0'),
+    }
+    const after = {
+      ...root({ a: '^1.0.0' }),
+      'node_modules/a': {
+        version: '1.1.0',
+        dependencies: { foo: '^1.0.0' },
+        peerDependencies: { foo: '^2.0.0' },
+      },
+      'node_modules/foo': pkg('1.5.0'),
+    }
+    const failures = lockfileFailures(before, after)
+    expect(failures).not.toEqual([])
+    expect(failures.join('\n')).toContain('peerDependencies')
+  })
+
+  it('does not call two fields ambiguous when they agree', () => {
+    const tree = (a) => ({
+      ...root({ a: '^1.0.0' }),
+      'node_modules/a': {
+        version: a,
+        dependencies: { foo: '^1.0.0' },
+        peerDependencies: { foo: '^1.0.0' },
+      },
+      'node_modules/foo': pkg('1.5.0'),
+    })
+    expect(lockfileFailures(tree('1.0.0'), tree('1.1.0'))).toEqual([])
+  })
+
+  it('catches a pin whose version carries build metadata', () => {
+    // Both sides used to answer null on the version alone, so the pair of
+    // refusals waved through the combination this check exists to stop.
+    const before = {
+      ...root({ a: '^1.0.0' }),
+      'node_modules/a': pkg('1.0.0', { foo: '^1.0.0' }),
+      'node_modules/foo': pkg('1.5.0+build.1'),
+    }
+    const after = {
+      ...root({ a: '^1.0.0' }),
+      'node_modules/a': pkg('1.1.0', { foo: '^2.0.0' }),
+      'node_modules/foo': pkg('1.5.0+build.1'),
+    }
+    const failures = lockfileFailures(before, after)
+    expect(failures).not.toEqual([])
+    expect(failures.join('\n')).toContain('foo')
+  })
+
+  it('passes a bump whose resolution still satisfies the new range', () => {
+    const before = {
+      ...root({ a: '^1.0.0' }),
+      'node_modules/a': pkg('1.0.0', { foo: '^1.0.0' }),
+      'node_modules/foo': pkg('1.2.0'),
+    }
+    const after = {
+      ...root({ a: '^1.0.0' }),
+      'node_modules/a': pkg('1.1.0', { foo: '^1.2.0' }),
+      'node_modules/foo': pkg('1.5.0'),
+    }
+    expect(lockfileFailures(before, after)).toEqual([])
+  })
+
+  it('refuses when the new range is one it cannot check the pin against', () => {
+    // Fail closed, as everywhere else here: a range this job cannot model
+    // arriving over one it could is exactly where a silent pass would hide
+    // the pin. `>=2.0.0` used to stand here and is modeled now, so it was
+    // asserting the definite-misfit branch under this name; a prerelease-
+    // carrying range is genuinely outside the grammar.
+    const before = {
+      ...root({ a: '^1.0.0' }),
+      'node_modules/a': pkg('1.0.0', { foo: '^1.0.0' }),
+      'node_modules/foo': pkg('1.5.0'),
+    }
+    const after = {
+      ...root({ a: '^1.0.0' }),
+      'node_modules/a': pkg('1.1.0', { foo: '^2.0.0-beta.1' }),
+      'node_modules/foo': pkg('1.5.0'),
+    }
+    const failures = lockfileFailures(before, after)
+    expect(failures).not.toEqual([])
+    expect(failures.join('\n')).toContain('cannot check the resolved')
   })
 
   it('catches an in-place transitive major', () => {
@@ -2278,5 +2952,149 @@ describe('directDependencyNames', () => {
       }),
     ).toEqual(['a'])
     expect(directDependencyNames({ manifestBefore: {} })).toEqual([])
+  })
+})
+
+describe('satisfiesRange', () => {
+  it('answers for the grammar it models', () => {
+    expect(satisfiesRange('1.2.3', '^1.0.0')).toBe(true)
+    expect(satisfiesRange('2.0.0', '^1.0.0')).toBe(false)
+    expect(satisfiesRange('1.2.9', '~1.2.0')).toBe(true)
+    expect(satisfiesRange('1.3.0', '~1.2.0')).toBe(false)
+    expect(satisfiesRange('1.2.3', '1.2.3')).toBe(true)
+    expect(satisfiesRange('1.2.4', '1.2.3')).toBe(false)
+    expect(satisfiesRange('1.0.0', '^1.2.0')).toBe(false)
+  })
+
+  it('pins the minor for a caret range on 0.x, as ceil does', () => {
+    expect(satisfiesRange('0.5.9', '^0.5.0')).toBe(true)
+    expect(satisfiesRange('0.6.0', '^0.5.0')).toBe(false)
+  })
+
+  it('treats a wildcard and the empty range as satisfied by any release', () => {
+    expect(satisfiesRange('9.9.9', '*')).toBe(true)
+    expect(satisfiesRange('9.9.9', '')).toBe(true)
+    expect(satisfiesRange('9.9.9', undefined)).toBe(true)
+  })
+
+  it('does not exempt a wildcard from the prerelease rule', () => {
+    // `*` desugars to `>=0.0.0`, whose comparator carries no prerelease, so
+    // npm's own matcher admits none either. Returning true before reaching
+    // the prerelease check made the shortcut a different question.
+    expect(satisfiesRange('1.5.0-beta.1', '*')).toBe(false)
+    expect(satisfiesRange('1.5.0-beta.1', '')).toBe(false)
+    expect(satisfiesRange('1.5.0-beta.1', undefined)).toBe(false)
+  })
+
+  it('settles the version before any range shortcut', () => {
+    // A version it cannot parse is "cannot decide" whatever the range says.
+    expect(satisfiesRange('not-a-version', '*')).toBe(null)
+  })
+
+  it('compares a build-metadata version by its numeric core', () => {
+    // Build metadata is ignored for precedence and range matching, so this
+    // answers exactly as 1.5.0 does. Refusing instead made BOTH sides of a
+    // comparison unanswerable and waved the pin through.
+    expect(satisfiesRange('1.5.0+build.1', '^1.0.0')).toBe(true)
+    expect(satisfiesRange('1.5.0+build.1', '^2.0.0')).toBe(false)
+  })
+
+  it('answers a definite no for a prerelease, not a refusal', () => {
+    // npm admits a prerelease only when some comparator carries one on the
+    // same numeric core, and `parseRange` accepts nothing but plain X.Y.Z
+    // forms — so no range reaching that code can ever admit one.
+    expect(satisfiesRange('1.5.0-beta.1', '^1.0.0')).toBe(false)
+    expect(satisfiesRange('1.5.0-beta.1', '1.5.0')).toBe(false)
+  })
+
+  it('lets a union arm reject a prerelease without ending the range', () => {
+    // An arm that contains the version numerically but carries no prerelease
+    // comparator rejects it — that arm, not the range. npm takes the second
+    // arm of `^1 || ^1.2.3-beta.1` here; this job cannot model it, so the
+    // honest answer is a refusal, not a confident no.
+    expect(satisfiesRange('1.2.3-beta.2', '^1 || ^1.2.3-beta.1')).toBe(null)
+    // A range with no prerelease-carrying arm anywhere is still a definite no.
+    expect(satisfiesRange('1.2.3-beta.2', '^1')).toBe(false)
+    expect(satisfiesRange('1.5.0-beta.1', '*')).toBe(false)
+    expect(satisfiesRange('1.5.0-beta.1', '1.0.0 - 2.0.0')).toBe(false)
+    // And a non-prerelease still answers off the first arm that admits it.
+    expect(satisfiesRange('1.5.0', '^1 || >1.2')).toBe(true)
+  })
+
+  it('ignores everything after an x-range wildcard, as npm does', () => {
+    // npm normalizes `1.x.2` to the `1.x` interval; reading the trailing 2
+    // into the lower bound answered a definite `false` for 1.0.0 — a wrong
+    // answer, not a refusal, and one that holds a fitting edge back.
+    expect(satisfiesRange('1.0.0', '1.x.2')).toBe(true)
+    expect(satisfiesRange('1.0.0', '1.X.9')).toBe(true)
+    expect(satisfiesRange('1.0.0', '1.*.5')).toBe(true)
+    expect(satisfiesRange('1.0.0', '^1.x.2')).toBe(true)
+    expect(satisfiesRange('1.0.0', '~1.x.9')).toBe(true)
+    // Still bounded by the part left of the wildcard.
+    expect(satisfiesRange('2.0.0', '1.x.2')).toBe(false)
+    expect(satisfiesRange('1.0.0', '0.x.7')).toBe(false)
+  })
+
+  it('models the forms real lockfiles actually use', () => {
+    // Measured on a live batch: refusing on these would have held
+    // `firebase-functions` and `protobufjs` back every week for edges that
+    // fit perfectly well.
+    expect(satisfiesRange('13.10.0', '^11.10.0 || ^12.0.0 || ^13.0.0')).toBe(true)
+    expect(satisfiesRange('14.0.0', '^11.10.0 || ^12.0.0 || ^13.0.0')).toBe(false)
+    expect(satisfiesRange('22.20.1', '>=13.7.0')).toBe(true)
+    expect(satisfiesRange('12.0.0', '>=13.7.0')).toBe(false)
+    expect(satisfiesRange('1.2.3', '^1')).toBe(true)
+    expect(satisfiesRange('2.0.0', '^1')).toBe(false)
+    expect(satisfiesRange('0.5.9', '0.x')).toBe(true)
+    expect(satisfiesRange('1.0.0', '0.x')).toBe(false)
+    expect(satisfiesRange('1.2.9', '~1.2')).toBe(true)
+    expect(satisfiesRange('1.3.0', '~1.2')).toBe(false)
+    expect(satisfiesRange('0.9.0', '<1.0.0')).toBe(true)
+    expect(satisfiesRange('1.0.0', '<1.0.0')).toBe(false)
+  })
+
+  it('declines to answer outside that grammar', () => {
+    // null is "cannot decide", never a pass — the caller is what turns it
+    // into a refusal.
+    expect(satisfiesRange('1.2.3', '1.0 - 2.0')).toBe(null)
+    expect(satisfiesRange('1.2.3', '>1.2')).toBe(null)
+    expect(satisfiesRange('1.2.3', '>=1.0.0-beta.1')).toBe(null)
+    expect(satisfiesRange('1.2.3', 'npm:other@^1.0.0')).toBe(null)
+    expect(satisfiesRange('not-a-version', '^1.0.0')).toBe(null)
+  })
+
+  it('keeps a comparator attached to its version across whitespace', () => {
+    // npm lets the operator stand apart. Splitting on whitespace first left
+    // an operator with nothing to compare, which can only be refused — and a
+    // refusal passes the after-only arm, so `>= 2.0.0` was a way past the
+    // check entirely.
+    expect(satisfiesRange('1.5.0', '>= 2.0.0')).toBe(false)
+    expect(satisfiesRange('2.5.0', '>= 2.0.0')).toBe(true)
+    expect(satisfiesRange('2.5.0', '< 2.0.0')).toBe(false)
+    expect(satisfiesRange('1.5.0', '^ 1.0.0')).toBe(true)
+    expect(satisfiesRange('2.5.0', '^ 1.0.0')).toBe(false)
+  })
+
+  it('intersects the comparators inside one disjunct', () => {
+    expect(satisfiesRange('1.5.0', '>=1.0.0 <2.0.0')).toBe(true)
+    expect(satisfiesRange('2.5.0', '>=1.0.0 <2.0.0')).toBe(false)
+    expect(satisfiesRange('1.5.0', '>= 1.0.0 < 2.0.0')).toBe(true)
+  })
+
+  it('models a hyphen range rather than splitting it into atoms', () => {
+    // Whitespace-splitting `1.0.0 - 2.0.0` reads the lower bound as an exact
+    // pin and answers a definite `false` for everything above it — a wrong
+    // answer, not a refusal, and one that would hold packages back.
+    expect(satisfiesRange('1.2.3', '1.0.0 - 2.0.0')).toBe(true)
+    expect(satisfiesRange('1.0.0', '1.0.0 - 2.0.0')).toBe(true)
+    expect(satisfiesRange('2.0.0', '1.0.0 - 2.0.0')).toBe(true)
+    expect(satisfiesRange('2.5.0', '1.0.0 - 2.0.0')).toBe(false)
+  })
+
+  it('lets one modelable disjunct answer past one it cannot model', () => {
+    // A union is satisfied by ANY disjunct, so an unmodelable sibling does
+    // not make the whole range unanswerable when another admits the version.
+    expect(satisfiesRange('1.2.3', '1.0 - 2.0 || ^1.2.0')).toBe(true)
+    expect(satisfiesRange('9.9.9', '1.0 - 2.0 || ^1.2.0')).toBe(null)
   })
 })

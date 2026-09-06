@@ -149,6 +149,18 @@ blocked each package, and they stay held until someone does the migration
 deliberately — which is the point, since that migration is exactly what an
 unattended weekly job must not attempt.
 
+A breaking crossing is not the only thing held back. A batch can also leave a
+package resolving a version its own dependent no longer declares, with nothing
+moving at all: an `overrides` entry is authoritative for npm, so it pins a copy
+in place while the dependent that declares it is bumped out from under. npm
+raises nothing (the override is the instruction), and where the override also
+pins the matching `@types/*` package the consumer's own type-check cannot see
+it either. So the walk compares each edge against the range its dependent
+declares, on both sides, and holds back a package that makes a copy stop
+satisfying one. Only a **new** violation counts — an override already forcing a
+copy outside its range is a standing decision, and re-reporting it would stop
+every batch rather than the one that broke something.
+
 "One package at a time" means every name the repository declares *and* every
 name the bulk resolve moved underneath them. The transitives have to be in
 that list: a bare `npm update` walks the whole tree, while
