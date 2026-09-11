@@ -1491,17 +1491,43 @@ export function rebuildCandidates({ manifestBefore, lockBefore, lockAfter, works
  * rebuild never installed — so a name with several copies of which the
  * rebuild moved only some is named, and so is a new transitive the rebuild
  * never reached (Codex, twice), while one the rebuild moved somewhere else
- * entirely is not.
+ * entirely is not. A copy reachable from the manifests ONLY through a
+ * held-back name's record is that hold-back's own subtree and is left out
+ * of the count: holding eslint back necessarily leaves its new
+ * file-entry-cache tree behind, and holding rolldown back its platform
+ * binaries and oxc types, and naming each of those as a dropped move of its
+ * own turned two hold-backs into thirty-six lines on gedmap's first batch
+ * with this pass. Only "reachable only through": a copy with no recorded
+ * route at all (a lockfile without edge fields, an extraneous copy) is not
+ * explained by anything and stays counted. And only through a name that
+ * STAYS held: a name `moved` retracts (below) has no line left to cover its
+ * subtree, so a child of it the rebuild left behind is counted again
+ * (Codex).
  *
- * `moved`: a held-back name whose installed versions nonetheless differ
- * from HEAD's after the rebuild — the group re-apply carried it along as a
- * member's subdependency, at a version the validator accepted — AND for
- * which the same two dropped clauses, over every copy, now find nothing left
- * behind. Its line in `holdback.md` would claim a move that shipped, so the
- * workflow removes it (Codex). A held name the group carried only partly
- * ({1.0, 2.0} to {1.1, 2.0} against a bulk of {1.1, 2.1}) keeps its line,
- * which is still true of the copy that stayed (Codex again). Compared as
- * multisets, so a relocation alone retracts nothing.
+ * `moved`: a held-back name the rebuild nonetheless carried to exactly
+ * where the bulk had it — the group re-apply brought it along as a
+ * member's subdependency — so its line in `holdback.md` would claim a move
+ * that did not ship, and the workflow removes it (Codex). Judged by
+ * dependency EDGE: every edge into the name, keyed by the PATH of the
+ * record it leaves from (`.` for the root manifest), resolves after the
+ * rebuild to the version the bulk resolved it to, and some edge resolves
+ * differently from HEAD. Four findings against this one check settled the
+ * representation: a version multiset read the bulk moving the direct copy
+ * and the rebuild moving a nested one as the same {1.0, 1.1}; a per-path
+ * comparison of the copies read one relocated at the same version as a
+ * move; edges keyed by the parent's name and version aliased two copies of
+ * one parent. Keyed by the parent's path, every failure mode left is a
+ * line KEPT, never one deleted: a parent that itself relocated between the
+ * bulk and the rebuild keys its edge differently on the two sides, so the
+ * tallies differ and the line stays. The held copy relocating changes
+ * nothing, since the edge still resolves to the same version. So a held
+ * name the group carried only partly ({1.0, 2.0} to {1.1, 2.0} against a
+ * bulk of {1.1, 2.1}) keeps its line, and so does one carried to a version
+ * other than the bulk's — the line is about the bulk's move, and the PR
+ * body's summary lists the one that happened. A copy no recorded edge
+ * reaches (a lockfile without edge fields, an extraneous copy) is compared
+ * under a key of its own, as a multiset, so such a lockfile still gets an
+ * answer rather than never retracting.
  *
  * Any of the three lockfiles being unwalkable yields nothing to re-apply:
  * the validator refuses the batch on that shape regardless, and a diff
@@ -1621,20 +1647,42 @@ export function droppedByRebuild({
   // are two copies, and the bulk moving one of them is a move (Codex). Paths
   // are deliberately not part of it: a copy relocating at the same version
   // is not a dropped move.
-  const tallied = (packages, directPaths) => {
+  const tallied = (packages, excluded) => {
     const byName = new Map();
     for (const [name, copies] of installedVersions(packages)) {
       const tally = new Map();
       for (const [path, version] of copies) {
-        if (!directPaths.has(path)) tally.set(version, (tally.get(version) ?? 0) + 1);
+        if (!excluded.has(path)) tally.set(version, (tally.get(version) ?? 0) + 1);
       }
       if (tally.size) byName.set(name, tally);
     }
     return byName;
   };
-  const tBefore = tallied(before, rBefore.paths);
-  const tBulk = tallied(bulk, rBulk.paths);
-  const tAfter = tallied(after, rAfter.paths);
+  // The copies each lockfile reaches from its manifests, walking every
+  // recorded edge — and the same walk refusing to enter a held-back name's
+  // record. A copy the first walk reaches and the second does not sits only
+  // beneath a hold-back, and is that hold-back's, not a move of its own.
+  const reachable = (packages, avoid) => {
+    const seen = new Set();
+    const queue = consumers.map(([consumer]) => consumer);
+    while (queue.length) {
+      const from = queue.pop();
+      const record = packages[from];
+      if (record === null || typeof record !== "object") continue;
+      for (const field of EDGE_FIELDS) {
+        const edges = record[field];
+        if (edges === null || typeof edges !== "object") continue;
+        for (const name of Object.keys(edges)) {
+          if (avoid.has(name)) continue;
+          const hit = resolveEdgeInstance(packages, from, name);
+          if (!hit || seen.has(hit.path)) continue;
+          seen.add(hit.path);
+          queue.push(hit.path);
+        }
+      }
+    }
+    return seen;
+  };
   const count = (tally, version) => tally?.get(version) ?? 0;
   // Dropped means one of two things, and the two are the whole definition:
   //   - LEFT BEHIND: a copy the bulk removed (at some version it holds fewer
@@ -1665,26 +1713,84 @@ export function droppedByRebuild({
     }
     return leftBehind || (introduced > 0 && arrived === 0);
   };
+  // Held names first, by dependency EDGE: retract the hold-back line only
+  // for a name every edge into which resolves, after the rebuild, to what
+  // the bulk resolved it to, with some edge resolving differently from
+  // HEAD. Edges are keyed by the path of the record they leave from: a
+  // version multiset cannot tell the bulk moving the direct copy from the
+  // rebuild moving a nested one, a per-path view of the COPIES reads one
+  // relocated at the same version as a move, and a parent's name@version
+  // aliases two copies of that parent (Codex, four findings). A parent
+  // path can relocate too, but that only keys the edge differently on the
+  // two sides and keeps the line — the safe direction. First, because
+  // the subtree exclusion below has to know which names STAY held: a
+  // retracted line covers nothing, so a child that moved in the bulk and
+  // stayed at HEAD under a parent the group carried along is a drop of its
+  // own again, not the parent's (Codex).
+  const edgeTallies = (packages) => {
+    const byKey = new Map();
+    const resolvedPaths = new Set();
+    const bump = (key, version) => {
+      const tally = byKey.get(key) ?? new Map();
+      tally.set(version, (tally.get(version) ?? 0) + 1);
+      byKey.set(key, tally);
+    };
+    for (const [path, record] of Object.entries(packages)) {
+      if (record === null || typeof record !== "object" || record.link) continue;
+      const from = path === "" ? "." : path;
+      for (const field of EDGE_FIELDS) {
+        const edges = record[field];
+        if (edges === null || typeof edges !== "object") continue;
+        for (const name of Object.keys(edges)) {
+          const hit = resolveEdgeInstance(packages, path, name);
+          bump(`${from} -> ${name}`, hit ? hit.version : "-");
+          if (hit) resolvedPaths.add(hit.path);
+        }
+      }
+    }
+    // A copy no recorded edge reaches keeps a key of its own, as a multiset.
+    for (const [name, copies] of installedVersions(packages)) {
+      for (const [path, version] of copies) if (!resolvedPaths.has(path)) bump(`? -> ${name}`, version);
+    }
+    return byKey;
+  };
+  const eBefore = edgeTallies(before);
+  const eBulk = edgeTallies(bulk);
+  const eAfter = edgeTallies(after);
+  const sameTally = (x, y) =>
+    [...new Set([...(x?.keys() ?? []), ...(y?.keys() ?? [])])].every(
+      (v) => (x?.get(v) ?? 0) === (y?.get(v) ?? 0),
+    );
+  const moved = [...held]
+    .filter((name) => {
+      const suffix = ` -> ${name}`;
+      const keys = new Set(
+        [...eBefore.keys(), ...eBulk.keys(), ...eAfter.keys()].filter((k) => k.endsWith(suffix)),
+      );
+      let changed = false;
+      for (const key of keys) {
+        if (!sameTally(eBefore.get(key), eAfter.get(key))) changed = true;
+        if (!sameTally(eBulk.get(key), eAfter.get(key))) return false;
+      }
+      return changed;
+    })
+    .sort();
+  const stillHeld = new Set([...held].filter((name) => !moved.includes(name)));
+
+  const heldOnly = (packages) => {
+    if (stillHeld.size === 0) return new Set();
+    const avoiding = reachable(packages, stillHeld);
+    return new Set([...reachable(packages, new Set())].filter((path) => !avoiding.has(path)));
+  };
+  const excluded = (packages, directPaths) => new Set([...directPaths, ...heldOnly(packages)]);
+  const tBefore = tallied(before, excluded(before, rBefore.paths));
+  const tBulk = tallied(bulk, excluded(bulk, rBulk.paths));
+  const tAfter = tallied(after, excluded(after, rAfter.paths));
   const transitive = [];
   for (const name of new Set([...tBefore.keys(), ...tBulk.keys()])) {
     if (held.has(name)) continue;
     if (droppedBetween(tBefore.get(name), tBulk.get(name), tAfter.get(name))) transitive.push(name);
   }
-
-  // Held names, over EVERY copy: retract the hold-back line only for a name
-  // the rebuild changed and left nothing of behind, by the same two clauses.
-  const none = new Set();
-  const allBefore = tallied(before, none);
-  const allBulk = tallied(bulk, none);
-  const allAfter = tallied(after, none);
-  const sameTally = (x, y) => [...versionsOf(x, y)].every((v) => count(x, v) === count(y, v));
-  const moved = [...held]
-    .filter(
-      (name) =>
-        !sameTally(allBefore.get(name), allAfter.get(name)) &&
-        !droppedBetween(allBefore.get(name), allBulk.get(name), allAfter.get(name)),
-    )
-    .sort();
   return { direct, transitive: transitive.sort(), moved };
 }
 

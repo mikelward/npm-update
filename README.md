@@ -189,7 +189,9 @@ it was — `~4.1.10` already admits 4.1.11 — and an install with nothing to do
 keeps whatever the lockfile has. A group that still fails is rolled back and
 named in the PR body, and so is a member the resolve still left at HEAD, and
 a transitive the bulk moved that no single re-resolve reached, since nothing
-can ask for one of those by version.
+can ask for one of those by version. A transitive that sits only beneath a
+held-back package is not named again: it moved because its parent did, and
+the parent's line already says why the move stayed behind.
 
 Two consequences worth knowing:
 
