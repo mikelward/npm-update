@@ -2884,6 +2884,74 @@ describe('droppedByRebuild', () => {
     })
   })
 
+  it('leaves out the subtree that sits only beneath a held-back name: that is the hold-back, not more drops', () => {
+    // gedmap's first batch with this pass: eslint held back for taking
+    // file-entry-cache across a major, and then file-entry-cache, its new
+    // flat-cache tree and every other copy that moved only because eslint
+    // did were each named as a dropped move of their own — two hold-backs,
+    // thirty-six lines. A copy reachable from the manifests only through
+    // the held record moved for the hold-back's reasons and is covered by
+    // its line. One reachable some other way as well is still counted, and
+    // still named when the rebuild left it behind.
+    const m = { devDependencies: { eslint: '^1.0.0', other: '^1.0.0' } }
+    const rootRecord = { devDependencies: { eslint: '^1.0.0', other: '^1.0.0' } }
+    const tree = ({ eslint, fec, keyv, z, flat }) => lock({
+      'node_modules/eslint': { version: eslint, dependencies: { 'file-entry-cache': fec === '8.0.0' ? '^8.0.0' : '^11.0.0' } },
+      'node_modules/file-entry-cache': { version: fec, dependencies: { keyv: '^1.0.0', ...(flat ? { 'flat-cache': '^1.0.0' } : {}) } },
+      ...(flat ? { 'node_modules/flat-cache': { version: flat } } : {}),
+      // keyv is reached through eslint AND through `other`, so it counts.
+      'node_modules/keyv': { version: keyv },
+      'node_modules/other': { version: '1.0.0', dependencies: { keyv: '^1.0.0', z: '^1.0.0' } },
+      'node_modules/z': { version: z },
+    }, rootRecord)
+    const before = tree({ eslint: '1.0.0', fec: '8.0.0', keyv: '1.0.0', z: '1.0.0' })
+    const moved = tree({ eslint: '1.1.0', fec: '11.0.0', keyv: '1.0.1', z: '1.0.1', flat: '1.0.0' })
+    // The rebuild held eslint back and did not reach keyv or z either.
+    const r = droppedByRebuild({ manifestBefore: m, lockBefore: before, lockBulk: moved, lockAfter: before, heldBack: ['eslint'] })
+    expect(r.transitive).toEqual(['keyv', 'z'])
+    // Without the hold-back, eslint's subtree is nobody's to explain.
+    const all = droppedByRebuild({ manifestBefore: m, lockBefore: before, lockBulk: moved, lockAfter: before })
+    expect(all.transitive).toEqual(['file-entry-cache', 'flat-cache', 'keyv', 'z'])
+  })
+
+  it('counts a held-back name\'s subtree again once the group carried the name itself along', () => {
+    // The parent's hold-back line is retracted (`moved`), so it covers
+    // nothing any more; a child of it the bulk moved and the group left at
+    // HEAD is a drop of its own again. With the parent still at HEAD it is
+    // the parent's, as above.
+    const m = { dependencies: { p: '^1.0.0' } }
+    const rootRecord = { dependencies: { p: '^1.0.0' } }
+    const tree = (p, child) => lock({ 'node_modules/p': { version: p, dependencies: { child: '*' } }, 'node_modules/child': child }, rootRecord)
+    const before = tree('1.0.0', '1.0.0')
+    const moved = tree('1.1.0', '1.1.0')
+    const carried = droppedByRebuild({ manifestBefore: m, lockBefore: before, lockBulk: moved, lockAfter: tree('1.1.0', '1.0.0'), heldBack: ['p'] })
+    expect(carried).toEqual({ direct: [], transitive: ['child'], moved: ['p'] })
+    const stillHeld = droppedByRebuild({ manifestBefore: m, lockBefore: before, lockBulk: moved, lockAfter: before, heldBack: ['p'] })
+    expect(stillHeld).toEqual({ direct: [], transitive: [], moved: [] })
+  })
+
+  it('keeps a held name\'s line when the rebuild moved a DIFFERENT copy of it than the bulk did', () => {
+    // A rejected group member is held by the time of the read after the
+    // group; the bulk had moved the copy the manifest resolves, the loop's
+    // other re-resolves moved a nested copy instead. As multisets both
+    // sides read {1.0, 1.1}, and a multiset comparison would retract the
+    // only notice that the direct move failed (Codex). Copy for copy, the
+    // direct one is still where HEAD had it, so the line stays.
+    const m = { dependencies: { p: '^1.0.0', q: '^1.0.0' } }
+    const rootRecord = { dependencies: { p: '^1.0.0', q: '^1.0.0' } }
+    const tree = (direct, nested) => lock({
+      'node_modules/p': direct,
+      'node_modules/q': { version: '1.0.0', dependencies: { p: '1.0.0' } },
+      'node_modules/q/node_modules/p': nested,
+    }, rootRecord)
+    const before = tree('1.0.0', '1.0.0')
+    const r = droppedByRebuild({ manifestBefore: m, lockBefore: before, lockBulk: tree('1.1.0', '1.0.0'), lockAfter: tree('1.0.0', '1.1.0'), heldBack: ['p'] })
+    expect(r.moved).toEqual([])
+    // Carried exactly as the bulk had it, the line goes.
+    const carried = droppedByRebuild({ manifestBefore: m, lockBefore: before, lockBulk: tree('1.1.0', '1.0.0'), lockAfter: tree('1.1.0', '1.0.0'), heldBack: ['p'] })
+    expect(carried.moved).toEqual(['p'])
+  })
+
   it('leaves out a held-back name: it was rejected, not dropped, and is already reported', () => {
     const r = droppedByRebuild({ manifestBefore: manifest, lockBefore: head, lockBulk: bulk, lockAfter: head, heldBack: ['r', 'a', 'x'] })
     expect(r.direct.map((d) => d.name)).toEqual(['b'])
@@ -2996,10 +3064,53 @@ describe('droppedByRebuild', () => {
     // line saying x was held back would now be false.
     const m = { dependencies: { a: '^1.0.0' } }
     const at = (a, x) => lock({ 'node_modules/a': a, 'node_modules/x': x })
-    const r = droppedByRebuild({ manifestBefore: m, lockBefore: at('1.0.0', '0.1.0'), lockBulk: at('1.1.0', '0.2.0'), lockAfter: at('1.1.0', '0.1.5'), heldBack: ['x'] })
+    const r = droppedByRebuild({ manifestBefore: m, lockBefore: at('1.0.0', '0.1.0'), lockBulk: at('1.1.0', '0.2.0'), lockAfter: at('1.1.0', '0.2.0'), heldBack: ['x'] })
     expect(r.moved).toEqual(['x'])
     // Still where HEAD had it: the line stays true, and stays.
     expect(droppedByRebuild({ manifestBefore: m, lockBefore: at('1.0.0', '0.1.0'), lockBulk: at('1.1.0', '0.2.0'), lockAfter: at('1.0.0', '0.1.0'), heldBack: ['x'] }).moved).toEqual([])
+    // Carried to a version other than the bulk's: the line is about the
+    // bulk's move, which did not ship, and the summary lists the one that did.
+    expect(droppedByRebuild({ manifestBefore: m, lockBefore: at('1.0.0', '0.1.0'), lockBulk: at('1.1.0', '0.2.0'), lockAfter: at('1.1.0', '0.1.5'), heldBack: ['x'] }).moved).toEqual([])
+  })
+
+  it('keeps a held name\'s line when the rebuild moved it under a DIFFERENT copy of the same parent', () => {
+    // Codex: two q@1.0.0 copies, one under a and one under b, each with its
+    // own nested r. The bulk moved r under a's q; the rebuild moved r under
+    // b's q. Keyed by the parent's name and version the two edges collapse
+    // into one tally that reads the same on both sides; keyed by the
+    // parent's path they are two edges, and a's still resolves 1 where the
+    // bulk resolved 2.
+    const m = { dependencies: { a: '^1.0.0', b: '^1.0.0' } }
+    const rootRecord = { dependencies: { a: '^1.0.0', b: '^1.0.0' } }
+    const tree = (ra, rb) => lock({
+      'node_modules/a': { version: '1.0.0', dependencies: { q: '1.0.0' } },
+      'node_modules/a/node_modules/q': { version: '1.0.0', dependencies: { r: '*' } },
+      'node_modules/a/node_modules/r': ra,
+      'node_modules/b': { version: '1.0.0', dependencies: { q: '1.0.0' } },
+      'node_modules/b/node_modules/q': { version: '1.0.0', dependencies: { r: '*' } },
+      'node_modules/b/node_modules/r': rb,
+    }, rootRecord)
+    const before = tree('1.0.0', '1.0.0')
+    const bulk = tree('2.0.0', '1.0.0')
+    expect(droppedByRebuild({ manifestBefore: m, lockBefore: before, lockBulk: bulk, lockAfter: tree('1.0.0', '2.0.0'), heldBack: ['r'] }).moved).toEqual([])
+    expect(droppedByRebuild({ manifestBefore: m, lockBefore: before, lockBulk: bulk, lockAfter: tree('2.0.0', '1.0.0'), heldBack: ['r'] }).moved).toEqual(['r'])
+  })
+
+  it('keeps a held name\'s line when the rebuild only relocated the copy the bulk had moved', () => {
+    // Codex: the bulk took q's nested r from 1 to 2; the rebuild kept r@1
+    // and hoisted it. Path for path that reads as a change at a new path
+    // and nothing left in place; by edge, q@1.0.0 -> r resolves 1 where
+    // the bulk resolved 2, so the move did not ship and the line stays.
+    const m = { dependencies: { q: '^1.0.0' } }
+    const rootRecord = { dependencies: { q: '^1.0.0' } }
+    const q = (r) => ({ version: '1.0.0', dependencies: { r } })
+    const before = lock({ 'node_modules/q': q('^1.0.0'), 'node_modules/q/node_modules/r': '1.0.0' }, rootRecord)
+    const moved = lock({ 'node_modules/q': q('^2.0.0'), 'node_modules/q/node_modules/r': '2.0.0' }, rootRecord)
+    const hoisted = lock({ 'node_modules/q': q('^1.0.0'), 'node_modules/r': '1.0.0' }, rootRecord)
+    expect(droppedByRebuild({ manifestBefore: m, lockBefore: before, lockBulk: moved, lockAfter: hoisted, heldBack: ['r'] }).moved).toEqual([])
+    // Hoisted AND at the bulk's version: the edge agrees with the bulk, so it goes.
+    const hoistedMoved = lock({ 'node_modules/q': q('^2.0.0'), 'node_modules/r': '2.0.0' }, rootRecord)
+    expect(droppedByRebuild({ manifestBefore: m, lockBefore: before, lockBulk: moved, lockAfter: hoistedMoved, heldBack: ['r'] }).moved).toEqual(['r'])
   })
 
   it('keeps the hold-back line of a held name the group carried only partly', () => {
@@ -3198,7 +3309,10 @@ describe('the CLI run from a nested npm tree', () => {
     // And a package the loop did move is not dropped, whatever version it reached.
     writeFileSync(join(cwd, 'package-lock.json'), lockFor('1.0.1'))
     expect(runFrom(cwd, 'dropped', bulk)).toBe('')
-    // A held-back name that moved after all is reported as such, so its line can go.
+    // A held-back name carried to where the bulk had it is reported as
+    // such, so its line can go; carried elsewhere, the line stays.
+    expect(runFrom(cwd, 'dropped', bulk, 'dep')).toBe('')
+    writeFileSync(join(cwd, 'package-lock.json'), lockFor('1.0.2'))
     expect(runFrom(cwd, 'dropped', bulk, 'dep')).toBe('moved\tdep\n')
   })
 

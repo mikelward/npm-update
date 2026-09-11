@@ -199,7 +199,11 @@ has stopped biting.
   single bare `npm install` — and validated like any step of the loop, and
   what still fails — or a dropped transitive, which nothing can ask for by
   version, or a member the accepted group's resolve still left at HEAD — is
-  named in `holdback.md`. The record goes because the range write alone is
+  named in `holdback.md`. A transitive is a drop of its own only on the
+  manifests' side of a hold-back: a copy reachable only through a held-back
+  record moved for that hold-back's reasons, and its line covers it —
+  gedmap's first batch with this pass named eslint and rolldown and then
+  thirty-four packages that had moved only because they had. The record goes because the range write alone is
   not enough: the bulk keeps a declaration whose range already admits the
   new version (`~4.1.10` spans 4.1.11, and `npm update --save` does not
   narrow it), so writing that range back changes nothing, and a bare

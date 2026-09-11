@@ -622,6 +622,10 @@ jobs:
                 for consumer in "${consumers[@]}"; do
                   for name in ${members[$consumer]}; do
                     printf -- '- `%s`: moved to %s (`%s`) in the bulk resolve only together with the rest of this group, and re-applying the group failed: %s\n' "$name" "${version_of[$consumer/$name]}" "${range_of[$consumer/$name]}" "$rejected" >> holdback.md
+                    # Held back now, like the loop's rejects: the read below
+                    # then charges the member's own subtree to this line
+                    # rather than naming each copy under it as a drop.
+                    held+=("$name")
                   done
                 done
               fi
@@ -647,10 +651,16 @@ jobs:
             #
             # And a member the accepted group's resolve placed back at
             # HEAD's version after all is named too, rather than read as
-            # nothing (Codex): `rejected` is the group's verdict here — reset
-            # when the group began, and no direct record survives without a
-            # group — so the rejected case, whose members are already named
-            # above, does not name them twice.
+            # nothing (Codex). A rejected group's members are held by now,
+            # so the read cannot offer them again; the guard on `rejected`
+            # (the group's verdict, reset when the group began) is the
+            # belt to that suspender.
+            #
+            # Only what sits on the manifests' own side of a hold-back is
+            # read as a drop: a copy reachable only through a held-back
+            # record moved for that hold-back's reasons and is covered by
+            # its line. Two hold-backs on gedmap's first batch with this
+            # pass came with thirty-four such lines.
             left=$(node "$CHECKER" dropped "$snapshot/bulk-lock.json" ${held[@]+"${held[@]}"})
             while IFS=$'\t' read -r kind name member version range _; do
               case "$kind" in

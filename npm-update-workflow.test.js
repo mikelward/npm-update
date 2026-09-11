@@ -2721,13 +2721,14 @@ describe("holding back only what a breaking transitive blocks", () => {
         "npm pkg set dependencies[b]=~1.0.0",
         "npm install --ignore-scripts",
       ]);
-      // holdback.md names the rejected package and the transitive nothing
-      // could reach, and not the pair, which shipped.
+      // holdback.md names the rejected package, and not the pair, which
+      // shipped — nor x, which sits only beneath r and moved only because
+      // r did: r's own line already says it resolves x across the step.
       expect(r.holdback).toMatch(/^- `r`: r@1\.0\.0 .* 0\.1\.0 -> 0\.2\.0/m);
-      expect(r.holdback).toMatch(/^- `x`: moved in the bulk resolve only as a transitive copy, .*no single re-resolve reached it/m);
-      expect(r.holdback).not.toMatch(/`a`|`b`|`c`/);
+      expect(r.holdback).not.toMatch(/^- `(a|b|c|x)`:/m);
       // The trusted copy the PR body is rebuilt from says the same.
-      expect(r.output).toContain("- `x`: moved in the bulk resolve");
+      expect(r.output).toContain("- `r`: r@1.0.0");
+      expect(r.output).not.toContain("- `x`:");
     } finally {
       r.cleanup();
     }
