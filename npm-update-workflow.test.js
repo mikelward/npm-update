@@ -35,6 +35,7 @@ import {
 import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 // yaml-lite tracks @main like the rest of the fleet's shared machinery
 // (lanes, codex-review, the reusable workflows) instead of living here as
 // a vendored copy that needs syncing. CI checks the canonical repo out
@@ -2441,9 +2442,349 @@ describe("holding back only what a breaking transitive blocks", () => {
       .split("\n")
       .filter((line) => !line.trimStart().startsWith("#"))
       .join("\n");
-    const updates = script.match(/npm update --[^\n]*/g) ?? [];
-    expect(updates.length).toBeGreaterThan(0);
-    for (const cmd of updates) expect(cmd).toContain("--ignore-scripts");
+    // Both verbs: the loop re-resolves with `npm update`, the group
+    // re-apply after it with one bare `npm install`.
+    const resolves = script.match(/npm (?:update|install) --[^\n]*/g) ?? [];
+    expect(resolves.some((cmd) => cmd.startsWith("npm update"))).toBe(true);
+    expect(resolves.some((cmd) => cmd.startsWith("npm install"))).toBe(true);
+    for (const cmd of resolves) expect(cmd).toContain("--ignore-scripts");
+  });
+
+  it("keeps the bulk lockfile past the restore, and re-applies what the loop dropped as one group", () => {
+    // A peer-pinned pair (vitest + @vitest/coverage-v8) moves in the bulk
+    // resolve and in no single `npm update`, so the loop validates an
+    // unchanged tree for each member and moves on: neither held back nor
+    // moved, dropped without a line in the PR body. The bulk lockfile is
+    // the only record of the versions to ask for, so it has to survive the
+    // restore to HEAD.
+    const run = step.run;
+    const keep = run.indexOf('cp package-lock.json "$snapshot/bulk-lock.json"');
+    const restore = run.indexOf('git checkout HEAD -- "${manifests[@]}"');
+    expect(keep).toBeGreaterThan(-1);
+    expect(keep).toBeLessThan(restore);
+    // The loop's rejects travel along, so a held-back name is neither
+    // retried as part of the group nor reported twice.
+    expect(run).toContain('held+=("$name")');
+    expect(run).toContain('node "$CHECKER" dropped "$snapshot/bulk-lock.json" ${held[@]+"${held[@]}"}');
+    // Re-applied by writing the bulk's declared RANGE into each declaring
+    // manifest (root, or the workspace's own), then ONE resolve for all of
+    // them, validated the same way the loop validates each package, and
+    // rolled back and named on failure. The range rather than a bare
+    // version: a bare version is saved under the ambient save-prefix, which
+    // would turn a `~` declaration into `^` and have the checker reject a
+    // move the bulk made legitimately (Codex). One resolve rather than one
+    // per manifest: a peer-pinned pair split across two manifests would
+    // fail the first on the conflict the second removes (Codex).
+    expect(run).toContain('declare_range=(npm pkg set "${section_of[$key]}[$name]=${range_of[$key]}")');
+    expect(run).toContain(
+      'declare_range=(npm pkg set --workspace "$consumer" "${section_of[$key]}[$name]=${range_of[$key]}")',
+    );
+    // Between the range writes and the resolve, each member's own lockfile
+    // record goes: a `~` the bulk left alone makes the range write a
+    // no-op, and a bare install with nothing to do keeps the lockfile's
+    // copy — the member dropped again, past the re-apply (Codex). With
+    // the record gone the edge is one npm must place afresh.
+    const unresolve = run.indexOf('node "$CHECKER" unresolve "${records[@]}"');
+    expect(unresolve).toBeGreaterThan(run.indexOf("declare_range=(npm pkg set"));
+    const group = run.indexOf('if [ -z "$rejected" ] && ! attempt=$(npm install --ignore-scripts 2>&1); then');
+    expect(group).toBeGreaterThan(unresolve);
+    const validate = run.indexOf(
+      'if [ -z "$rejected" ] && ! attempt=$(node "$CHECKER" 2>&1 >/dev/null); then',
+      group,
+    );
+    expect(validate).toBeGreaterThan(group);
+    expect(run.slice(validate)).toContain('tar -xf "$snapshot/manifests.tar"');
+    expect(run.slice(validate)).toContain("re-applying the group failed");
+    // A dropped transitive is named rather than left silent, and read
+    // AFTER the group, so a member's own subdependencies no longer count.
+    const transitive = run.indexOf("transitive)", validate);
+    expect(transitive).toBeGreaterThan(validate);
+    expect(run.slice(transitive)).toContain("no single re-resolve reached it");
+    // And a held-back name the accepted group carried along loses its
+    // hold-back line, matched on the whole "- `name`: " prefix.
+    expect(run.slice(validate)).toContain("moved)");
+    expect(run.slice(validate)).toContain('grep -v -F -- "- \\`$name\\`: " holdback.md');
+    // A member the accepted group's resolve still left at HEAD is named,
+    // not read as nothing: the `direct` record it prints again is a
+    // case, not a fall-through (Codex).
+    const direct = run.indexOf("direct)", validate);
+    expect(direct).toBeGreaterThan(validate);
+    expect(run.slice(direct)).toContain("re-applying the group resolved without it");
+  });
+
+  // The pass end to end: the real step script, the real checker, a real git
+  // repository, and a fake npm that does what npm does for a peer-pinned
+  // pair -- moves it in the bulk resolve, moves neither member alone, and
+  // for a bare `npm install` is driven by the lockfile: it places the pair
+  // afresh only when their records are gone, and otherwise keeps what the
+  // lockfile has, whatever the manifests say (verified against npm 11.19).
+  // Structure can't prove this one: the failure it guards is the loop
+  // finishing green with a package quietly missing.
+  //
+  // The tree: `a` and `b` peer-pin each other; `c` is a's subdependency;
+  // `r` depends on `x` across a 0.x step, the crossing that sends the batch
+  // down the rebuild path. HEAD has everything at its oldest, the bulk
+  // resolve moved all five, and the loop can reproduce only r's move.
+  // `groupStalls` is the resolve placing the pair back at HEAD's versions
+  // after all — a registry that no longer offers 1.0.5, say — which the
+  // step has to name rather than read as nothing. Only a member whose
+  // range the bulk left alone can stall and still validate (a caret the
+  // bulk rewrote excludes the old version, and the checker says so), so in
+  // that variant a is declared with a tilde too.
+  function runHoldbackPass({ groupCrosses, groupStalls = false }) {
+    const scratch = mkdtempSync(join(tmpdir(), "npm-update-holdback-"));
+    const repo = join(scratch, "repo");
+    const bin = join(scratch, "bin");
+    mkdirSync(repo);
+    mkdirSync(bin);
+    // a is declared with a caret, b with a tilde, and the bulk moves both by
+    // a patch step (the only move a tilde admits). The bulk rewrites a's
+    // caret to `^1.0.5` and leaves b's `~1.0.0` exactly as it was — what
+    // `npm update --save` does with a range the new version already
+    // satisfies — so the group re-apply has to carry each declaration's
+    // own operator through, and cannot rely on the range write to make
+    // npm move b: for b it writes what is already there.
+    const aRange = (floor) => (groupStalls ? "~1.0.0" : `^${floor}`);
+    const lock = ({ a, b, c, x, floor = "1.0.0" }) =>
+      JSON.stringify(
+        {
+          name: "app",
+          version: "1.0.0",
+          lockfileVersion: 3,
+          requires: true,
+          packages: {
+            "": { name: "app", version: "1.0.0", dependencies: { a: aRange(floor), b: "~1.0.0", r: "^1.0.0" } },
+            "node_modules/a": {
+              version: a,
+              resolved: `https://registry.example.com/a-${a}.tgz`,
+              dependencies: { c: "^1.0.0" },
+              peerDependencies: { b },
+            },
+            "node_modules/b": {
+              version: b,
+              resolved: `https://registry.example.com/b-${b}.tgz`,
+              peerDependencies: { a },
+            },
+            "node_modules/c": { version: c, resolved: `https://registry.example.com/c-${c}.tgz` },
+            "node_modules/r": {
+              version: "1.0.0",
+              resolved: "https://registry.example.com/r-1.0.0.tgz",
+              dependencies: { x: "^0.1.0 || ^0.2.0" },
+            },
+            "node_modules/x": { version: x, resolved: `https://registry.example.com/x-${x}.tgz` },
+          },
+        },
+        null,
+        2,
+      ) + "\n";
+    const manifest = (floor) =>
+      JSON.stringify(
+        { name: "app", version: "1.0.0", dependencies: { a: aRange(floor), b: "~1.0.0", r: "^1.0.0" } },
+        null,
+        2,
+      ) + "\n";
+    // What the fake npm hands back: r alone reproduces the crossing; the
+    // group brings a, b and c along -- and, when asked to, drags x across
+    // the 0.x step too, which is the shape the checker has to reject.
+    writeFileSync(join(scratch, "r-alone-lock.json"), lock({ a: "1.0.0", b: "1.0.0", c: "1.0.0", x: "0.2.0" }));
+    writeFileSync(
+      join(scratch, "group-lock.json"),
+      groupStalls
+        ? lock({ a: "1.0.0", b: "1.0.0", c: "1.0.0", x: "0.1.0" })
+        : lock({ a: "1.0.5", b: "1.0.5", c: "1.0.1", x: groupCrosses ? "0.2.0" : "0.1.0", floor: "1.0.5" }),
+    );
+    // `npm pkg set` writes the range into the manifest, as npm's does.
+    writeFileSync(
+      join(scratch, "pkg-set.mjs"),
+      [
+        'import { readFileSync, writeFileSync } from "node:fs";',
+        "const [, section, name, range] = process.argv[2].match(/^([^[]+)\\[([^\\]]+)\\]=(.*)$/);",
+        'const m = JSON.parse(readFileSync("package.json", "utf8"));',
+        "m[section][name] = range;",
+        'writeFileSync("package.json", JSON.stringify(m, null, 2) + "\\n");',
+        "",
+      ].join("\n"),
+    );
+    // A bare `npm install` is driven by the lockfile: the pair is placed
+    // afresh only when neither record is there, and a lockfile that still
+    // has them is left exactly as it is, whatever the manifests now say.
+    writeFileSync(
+      join(scratch, "install.mjs"),
+      [
+        'import { copyFileSync, readFileSync } from "node:fs";',
+        'const { packages } = JSON.parse(readFileSync("package-lock.json", "utf8"));',
+        'if (!("node_modules/a" in packages) && !("node_modules/b" in packages)) {',
+        '  copyFileSync(`${process.env.WORK}/group-lock.json`, "package-lock.json");',
+        "}",
+        "",
+      ].join("\n"),
+    );
+    writeFileSync(
+      join(bin, "npm"),
+      [
+        "#!/bin/bash",
+        'echo "npm $*" >> "$WORK/npm-calls.log"',
+        'case "$*" in',
+        '  "update --save --ignore-scripts -- r") cp "$WORK/r-alone-lock.json" package-lock.json ;;',
+        '  "update --save --ignore-scripts -- "*) : ;;',
+        '  "pkg set "*) node "$WORK/pkg-set.mjs" "$3" ;;',
+        '  "install --ignore-scripts") node "$WORK/install.mjs" ;;',
+        '  *) echo "fake npm: unexpected invocation: npm $*" >&2; exit 1 ;;',
+        "esac",
+        "",
+      ].join("\n"),
+      { mode: 0o755 },
+    );
+    const git = (...args) =>
+      execFileSync("git", [
+        "-C", repo,
+        "-c", "user.name=t", "-c", "user.email=t@example.com",
+        "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null",
+        ...args,
+      ]);
+    git("init", "-q");
+    writeFileSync(join(repo, "package.json"), manifest("1.0.0"));
+    writeFileSync(join(repo, "package-lock.json"), lock({ a: "1.0.0", b: "1.0.0", c: "1.0.0", x: "0.1.0" }));
+    git("add", "-A");
+    git("commit", "-q", "-m", "base");
+    // The bulk resolve's result is what the step finds on disk.
+    writeFileSync(join(repo, "package.json"), manifest("1.0.5"));
+    writeFileSync(
+      join(repo, "package-lock.json"),
+      lock({ a: "1.0.5", b: "1.0.5", c: "1.0.1", x: "0.2.0", floor: "1.0.5" }),
+    );
+    const out = join(scratch, "out.txt");
+    const summary = join(scratch, "summary.txt");
+    writeFileSync(out, "");
+    writeFileSync(summary, "");
+    let status = 0;
+    let stdout = "";
+    try {
+      stdout = execFileSync("bash", ["-c", step.run], {
+        cwd: repo,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+        env: {
+          ...process.env,
+          PATH: `${bin}:${process.env.PATH}`,
+          WORK: scratch,
+          CHECKER: fileURLToPath(new URL("./check-npm-update.mjs", import.meta.url)),
+          GITHUB_OUTPUT: out,
+          GITHUB_STEP_SUMMARY: summary,
+          RUNNER_TEMP: scratch,
+        },
+      });
+    } catch (err) {
+      status = err.status;
+      stdout = `${err.stdout ?? ""}${err.stderr ?? ""}`;
+    }
+    const packages = JSON.parse(readFileSync(join(repo, "package-lock.json"), "utf8")).packages;
+    const versions = Object.fromEntries(
+      Object.entries(packages)
+        .filter(([path]) => path !== "")
+        .map(([path, entry]) => [path.slice("node_modules/".length), entry.version]),
+    );
+    return {
+      status,
+      stdout,
+      versions,
+      ranges: JSON.parse(readFileSync(join(repo, "package.json"), "utf8")).dependencies,
+      holdback: readFileSync(join(repo, "holdback.md"), "utf8"),
+      output: readFileSync(out, "utf8"),
+      calls: readFileSync(join(scratch, "npm-calls.log"), "utf8").trim().split("\n"),
+      cleanup: () => rmSync(scratch, { recursive: true, force: true }),
+    };
+  }
+
+  it("re-applies a peer-pinned pair the loop dropped, as one group, and names what still could not move", () => {
+    const r = runHoldbackPass({ groupCrosses: false });
+    try {
+      expect(r.status).toBe(0);
+      // The pair is at the bulk's versions, with its subdependency; the
+      // package the loop held back, and the crossing under it, are not.
+      expect(r.versions).toEqual({ a: "1.0.5", b: "1.0.5", c: "1.0.1", r: "1.0.0", x: "0.1.0" });
+      // Each declaration keeps its own operator, and b's range is the one
+      // the bulk left alone.
+      expect(r.ranges).toEqual({ a: "^1.0.5", b: "~1.0.0", r: "^1.0.0" });
+      // Every candidate tried alone first -- declared names, then the
+      // transitives the bulk moved -- then each member's declared range
+      // written into its manifest (b's a no-op), then ONE resolve for the
+      // whole group. The records went in between, through the checker: the
+      // fake install moves the pair only because they did.
+      expect(r.calls).toEqual([
+        "npm update --save --ignore-scripts -- a",
+        "npm update --save --ignore-scripts -- b",
+        "npm update --save --ignore-scripts -- r",
+        "npm update --save --ignore-scripts -- c",
+        "npm update --save --ignore-scripts -- x",
+        "npm pkg set dependencies[a]=^1.0.5",
+        "npm pkg set dependencies[b]=~1.0.0",
+        "npm install --ignore-scripts",
+      ]);
+      // holdback.md names the rejected package and the transitive nothing
+      // could reach, and not the pair, which shipped.
+      expect(r.holdback).toMatch(/^- `r`: r@1\.0\.0 .* 0\.1\.0 -> 0\.2\.0/m);
+      expect(r.holdback).toMatch(/^- `x`: moved in the bulk resolve only as a transitive copy, .*no single re-resolve reached it/m);
+      expect(r.holdback).not.toMatch(/`a`|`b`|`c`/);
+      // The trusted copy the PR body is rebuilt from says the same.
+      expect(r.output).toContain("- `x`: moved in the bulk resolve");
+    } finally {
+      r.cleanup();
+    }
+  });
+
+  it("rolls the group back and names every member when re-applying it crosses a boundary", () => {
+    const r = runHoldbackPass({ groupCrosses: true });
+    try {
+      // The manifests are back at HEAD, byte for byte...
+      expect(r.versions).toEqual({ a: "1.0.0", b: "1.0.0", c: "1.0.0", r: "1.0.0", x: "0.1.0" });
+      expect(r.ranges).toEqual({ a: "^1.0.0", b: "~1.0.0", r: "^1.0.0" });
+      // ...each member is named with the bulk's version, its declared range
+      // and the reason...
+      expect(r.holdback).toMatch(
+        /^- `a`: moved to 1\.0\.5 \(`\^1\.0\.5`\) in the bulk resolve only together with the rest of this group, and re-applying the group failed: .*0\.1\.0 -> 0\.2\.0/m,
+      );
+      expect(r.holdback).toMatch(/^- `b`: moved to 1\.0\.5 \(`~1\.0\.0`\) in the bulk resolve only together/m);
+      // ...and with nothing left moved, the pass fails loudly rather than
+      // letting the next step end the batch as "nothing to update".
+      expect(r.status).toBeGreaterThan(0);
+      expect(r.stdout).toContain("Nothing survived the rebuild");
+    } finally {
+      r.cleanup();
+    }
+  });
+
+  it("names a member the accepted group's resolve still left at HEAD, rather than reading it as nothing", () => {
+    const r = runHoldbackPass({ groupCrosses: false, groupStalls: true });
+    try {
+      // The group's resolve validated -- every member within the range it
+      // kept -- and moved nothing: the range writes were no-ops, so
+      // nothing on disk says the pair was ever asked for...
+      expect(r.versions).toEqual({ a: "1.0.0", b: "1.0.0", c: "1.0.0", r: "1.0.0", x: "0.1.0" });
+      expect(r.ranges).toEqual({ a: "~1.0.0", b: "~1.0.0", r: "^1.0.0" });
+      expect(r.calls.slice(-3)).toEqual([
+        "npm pkg set dependencies[a]=~1.0.0",
+        "npm pkg set dependencies[b]=~1.0.0",
+        "npm install --ignore-scripts",
+      ]);
+      // ...except the PR body, which names each member once, with the
+      // version that did not ship and the range it kept.
+      for (const name of ["a", "b"]) {
+        expect(r.holdback).toMatch(
+          new RegExp(
+            `^- \`${name}\`: moved to 1\\.0\\.5 \\(\`~1\\.0\\.0\`\\) in the bulk resolve only together with the rest of this group, and re-applying the group resolved without it, so that move did not ship$`,
+            "m",
+          ),
+        );
+        expect(r.holdback.match(new RegExp(`^- \`${name}\`:`, "gm"))).toHaveLength(1);
+      }
+      // And with nothing left moved, the pass fails loudly (before the
+      // trusted copy of holdback.md is written, as in the rollback case).
+      expect(r.status).toBeGreaterThan(0);
+      expect(r.stdout).toContain("Nothing survived the rebuild");
+    } finally {
+      r.cleanup();
+    }
   });
 
   it("fetches the checker OUTSIDE the consumer's tree, pinned to the workflow's own sha", () => {

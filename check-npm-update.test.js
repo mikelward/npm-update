@@ -40,6 +40,8 @@ import {
   isWalkableLock,
   manifestPaths,
   rebuildCandidates,
+  droppedByRebuild,
+  unresolved,
   updateSummary,
   workspacePaths,
 } from './check-npm-update.mjs'
@@ -2780,6 +2782,300 @@ describe('rebuildCandidates', () => {
   })
 })
 
+describe('droppedByRebuild', () => {
+  // What the hold-back pass re-applies as a group after its loop, and what it
+  // names as dropped. The loop re-resolves one name at a time; a package that
+  // only moves TOGETHER with another (a peer-pinned pair) re-resolves to no
+  // change alone, validates as unchanged, and is neither held back nor moved
+  // — which is how gedmap, newshacker and readmo shipped every rebuild week
+  // without vitest 4.1.11. Three lockfiles: HEAD, the bulk resolve, and the
+  // tree the loop left.
+  const lock = (versions, root = {}) => ({
+    packages: {
+      '': root,
+      ...Object.fromEntries(Object.entries(versions).map(([path, entry]) => [path, typeof entry === 'string' ? { version: entry } : entry])),
+    },
+  })
+  // a and b peer-pin each other, c is a's subdependency, r is untouched
+  // and its subdependency x is the crossing the loop holds r back for.
+  const manifest = { dependencies: { a: '^1.0.0', b: '~1.0.0', r: '^1.0.0' } }
+  const head = lock(
+    { 'node_modules/a': '1.0.0', 'node_modules/b': '1.0.0', 'node_modules/c': '1.0.0', 'node_modules/r': '1.0.0', 'node_modules/x': '0.1.0' },
+    { dependencies: { a: '^1.0.0', b: '~1.0.0', r: '^1.0.0' } },
+  )
+  // The bulk resolve's root record carries the ranges `npm update --save`
+  // wrote: the operator kept, the floor moved.
+  const bulk = lock(
+    { 'node_modules/a': '1.1.0', 'node_modules/b': '1.1.0', 'node_modules/c': '1.0.1', 'node_modules/r': '1.0.0', 'node_modules/x': '0.2.0' },
+    { dependencies: { a: '^1.1.0', b: '~1.1.0', r: '^1.0.0' } },
+  )
+
+  it('offers a declared pair the loop left at HEAD as a group, with the bulk\'s versions and declared ranges, and names the dropped transitives', () => {
+    expect(droppedByRebuild({ manifestBefore: manifest, lockBefore: head, lockBulk: bulk, lockAfter: head, heldBack: ['r'] })).toEqual({
+      direct: [
+        { consumer: '.', name: 'a', version: '1.1.0', range: '^1.1.0', section: 'dependencies', path: 'node_modules/a' },
+        { consumer: '.', name: 'b', version: '1.1.0', range: '~1.1.0', section: 'dependencies', path: 'node_modules/b' },
+      ],
+      transitive: ['c', 'x'],
+      moved: [],
+    })
+  })
+
+  it('names the manifest section that declares each member, so the range goes back where it came from', () => {
+    const m = { devDependencies: { a: '^1.0.0' }, optionalDependencies: { b: '~1.0.0' } }
+    const r = droppedByRebuild({ manifestBefore: m, lockBefore: head, lockBulk: bulk, lockAfter: head, heldBack: ['r'] })
+    expect(r.direct.map((d) => [d.name, d.section])).toEqual([['a', 'devDependencies'], ['b', 'optionalDependencies']])
+  })
+
+  it('names optionalDependencies, not dependencies, when a manifest declares the name in both', () => {
+    // npm: "entries in optionalDependencies will override entries of the
+    // same name in dependencies", and its lockfile record drops the name
+    // from `dependencies` accordingly. Recording `dependencies` because it
+    // comes first would write the bulk's range into the entry npm ignores,
+    // leave the effective one at HEAD's range, and let `npm install` keep
+    // HEAD's resolution — a group member dropped with a `direct` record
+    // that claims otherwise. The range is read from the effective section
+    // too, so a stale range left in `dependencies` is not the one written.
+    const m = { dependencies: { a: '^1.0.0', b: '^1.0.0', r: '^1.0.0' }, optionalDependencies: { a: '^1.0.0' } }
+    const record = { dependencies: { a: '^1.0.0', b: '^1.1.0', r: '^1.0.0' }, optionalDependencies: { a: '^1.1.0' } }
+    const bulkWithRecord = { packages: { ...bulk.packages, '': record } }
+    const r = droppedByRebuild({ manifestBefore: m, lockBefore: head, lockBulk: bulkWithRecord, lockAfter: head, heldBack: ['r'] })
+    expect(r.direct.map((d) => [d.name, d.section, d.range])).toEqual([
+      ['a', 'optionalDependencies', '^1.1.0'],
+      ['b', 'dependencies', '^1.1.0'],
+    ])
+  })
+
+  it('names the record the consumer resolves in the REBUILT tree, the one to remove before the group resolves', () => {
+    // The re-apply removes that record rather than trusting the range
+    // write: a `~` the bulk left alone makes the write a no-op, and a bare
+    // install with nothing to do keeps the lockfile's copy. The path is
+    // the rebuilt tree's, which is where the copy sits at that point; the
+    // bulk may have hoisted it elsewhere. `null` when HEAD (and so the
+    // rebuild) resolved no copy at all — nothing to remove, and the edge
+    // is already one npm must place.
+    const nested = lock({ 'node_modules/a': '1.1.0', 'node_modules/b': '1.1.0', 'node_modules/c': '1.0.1', 'node_modules/r': '1.0.0', 'node_modules/r/node_modules/x': '0.2.0' })
+    const headNested = lock({ 'node_modules/a': '1.0.0', 'node_modules/b': '1.0.0', 'node_modules/c': '1.0.0', 'node_modules/r': '1.0.0', 'node_modules/r/node_modules/x': '0.1.0' })
+    let r = droppedByRebuild({ manifestBefore: manifest, lockBefore: headNested, lockBulk: nested, lockAfter: headNested, heldBack: ['r'] })
+    expect(r.direct.map((d) => d.path)).toEqual(['node_modules/a', 'node_modules/b'])
+    const without = lock({ 'node_modules/b': '1.0.0', 'node_modules/c': '1.0.0', 'node_modules/r': '1.0.0', 'node_modules/x': '0.1.0' })
+    r = droppedByRebuild({ manifestBefore: manifest, lockBefore: without, lockBulk: bulk, lockAfter: without, heldBack: ['r', 'b'] })
+    expect(r.direct.map((d) => [d.name, d.path])).toEqual([['a', null]])
+  })
+
+  it('falls back to the bare version when the bulk record declares no range for the name', () => {
+    const noRanges = lock({ 'node_modules/a': '1.1.0', 'node_modules/b': '1.1.0', 'node_modules/c': '1.0.1', 'node_modules/r': '1.0.0', 'node_modules/x': '0.2.0' })
+    const r = droppedByRebuild({ manifestBefore: manifest, lockBefore: head, lockBulk: noRanges, lockAfter: head, heldBack: ['r'] })
+    expect(r.direct.map((d) => d.range)).toEqual(['1.1.0', '1.1.0'])
+  })
+
+  it('names a dropped NESTED copy of a declared name as transitive, even though the direct copy never moved', () => {
+    // Codex's finding: skipping declared names in the transitive scan hid
+    // this move. The root copy of foo stays at 1.0.0 on every side; the
+    // copy nested under a moved 2.0.0 -> 2.1.0 in the bulk and came back.
+    // Buckets are decided by resolution, as the PR-body summary decides
+    // its own: the root copy is direct, the nested one is not.
+    const m = { dependencies: { a: '^1.0.0', foo: '^1.0.0' } }
+    const at = (nested) => lock({ 'node_modules/a': '1.0.0', 'node_modules/foo': '1.0.0', 'node_modules/a/node_modules/foo': nested })
+    expect(droppedByRebuild({ manifestBefore: m, lockBefore: at('2.0.0'), lockBulk: at('2.1.0'), lockAfter: at('2.0.0') })).toEqual({
+      direct: [],
+      transitive: ['foo'],
+      moved: [],
+    })
+  })
+
+  it('leaves out a held-back name: it was rejected, not dropped, and is already reported', () => {
+    const r = droppedByRebuild({ manifestBefore: manifest, lockBefore: head, lockBulk: bulk, lockAfter: head, heldBack: ['r', 'a', 'x'] })
+    expect(r.direct.map((d) => d.name)).toEqual(['b'])
+    expect(r.transitive).toEqual(['c'])
+  })
+
+  it('leaves out a package the rebuild did move, to the bulk\'s version or any other', () => {
+    // a and b reached the bulk's versions, c a different one; all three
+    // moved, so none is dropped. x, still at HEAD's, is.
+    const rebuilt = lock({ 'node_modules/a': '1.1.0', 'node_modules/b': '1.1.0', 'node_modules/c': '1.0.2', 'node_modules/r': '1.0.0', 'node_modules/x': '0.1.0' })
+    expect(droppedByRebuild({ manifestBefore: manifest, lockBefore: head, lockBulk: bulk, lockAfter: rebuilt, heldBack: ['r'] })).toEqual({
+      direct: [],
+      transitive: ['x'],
+      moved: [],
+    })
+  })
+
+  it('leaves out a declared package the bulk did not move either', () => {
+    // r stayed at 1.0.0 in the bulk; only its subdependency crossed. There
+    // is nothing to re-apply for it, held back or not.
+    const r = droppedByRebuild({ manifestBefore: manifest, lockBefore: head, lockBulk: bulk, lockAfter: head })
+    expect(r.direct.map((d) => d.name)).toEqual(['a', 'b'])
+  })
+
+  it('reads a workspace\'s dependency as that workspace resolves it, and files it under the workspace', () => {
+    // npm install writes the range into the manifest of the workspace it
+    // runs for, so the consumer is part of the record; the workspace's own
+    // name is a local link and never something to ask the registry for.
+    const ws = { 'packages/w': { manifestBefore: { name: 'w', dependencies: { dep: '^1.0.0' } } } }
+    const at = (v) => lock({ 'packages/w': { name: 'w', version: '0.0.0' }, 'node_modules/w': { link: true }, 'packages/w/node_modules/dep': v })
+    expect(droppedByRebuild({ manifestBefore: { dependencies: { w: '*' } }, lockBefore: at('1.0.0'), lockBulk: at('1.2.0'), lockAfter: at('1.0.0'), workspaces: ws })).toEqual({
+      direct: [{ consumer: 'packages/w', name: 'dep', version: '1.2.0', range: '1.2.0', section: 'dependencies', path: 'packages/w/node_modules/dep' }],
+      transitive: [],
+      moved: [],
+    })
+  })
+
+  it('names a transitive with several copies when the rebuild moved only some of them', () => {
+    // Codex's finding: comparing the rebuilt set against HEAD's calls
+    // {1.1.0, 2.0.0} "changed" and drops the name, though the 2.0.0 copy
+    // never reached the 2.1.0 the bulk chose. Dropped means a version the
+    // bulk removed is still installed after the rebuild.
+    const m = { dependencies: { a: '^1.0.0', b: '^1.0.0' } }
+    const at = (under_a, under_b) => lock({ 'node_modules/a': '1.0.0', 'node_modules/b': '1.0.0', 'node_modules/a/node_modules/foo': under_a, 'node_modules/b/node_modules/foo': under_b })
+    expect(droppedByRebuild({ manifestBefore: m, lockBefore: at('1.0.0', '2.0.0'), lockBulk: at('1.1.0', '2.1.0'), lockAfter: at('1.1.0', '2.0.0') })).toEqual({
+      direct: [],
+      transitive: ['foo'],
+      moved: [],
+    })
+    // Both copies moved, one of them past the bulk's pick: nothing left behind.
+    expect(droppedByRebuild({ manifestBefore: m, lockBefore: at('1.0.0', '2.0.0'), lockBulk: at('1.1.0', '2.1.0'), lockAfter: at('1.1.0', '2.2.0') })).toEqual({
+      direct: [],
+      transitive: [],
+      moved: [],
+    })
+  })
+
+  it('names a transitive the bulk brought in that the rebuild never installed', () => {
+    // Codex's finding: a residual-version test has nothing to find when HEAD
+    // had no copy at all. The bulk introduced `newdep` under a; the rebuild
+    // has none.
+    const m = { dependencies: { a: '^1.0.0' } }
+    const head = lock({ 'node_modules/a': '1.0.0' })
+    const withNew = lock({ 'node_modules/a': '1.0.0', 'node_modules/newdep': '1.0.0' })
+    expect(droppedByRebuild({ manifestBefore: m, lockBefore: head, lockBulk: withNew, lockAfter: head })).toEqual({
+      direct: [],
+      transitive: ['newdep'],
+      moved: [],
+    })
+    // Present after the rebuild at some version: carried, not dropped.
+    const withOther = lock({ 'node_modules/a': '1.0.0', 'node_modules/newdep': '1.0.1' })
+    expect(droppedByRebuild({ manifestBefore: m, lockBefore: head, lockBulk: withNew, lockAfter: withOther })).toEqual({
+      direct: [],
+      transitive: [],
+      moved: [],
+    })
+  })
+
+  it('counts copies, so one of two same-version copies moving and coming back is a dropped move', () => {
+    // Codex's finding: as a set, {1.0.0 ×2} and {1.0.0} are the same. The
+    // bulk took one of a's and b's copies of foo to 1.1.0; the rebuild left
+    // both where they were.
+    const m = { dependencies: { a: '^1.0.0', b: '^1.0.0' } }
+    const at = (under_a, under_b) => lock({ 'node_modules/a': '1.0.0', 'node_modules/b': '1.0.0', 'node_modules/a/node_modules/foo': under_a, 'node_modules/b/node_modules/foo': under_b })
+    expect(droppedByRebuild({ manifestBefore: m, lockBefore: at('1.0.0', '1.0.0'), lockBulk: at('1.0.0', '1.1.0'), lockAfter: at('1.0.0', '1.0.0') })).toEqual({
+      direct: [],
+      transitive: ['foo'],
+      moved: [],
+    })
+  })
+
+  it('does not call a rebuild that deduped a copy the bulk kept, or moved past its pick, dropped', () => {
+    // Both differ from the bulk's tally and left nothing behind.
+    const m = { dependencies: { a: '^1.0.0', b: '^1.0.0' } }
+    const at = (under_a, under_b) => lock({
+      'node_modules/a': '1.0.0',
+      'node_modules/b': '1.0.0',
+      ...(under_a ? { 'node_modules/a/node_modules/foo': under_a } : {}),
+      ...(under_b ? { 'node_modules/b/node_modules/foo': under_b } : {}),
+    })
+    const head = at('1.0.0', '1.0.0')
+    const bulk = at('1.1.0', '1.1.0')
+    expect(droppedByRebuild({ manifestBefore: m, lockBefore: head, lockBulk: bulk, lockAfter: at('1.1.0', null) }).transitive).toEqual([])
+    expect(droppedByRebuild({ manifestBefore: m, lockBefore: head, lockBulk: bulk, lockAfter: at('1.2.0', '1.2.0') }).transitive).toEqual([])
+  })
+
+  it('names a held-back package the accepted group carried along after all, so its hold-back line can go', () => {
+    // Codex's finding: the loop held x back (its solo re-resolve crossed),
+    // then the group brought x along at a version the checker accepted. The
+    // line saying x was held back would now be false.
+    const m = { dependencies: { a: '^1.0.0' } }
+    const at = (a, x) => lock({ 'node_modules/a': a, 'node_modules/x': x })
+    const r = droppedByRebuild({ manifestBefore: m, lockBefore: at('1.0.0', '0.1.0'), lockBulk: at('1.1.0', '0.2.0'), lockAfter: at('1.1.0', '0.1.5'), heldBack: ['x'] })
+    expect(r.moved).toEqual(['x'])
+    // Still where HEAD had it: the line stays true, and stays.
+    expect(droppedByRebuild({ manifestBefore: m, lockBefore: at('1.0.0', '0.1.0'), lockBulk: at('1.1.0', '0.2.0'), lockAfter: at('1.0.0', '0.1.0'), heldBack: ['x'] }).moved).toEqual([])
+  })
+
+  it('keeps the hold-back line of a held name the group carried only partly', () => {
+    // Codex's finding: a whole-name "differs from HEAD" test retracted the
+    // line here, though the nested copy's 2.0.0 -> 2.1.0 move is still
+    // absent — and a held name is not in the transitive scan, so nothing
+    // would have replaced it. The same two dropped clauses decide.
+    const m = { dependencies: { a: '^1.0.0', x: '^1.0.0' } }
+    const at = (top, nested) => lock({ 'node_modules/a': '1.0.0', 'node_modules/x': top, 'node_modules/a/node_modules/x': nested })
+    expect(droppedByRebuild({ manifestBefore: m, lockBefore: at('1.0.0', '2.0.0'), lockBulk: at('1.1.0', '2.1.0'), lockAfter: at('1.1.0', '2.0.0'), heldBack: ['x'] }).moved).toEqual([])
+    expect(droppedByRebuild({ manifestBefore: m, lockBefore: at('1.0.0', '2.0.0'), lockBulk: at('1.1.0', '2.1.0'), lockAfter: at('1.1.0', '2.1.0'), heldBack: ['x'] }).moved).toEqual(['x'])
+  })
+
+  it('does not call a transitive copy that only relocated at the same version dropped', () => {
+    // Coarser than rebuildCandidates on purpose, in the other direction:
+    // this list is read by a person, so a relocation reported as a dropped
+    // move costs more than the wasted round the candidate list accepts.
+    const before = lock({ 'node_modules/a': '1.0.0', 'node_modules/a/node_modules/dep': '1.0.0' })
+    const moved = lock({ 'node_modules/a': '1.0.0', 'node_modules/dep': '1.0.0' })
+    expect(droppedByRebuild({ manifestBefore: { dependencies: { a: '^1.0.0' } }, lockBefore: before, lockBulk: moved, lockAfter: before })).toEqual({
+      direct: [],
+      transitive: [],
+      moved: [],
+    })
+  })
+
+  it('sorts the group by consumer then name, and the transitives by name', () => {
+    const m = { dependencies: { zeta: '^1.0.0', alpha: '^1.0.0' } }
+    const at = (v) => lock({ 'node_modules/zeta': v, 'node_modules/alpha': v, 'node_modules/tz': v, 'node_modules/ta': v })
+    const r = droppedByRebuild({ manifestBefore: m, lockBefore: at('1.0.0'), lockBulk: at('1.1.0'), lockAfter: at('1.0.0') })
+    expect(r.direct.map((d) => d.name)).toEqual(['alpha', 'zeta'])
+    expect(r.transitive).toEqual(['ta', 'tz'])
+  })
+
+  it('offers nothing when any of the three lockfiles is unwalkable', () => {
+    // The validator refuses the batch on that shape regardless, and a diff
+    // against an unreadable side would name the whole tree.
+    for (const [b, k, a] of [[{}, bulk, head], [head, {}, head], [head, bulk, {}]]) {
+      expect(droppedByRebuild({ manifestBefore: manifest, lockBefore: b, lockBulk: k, lockAfter: a })).toEqual({ direct: [], transitive: [], moved: [] })
+    }
+  })
+})
+
+describe('unresolved', () => {
+  // What the group re-apply hands `npm install` instead of a name: with
+  // the record gone, the edge is one npm must place afresh, at the newest
+  // its range admits, in the same resolve as every other missing edge.
+  const lockfile = {
+    name: 'app',
+    lockfileVersion: 3,
+    packages: {
+      '': { dependencies: { a: '~1.0.0', b: '~1.0.0' } },
+      'node_modules/a': { version: '1.0.0', dependencies: { inner: '1.0.0' } },
+      'node_modules/a/node_modules/inner': { version: '1.0.0' },
+      'node_modules/ab': { version: '1.0.0' },
+      'node_modules/b': { version: '1.0.0' },
+      'node_modules/inner': { version: '2.0.0' },
+    },
+  }
+
+  it('removes the named records and every record beneath them, and nothing else', () => {
+    // `node_modules/ab` shares a prefix with `node_modules/a` and stays; a's
+    // nested copy of `inner` goes with a, the hoisted `inner` does not.
+    const out = unresolved(lockfile, ['node_modules/a', 'node_modules/b'])
+    expect(Object.keys(out.packages)).toEqual(['', 'node_modules/ab', 'node_modules/inner'])
+    expect(out.name).toBe('app')
+    expect(out.lockfileVersion).toBe(3)
+    // The input is left alone.
+    expect(Object.keys(lockfile.packages)).toHaveLength(6)
+  })
+
+  it('leaves a lockfile without a packages map as it is', () => {
+    expect(unresolved({ lockfileVersion: 1 }, ['node_modules/a'])).toEqual({ lockfileVersion: 1 })
+  })
+})
+
 describe('manifestPaths', () => {
   // The hold-back pass restores these before it re-resolves and after it
   // rejects a package. A path missing here is a file the rebuild silently
@@ -2886,6 +3182,56 @@ describe('the CLI run from a nested npm tree', () => {
   it('lists the manifest paths from the same subdirectory', () => {
     const cwd = join(repoWithNestedTree(), 'backend')
     expect(runFrom(cwd, 'manifests')).toBe('package.json\npackage-lock.json\n')
+  })
+
+  it('reports what the rebuild dropped, against a bulk lockfile kept aside, one record per line', () => {
+    const cwd = join(repoWithNestedTree(), 'backend')
+    // The bulk resolve had taken dep to 1.0.2; the loop left it at HEAD's 1.0.0.
+    const bulk = join(cwd, '..', 'bulk-lock.json')
+    writeFileSync(bulk, lockFor('1.0.2'))
+    writeFileSync(join(cwd, 'package-lock.json'), lockFor('1.0.0'))
+    // Version and the bulk record's declared range, which is what the
+    // workflow re-applies by (this fixture's root record keeps ^1.0.0).
+    expect(runFrom(cwd, 'dropped', bulk)).toBe('direct\t.\tdep\t1.0.2\t^1.0.0\tdependencies\tnode_modules/dep\n')
+    // A name the loop held back is not offered again.
+    expect(runFrom(cwd, 'dropped', bulk, 'dep')).toBe('')
+    // And a package the loop did move is not dropped, whatever version it reached.
+    writeFileSync(join(cwd, 'package-lock.json'), lockFor('1.0.1'))
+    expect(runFrom(cwd, 'dropped', bulk)).toBe('')
+    // A held-back name that moved after all is reported as such, so its line can go.
+    expect(runFrom(cwd, 'dropped', bulk, 'dep')).toBe('moved\tdep\n')
+  })
+
+  it('removes the named records from the lockfile in place, in npm\'s own serialization', () => {
+    const cwd = join(repoWithNestedTree(), 'backend')
+    expect(runFrom(cwd, 'unresolve', 'node_modules/dep')).toBe('')
+    const written = readFileSync(join(cwd, 'package-lock.json'), 'utf8')
+    expect(JSON.parse(written).packages).toEqual({ '': { name: 'app', version: '1.0.0', dependencies: { dep: '^1.0.0' } } })
+    expect(written).toBe(JSON.stringify(JSON.parse(written), null, 2) + '\n')
+  })
+
+  it('refuses the unresolve mode with no record paths rather than rewriting the lockfile for nothing', () => {
+    const cwd = join(repoWithNestedTree(), 'backend')
+    const before = readFileSync(join(cwd, 'package-lock.json'), 'utf8')
+    let code = 0
+    try {
+      execFileSync(process.execPath, [CLI, 'unresolve'], { cwd, encoding: 'utf8', stdio: 'pipe' })
+    } catch (err) {
+      code = err.status
+    }
+    expect(code).toBe(2)
+    expect(readFileSync(join(cwd, 'package-lock.json'), 'utf8')).toBe(before)
+  })
+
+  it('refuses the dropped mode without a bulk lockfile rather than reading nothing as "nothing dropped"', () => {
+    const cwd = join(repoWithNestedTree(), 'backend')
+    let code = 0
+    try {
+      execFileSync(process.execPath, [CLI, 'dropped'], { cwd, encoding: 'utf8', stdio: 'pipe' })
+    } catch (err) {
+      code = err.status
+    }
+    expect(code).toBe(2)
   })
 
   it('refuses an unknown mode rather than falling through to validation', () => {

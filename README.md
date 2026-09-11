@@ -175,6 +175,22 @@ shape npm resolved the whole tree into is not always reachable one package at
 a time. The PR body reports that case too, naming the crossing — otherwise it
 would claim every dependency moved while one deliberately did not.
 
+Nor is one package at a time enough on its own. A package that only moves
+*together* with another — `vitest` and `@vitest/coverage-v8` peer-pin each
+other to one exact release — re-resolves to no change alone, so the loop
+would validate an unchanged tree and move on, and the pair would fall out of
+the batch without a line anywhere. After the loop, the batch compares the
+rebuilt tree with the bulk resolve it kept aside and re-applies everything
+declared that the bulk moved but the rebuild did not, as one group: the
+bulk's own ranges go back into their manifests, each member's lockfile
+record is removed, and one `npm install` places them all afresh, validated
+the same way. The record has to go because the bulk often leaves a range as
+it was — `~4.1.10` already admits 4.1.11 — and an install with nothing to do
+keeps whatever the lockfile has. A group that still fails is rolled back and
+named in the PR body, and so is a member the resolve still left at HEAD, and
+a transitive the bulk moved that no single re-resolve reached, since nothing
+can ask for one of those by version.
+
 Two consequences worth knowing:
 
 - A week in which *everything* available is blocked fails the run loudly
@@ -183,9 +199,10 @@ Two consequences worth knowing:
 - The rebuild only runs in a week the batch would otherwise have shipped
   nothing at all, so the ordinary week costs exactly what it did before. On a
   week it does run, the job takes one `npm update` per candidate — the
-  declared names plus whatever the bulk resolve moved beneath them, so minutes
-  rather than the usual seconds, on the same free Actions runners, for a batch
-  that would otherwise not have happened.
+  declared names plus whatever the bulk resolve moved beneath them — and one
+  more resolve for the group, so minutes rather than the usual seconds, on
+  the same free Actions runners, for a batch that would otherwise not have
+  happened.
 
 ## Regenerating a derived file
 
