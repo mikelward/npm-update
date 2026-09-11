@@ -203,7 +203,14 @@ has stopped biting.
   manifests' side of a hold-back: a copy reachable only through a held-back
   record moved for that hold-back's reasons, and its line covers it —
   gedmap's first batch with this pass named eslint and rolldown and then
-  thirty-four packages that had moved only because they had. The record goes because the range write alone is
+  thirty-four packages that had moved only because they had. Nor is
+  anything beneath an optional dependency npm does not install on the
+  runner (its `cpu`/`os` lists, read by `isInstallable`, name only other
+  platforms): a full `npm update` prunes
+  its lockfile records on a runner that does not install it and a targeted
+  one keeps them, which read as six dropped moves of tailwind's wasm
+  runtime shims when nothing had moved. What is left is one line naming
+  them all, not a paragraph each. The record goes because the range write alone is
   not enough: the bulk keeps a declaration whose range already admits the
   new version (`~4.1.10` spans 4.1.11, and `npm update --save` does not
   narrow it), so writing that range back changes nothing, and a bare

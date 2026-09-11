@@ -2952,6 +2952,38 @@ describe('droppedByRebuild', () => {
     expect(carried.moved).toEqual(['p'])
   })
 
+  it('leaves out what sits beneath an optional dependency npm installs only on another platform', () => {
+    // gedmap's first batch after the subtree rule: the bulk `npm update`,
+    // a full reify, pruned the lockfile records beneath
+    // @tailwindcss/oxide-wasm32-wasi — optional, cpu wasm32, never
+    // installed on the linux runner — while the loop's targeted updates
+    // kept them, and six wasm runtime shims were named as dropped moves
+    // when nothing had moved. A record `isInstallable` refuses here, and
+    // all that is reachable only through it, is outside the count on every
+    // side. An optional dependency npm does install here — a plain one, or
+    // one whose cpu/os lists name this runner — counts like any other
+    // (Codex): what npm prunes beneath it is a real removal.
+    const m = { dependencies: { native: '^1.0.0' } }
+    const rootRecord = { dependencies: { native: '^1.0.0' } }
+    const tree = ({ shim, wasmBuild = { optional: true, cpu: ['wasm32'] } }) => lock({
+      'node_modules/native': { version: '1.0.0', optionalDependencies: { 'native-wasm32': '1.0.0' } },
+      'node_modules/native-wasm32': { version: '1.0.0', ...wasmBuild, dependencies: { shim: '^1.0.0' } },
+      ...(shim ? { 'node_modules/native-wasm32/node_modules/shim': { version: shim, optional: true } } : {}),
+    }, rootRecord)
+    const withShim = tree({ shim: '1.0.0' })
+    expect(droppedByRebuild({ manifestBefore: m, lockBefore: withShim, lockBulk: tree({ shim: null }), lockAfter: withShim })).toEqual({
+      direct: [], transitive: [], moved: [],
+    })
+    // Without the platform list, or with one that names this runner, the
+    // same pruning is a real removal the rebuild left behind, and is named.
+    for (const installable of [{ optional: true }, { optional: true, cpu: [process.arch], os: [process.platform] }]) {
+      expect(droppedByRebuild({ manifestBefore: m, lockBefore: tree({ shim: '1.0.0', wasmBuild: installable }), lockBulk: tree({ shim: null, wasmBuild: installable }), lockAfter: tree({ shim: '1.0.0', wasmBuild: installable }) }).transitive).toEqual(['shim'])
+    }
+    // A constraint npm records as a bare string is read the same way.
+    const asString = { optional: true, cpu: 'wasm32' }
+    expect(droppedByRebuild({ manifestBefore: m, lockBefore: tree({ shim: '1.0.0', wasmBuild: asString }), lockBulk: tree({ shim: null, wasmBuild: asString }), lockAfter: tree({ shim: '1.0.0', wasmBuild: asString }) }).transitive).toEqual([])
+  })
+
   it('leaves out a held-back name: it was rejected, not dropped, and is already reported', () => {
     const r = droppedByRebuild({ manifestBefore: manifest, lockBefore: head, lockBulk: bulk, lockAfter: head, heldBack: ['r', 'a', 'x'] })
     expect(r.direct.map((d) => d.name)).toEqual(['b'])

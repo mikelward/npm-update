@@ -2496,10 +2496,13 @@ describe("holding back only what a breaking transitive blocks", () => {
     expect(run.slice(validate)).toContain('tar -xf "$snapshot/manifests.tar"');
     expect(run.slice(validate)).toContain("re-applying the group failed");
     // A dropped transitive is named rather than left silent, and read
-    // AFTER the group, so a member's own subdependencies no longer count.
+    // AFTER the group, so a member's own subdependencies no longer count —
+    // all of them on one line, since a reader is scanning for the packages
+    // that need a decision and these are not those.
     const transitive = run.indexOf("transitive)", validate);
     expect(transitive).toBeGreaterThan(validate);
-    expect(run.slice(transitive)).toContain("no single re-resolve reached it");
+    expect(run.slice(transitive)).toContain('transitives+=("$name")');
+    expect(run.slice(transitive)).toContain("no single re-resolve reached; a transitive copy cannot be asked for by version, so those moves did not ship: %s");
     // And a held-back name the accepted group carried along loses its
     // hold-back line, matched on the whole "- `name`: " prefix.
     expect(run.slice(validate)).toContain("moved)");

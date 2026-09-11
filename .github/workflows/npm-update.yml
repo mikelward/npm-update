@@ -662,6 +662,7 @@ jobs:
             # its line. Two hold-backs on gedmap's first batch with this
             # pass came with thirty-four such lines.
             left=$(node "$CHECKER" dropped "$snapshot/bulk-lock.json" ${held[@]+"${held[@]}"})
+            transitives=()
             while IFS=$'\t' read -r kind name member version range _; do
               case "$kind" in
                 direct)
@@ -669,7 +670,7 @@ jobs:
                     printf -- '- `%s`: moved to %s (`%s`) in the bulk resolve only together with the rest of this group, and re-applying the group resolved without it, so that move did not ship\n' "$member" "$version" "$range" >> holdback.md
                   fi ;;
                 transitive)
-                  printf -- '- `%s`: moved in the bulk resolve only as a transitive copy, one no manifest resolves directly, and no single re-resolve reached it; a transitive copy cannot be asked for by version, so that move did not ship\n' "$name" >> holdback.md ;;
+                  transitives+=("$name") ;;
                 moved)
                   # `|| true`: grep -v exits 1 when nothing is left, which
                   # is a legitimate outcome, not a failure.
@@ -677,6 +678,14 @@ jobs:
                   mv -- "$snapshot/holdback.rest" holdback.md ;;
               esac
             done <<< "$left"
+            # One line for all of them, not one each: every transitive
+            # copy left behind has the same story, and a reader scanning
+            # this list is looking for the packages that need a decision,
+            # which these are not. The names are the whole content.
+            if [ "${#transitives[@]}" -gt 0 ]; then
+              names=$(printf -- '`%s`, ' "${transitives[@]}")
+              printf -- '- Transitive copies, ones no manifest resolves directly, that moved in the bulk resolve and that no single re-resolve reached; a transitive copy cannot be asked for by version, so those moves did not ship: %s\n' "${names%, }" >> holdback.md
+            fi
             rm -rf -- "$snapshot"
 
             # The rebuild is reported whether or not it held anything back,
