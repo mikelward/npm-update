@@ -24,7 +24,7 @@
 // the machine that ran the batch chose to report.
 
 import { execFileSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { readFileSync, writeFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 
 export const DEP_SECTIONS = [
@@ -1426,6 +1426,295 @@ export function rebuildCandidates({ manifestBefore, lockBefore, lockAfter, works
   return [...declared, ...moved.sort()];
 }
 
+/**
+ * What the one-package-at-a-time rebuild left behind, compared with the bulk
+ * resolve it replaced — so the workflow can re-apply it as a GROUP, and name
+ * whatever still will not move instead of shipping a PR that reads as if
+ * everything did.
+ *
+ * `npm update <name>` cannot move a package whose installed partner pins it
+ * to an exact version, and the partner is pinned right back: `vitest` and
+ * `@vitest/coverage-v8` peer-pin each other to the same release, so each
+ * single re-resolve leaves both where they were, naming them together in one
+ * `npm update` does no better, and only an `npm install` of both at explicit
+ * versions moves the pair. The bulk resolve had moved them; the rebuild's
+ * loop re-resolved each alone, saw no change, validated an unchanged tree and
+ * moved on. Neither held back nor moved, the pair was left out of the PR body
+ * entirely — for gedmap, newshacker and readmo that was `vitest` 4.1.11, the
+ * release carrying a `@vitest/mocker` advisory fix, dropped in every week the
+ * rolldown crossing sent the batch down the rebuild path. The advisory
+ * surfaced through Dependabot as a 4 → 5 major instead.
+ *
+ * `direct`: each declared dependency whose copy, as the consumer that
+ * declares it resolves it, moved in the bulk resolve and is back at HEAD's
+ * version after the rebuild — with the bulk's version, the range the bulk
+ * resolve declared for it, read from the bulk lockfile's record for that
+ * consumer (npm writes the manifest's ranges there), the manifest
+ * section declaring it — the EFFECTIVE one, under npm's one documented
+ * precedence rule: a name in optionalDependencies overrides the same name
+ * in dependencies, so that is the section named and the section the range
+ * is read from — and the path of the lockfile record the consumer resolves
+ * the name to in the rebuilt tree (`null` when it resolves none). The
+ * re-apply writes that range, operator and all, into the declaring
+ * manifest, removes that record (`unresolved` below), and then resolves
+ * once. The range rather than a bare version: writing a bare version
+ * through `npm install --save` would land under the ambient save-prefix
+ * and turn a `~` declaration the bulk kept as `~` into a `^` one — an
+ * operator change the validator rejects and the bulk never made (Codex).
+ * The version falls back in when the record declares no range. The record
+ * removed rather than the range alone: the bulk keeps a declaration whose
+ * range already admits the new version (`~4.1.10` spans 4.1.11, and npm
+ * does not narrow it), so writing that range back changes nothing, and an
+ * `npm install` with nothing to do reads the lockfile and keeps HEAD's
+ * copies — the member would be dropped a second time, now past the
+ * re-apply meant to catch it (Codex). An edge whose record is gone is one
+ * npm has to place afresh, at the newest the range admits, in the same
+ * resolve as every other member's, with the manifests left as written.
+ * Per consumer (`.` for the root, else the workspace path), since each
+ * workspace declares in its own manifest. A name the loop held back is
+ * excluded: it is already reported, and its move was rejected, not dropped.
+ *
+ * `transitive`: every installed copy the consumers do not resolve directly —
+ * all copies of an undeclared name, and the NESTED copies of a declared one —
+ * whose versions the bulk moved and the rebuild did not. Decided by
+ * resolution rather than by name, as the PR-body summary decides its
+ * buckets: a name that is declared at the root and also installed under some
+ * dependency can have the nested copy dropped while the root copy never
+ * moved, and skipping declared names wholesale would lose exactly that move
+ * (Codex). Nothing can ask for one of these by version without declaring
+ * it, so the workflow names it in `holdback.md` rather than leaving it
+ * silent. Counted per version (a multiset), not by path: a copy relocating
+ * at the same version is not a dropped move, and this list is read by a
+ * person, so the false positive costs more here than the wasted round
+ * `rebuildCandidates` accepts. Dropped means a copy the bulk removed is
+ * still installed after the rebuild, or the bulk brought a name in that the
+ * rebuild never installed — so a name with several copies of which the
+ * rebuild moved only some is named, and so is a new transitive the rebuild
+ * never reached (Codex, twice), while one the rebuild moved somewhere else
+ * entirely is not.
+ *
+ * `moved`: a held-back name whose installed versions nonetheless differ
+ * from HEAD's after the rebuild — the group re-apply carried it along as a
+ * member's subdependency, at a version the validator accepted — AND for
+ * which the same two dropped clauses, over every copy, now find nothing left
+ * behind. Its line in `holdback.md` would claim a move that shipped, so the
+ * workflow removes it (Codex). A held name the group carried only partly
+ * ({1.0, 2.0} to {1.1, 2.0} against a bulk of {1.1, 2.1}) keeps its line,
+ * which is still true of the copy that stayed (Codex again). Compared as
+ * multisets, so a relocation alone retracts nothing.
+ *
+ * Any of the three lockfiles being unwalkable yields nothing to re-apply:
+ * the validator refuses the batch on that shape regardless, and a diff
+ * against an unreadable side would name the whole tree.
+ */
+export function droppedByRebuild({
+  manifestBefore,
+  lockBefore,
+  lockBulk,
+  lockAfter,
+  workspaces = {},
+  heldBack = [],
+}) {
+  if (![lockBefore, lockBulk, lockAfter].every(isWalkableLock)) return { direct: [], transitive: [], moved: [] };
+  const held = new Set(heldBack);
+  const before = lockBefore.packages;
+  const bulk = lockBulk.packages;
+  const after = lockAfter.packages;
+
+  // A workspace's own name is a local link, never something to install.
+  const workspaceNames = new Set(
+    Object.values(workspaces)
+      .map((w) => w?.manifestBefore?.name)
+      .filter((name) => typeof name === "string" && name !== ""),
+  );
+  const consumers = [
+    ["", manifestBefore],
+    ...Object.entries(workspaces).map(([path, w]) => [path, w?.manifestBefore]),
+  ];
+  // Every (consumer, name) the repository declares, once each.
+  const declaredBy = [];
+  const seen = new Set();
+  for (const [consumer, manifest] of consumers) {
+    for (const section of DEP_SECTIONS) {
+      const declared = manifest?.[section];
+      if (declared === null || typeof declared !== "object") continue;
+      for (const name of Object.keys(declared)) {
+        if (workspaceNames.has(name)) continue;
+        const key = `${consumer}/${name}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        // The one precedence rule npm documents, the same one `declaredRange`
+        // applies to lockfile records: a name in optionalDependencies
+        // overrides the same name in dependencies. Taking `dependencies`
+        // because it comes first would send the re-apply's range into the
+        // entry npm ignores, leaving the effective one — and the install —
+        // where HEAD had them (Codex). Past that rule npm documents no
+        // precedence, so the first section in DEP_SECTIONS order stands.
+        const optional = manifest.optionalDependencies;
+        const effective =
+          section === "dependencies" &&
+          optional !== null &&
+          typeof optional === "object" &&
+          Object.hasOwn(optional, name)
+            ? "optionalDependencies"
+            : section;
+        declaredBy.push([consumer, name, effective]);
+      }
+    }
+  }
+  // The copy each consumer resolves for each name it declares, per lockfile
+  // — a copy can sit at a different path on each side. Those paths are the
+  // direct side; every other copy is transitive, whatever its name.
+  const resolutions = (packages) => {
+    const byKey = new Map();
+    const pathByKey = new Map();
+    const paths = new Set();
+    for (const [consumer, name] of declaredBy) {
+      const hit = resolveEdgeInstance(packages, consumer, name);
+      const key = `${consumer}/${name}`;
+      byKey.set(key, hit ? hit.version : null);
+      pathByKey.set(key, hit ? hit.path : null);
+      if (hit) paths.add(hit.path);
+    }
+    return { byKey, pathByKey, paths };
+  };
+  const rBefore = resolutions(before);
+  const rBulk = resolutions(bulk);
+  const rAfter = resolutions(after);
+
+  // The range the bulk declared, read first from the section the re-apply
+  // writes back to — the effective declaration — and only then from any
+  // other section naming it.
+  const declaredRangeIn = (record, name, section) => {
+    for (const s of [section, ...DEP_SECTIONS.filter((other) => other !== section)]) {
+      const range = record?.[s]?.[name];
+      if (typeof range === "string" && range !== "") return range;
+    }
+    return null;
+  };
+  const direct = [];
+  for (const [consumer, name, section] of declaredBy) {
+    if (held.has(name)) continue;
+    const key = `${consumer}/${name}`;
+    const was = rBefore.byKey.get(key);
+    const chosen = rBulk.byKey.get(key);
+    const now = rAfter.byKey.get(key);
+    if (chosen === null || chosen === was || now !== was) continue;
+    direct.push({
+      consumer: consumer || ".",
+      name,
+      version: chosen,
+      range: declaredRangeIn(bulk[consumer], name, section) ?? chosen,
+      // The manifest section that declares it, so the workflow can write the
+      // range back into the right place with `npm pkg set`.
+      section,
+      // The record the consumer resolves it to in the rebuilt tree, so the
+      // workflow can remove it before the group's resolve (see above).
+      path: rAfter.pathByKey.get(key),
+    });
+  }
+  const byConsumerThenName = (x, y) =>
+    x.consumer.localeCompare(y.consumer) || x.name.localeCompare(y.name);
+  direct.sort(byConsumerThenName);
+
+  // Copies counted per version — a MULTISET, since two copies at one version
+  // are two copies, and the bulk moving one of them is a move (Codex). Paths
+  // are deliberately not part of it: a copy relocating at the same version
+  // is not a dropped move.
+  const tallied = (packages, directPaths) => {
+    const byName = new Map();
+    for (const [name, copies] of installedVersions(packages)) {
+      const tally = new Map();
+      for (const [path, version] of copies) {
+        if (!directPaths.has(path)) tally.set(version, (tally.get(version) ?? 0) + 1);
+      }
+      if (tally.size) byName.set(name, tally);
+    }
+    return byName;
+  };
+  const tBefore = tallied(before, rBefore.paths);
+  const tBulk = tallied(bulk, rBulk.paths);
+  const tAfter = tallied(after, rAfter.paths);
+  const count = (tally, version) => tally?.get(version) ?? 0;
+  // Dropped means one of two things, and the two are the whole definition:
+  //   - LEFT BEHIND: a copy the bulk removed (at some version it holds fewer
+  //     of than HEAD) is still installed after the rebuild — {1.0, 2.0}
+  //     taken to {1.1, 2.1} by the bulk and to {1.1, 2.0} by the rebuild,
+  //     or {1.0 ×2} taken to {1.0, 1.1} and back to {1.0 ×2}.
+  //   - NEVER ARRIVED: the bulk brought in copies at versions HEAD had none
+  //     of, and the rebuild brought in none at all — a transitive the bulk
+  //     added that the rebuild never installed.
+  // Neither is "the rebuilt tally differs from the bulk's": a rebuild that
+  // moved a copy PAST the bulk's pick, or deduped one the bulk kept, differs
+  // and dropped nothing. The stated boundary: a name the rebuild did bring
+  // something new in for is carried, whether or not every new copy the bulk
+  // had made it — the same granularity the PR-body summary states for
+  // itself, presence over multiplicity of the new.
+  const versionsOf = (...tallies) => new Set(tallies.flatMap((t) => [...(t?.keys() ?? [])]));
+  const droppedBetween = (b, k, a) => {
+    let leftBehind = false;
+    let introduced = 0;
+    let arrived = 0;
+    for (const version of versionsOf(b, k, a)) {
+      const was = count(b, version);
+      const chosen = count(k, version);
+      const now = count(a, version);
+      if (was > chosen && now > chosen) leftBehind = true;
+      introduced += Math.max(0, chosen - was);
+      arrived += Math.max(0, now - was);
+    }
+    return leftBehind || (introduced > 0 && arrived === 0);
+  };
+  const transitive = [];
+  for (const name of new Set([...tBefore.keys(), ...tBulk.keys()])) {
+    if (held.has(name)) continue;
+    if (droppedBetween(tBefore.get(name), tBulk.get(name), tAfter.get(name))) transitive.push(name);
+  }
+
+  // Held names, over EVERY copy: retract the hold-back line only for a name
+  // the rebuild changed and left nothing of behind, by the same two clauses.
+  const none = new Set();
+  const allBefore = tallied(before, none);
+  const allBulk = tallied(bulk, none);
+  const allAfter = tallied(after, none);
+  const sameTally = (x, y) => [...versionsOf(x, y)].every((v) => count(x, v) === count(y, v));
+  const moved = [...held]
+    .filter(
+      (name) =>
+        !sameTally(allBefore.get(name), allAfter.get(name)) &&
+        !droppedBetween(allBefore.get(name), allBulk.get(name), allAfter.get(name)),
+    )
+    .sort();
+  return { direct, transitive: transitive.sort(), moved };
+}
+
+/**
+ * The lockfile with the named records removed, and with them every record
+ * beneath each (`<path>/node_modules/...`): a nested copy exists only to
+ * serve the record above it, and the fresh placement brings its own.
+ *
+ * What the group re-apply hands `npm install` instead of a name: an edge
+ * whose record is gone is one npm must place afresh, at the newest version
+ * its declared range admits, in the same resolve as every other missing
+ * edge — which is how a peer-pinned pair moves together whether or not the
+ * bulk changed either range, and across manifests, where an explicit
+ * `name@range` on the command line cannot reach (verified against npm
+ * 11.19: this reproduces the bulk's own lockfile for the vitest pair under
+ * `~` ranges; `npm update` naming both members does not move them).
+ * Everything else in the lockfile is left as it is, so a copy no member
+ * needs is npm's to keep or prune, not this function's.
+ */
+export function unresolved(lockfile, paths) {
+  const packages = lockfile?.packages;
+  if (packages === null || typeof packages !== "object") return lockfile;
+  const gone = (path) =>
+    paths.some((p) => path === p || path.startsWith(`${p}/node_modules/`));
+  return {
+    ...lockfile,
+    packages: Object.fromEntries(Object.entries(packages).filter(([path]) => !gone(path))),
+  };
+}
+
 export function updateSummary({ manifestBefore, manifestAfter, lockBefore, lockAfter, workspaces = {} }) {
   const isObject = (v) => typeof v === "object" && v !== null;
   const walkable = isObject(lockBefore?.packages) && isObject(lockAfter?.packages);
@@ -1630,10 +1919,10 @@ function main() {
   // in the PR body in its place. The same applies to `names`, whose caller
   // would otherwise read "Dependency diff validated" as its list of packages
   // and hold back every one of them.
-  const MODES = ["summary", "candidates", "manifests"];
+  const MODES = ["summary", "candidates", "manifests", "dropped", "unresolve"];
   if (mode !== undefined && !MODES.includes(mode)) {
     console.error(
-      `Unknown mode "${mode}". Run with no arguments to validate, "summary" for the PR-body section, "candidates" for the names the hold-back pass re-resolves, or "manifests" for the manifest paths the batch can rewrite.`,
+      `Unknown mode "${mode}". Run with no arguments to validate, "summary" for the PR-body section, "candidates" for the names the hold-back pass re-resolves, "manifests" for the manifest paths the batch can rewrite, "dropped <bulk-lockfile> [held-back-name...]" for what the rebuild left behind, or "unresolve <record-path...>" to remove those records from package-lock.json so the next install places them afresh.`,
     );
     process.exit(2);
   }
@@ -1659,6 +1948,57 @@ function main() {
   // disagree about which manifests exist.
   if (mode === "manifests") {
     process.stdout.write(manifestPaths(gatherInputs()).join("\n") + "\n");
+    return;
+  }
+
+  // What the hold-back pass's loop left behind, against the bulk lockfile the
+  // workflow kept aside before restoring HEAD. One record per line, tab
+  // separated: `direct <consumer> <name> <version> <range> <section> <path>`
+  // is a group member whose range goes back into `<section>` of the
+  // consumer's manifest (`.` for the root, else a workspace path; the
+  // version is for the report) and whose lockfile record `<path>` (`-` when
+  // the consumer resolves none) goes before the resolve; `transitive <name>` is a
+  // dropped move nothing can ask for by name; `moved <name>` is a held-back
+  // name the accepted group carried along after all, whose hold-back line
+  // has to go. The names after the lockfile path are the ones the loop
+  // already held back.
+  if (mode === "dropped") {
+    const bulkPath = process.argv[3];
+    if (!bulkPath) {
+      console.error('The "dropped" mode needs the bulk resolve\'s lockfile path, then any held-back names.');
+      process.exit(2);
+    }
+    const lockBulk = JSON.parse(readFileSync(bulkPath, "utf8"));
+    const { direct, transitive, moved } = droppedByRebuild({
+      ...gatherInputs(),
+      lockBulk,
+      heldBack: process.argv.slice(4),
+    });
+    const lines = [
+      ...direct.map(
+        ({ consumer, name, version, range, section, path }) =>
+          `direct\t${consumer}\t${name}\t${version}\t${range}\t${section}\t${path ?? "-"}`,
+      ),
+      ...transitive.map((name) => `transitive\t${name}`),
+      ...moved.map((name) => `moved\t${name}`),
+    ];
+    process.stdout.write(lines.length ? lines.join("\n") + "\n" : "");
+    return;
+  }
+
+  // Remove the named records from package-lock.json, so the group re-apply's
+  // `npm install` has to place those edges afresh (see `unresolved`). npm's
+  // own serialization — two-space indent, trailing newline — and npm
+  // rewrites the file moments later anyway. Refused with no paths: a call
+  // with nothing to remove is a workflow bug, not a no-op to pass over.
+  if (mode === "unresolve") {
+    const paths = process.argv.slice(3);
+    if (paths.length === 0) {
+      console.error('The "unresolve" mode needs the lockfile record paths to remove.');
+      process.exit(2);
+    }
+    const lockfile = JSON.parse(readFileSync("package-lock.json", "utf8"));
+    writeFileSync("package-lock.json", JSON.stringify(unresolved(lockfile, paths), null, 2) + "\n");
     return;
   }
 

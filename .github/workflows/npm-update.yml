@@ -402,6 +402,19 @@ jobs:
       # network beyond the registry metadata npm already fetched, and this
       # only runs in a week that would otherwise have shipped nothing at all.
       #
+      # One package at a time has a blind spot, closed by a second half:
+      # a package that only moves TOGETHER with another (a peer-pinned pair
+      # like vitest and @vitest/coverage-v8) re-resolves to no change on its
+      # own, validates as unchanged, and falls out of the batch without
+      # being held back — dropped, and unreported. So after the loop, the
+      # checker compares the rebuilt tree with the bulk lockfile kept aside
+      # before the restore, and everything declared that the bulk moved but
+      # the rebuild did not is re-applied as one group — the bulk's own
+      # ranges written into their manifests, then a single resolve —
+      # validated the same way, and rolled back and NAMED if that fails. A
+      # dropped transitive, which nothing can ask for by version, is named
+      # as such.
+      #
       # This still executes no dependency code — every resolve below carries
       # `--ignore-scripts`, exactly like the bulk one above — so it stays
       # inside the window where the manifests are trustworthy, ahead of the
@@ -448,16 +461,25 @@ jobs:
             while IFS= read -r m; do
               [ -n "$m" ] && manifests+=("$m")
             done <<< "$(node "$CHECKER" manifests)"
-            git checkout HEAD -- "${manifests[@]}"
-            # A byte-exact copy to roll back to, so a rejected package leaves
-            # no trace — restoring from a shell variable would drop the
-            # trailing newline npm writes and register as a change of its
-            # own. tar rather than cp, so a workspace manifest comes back at
-            # its own path rather than flattened into one directory. A temp
-            # directory is safe here specifically because no dependency code
-            # has run in this job yet.
+            # A temp directory is safe here specifically because no dependency
+            # code has run in this job yet. It holds the byte-exact copy each
+            # rejected step rolls back to (below), and, first, the bulk
+            # lockfile itself: the only record of which version the bulk
+            # resolve chose for each package, which is what the group
+            # re-apply after the loop asks `npm install` for. Taken BEFORE
+            # the restore, for the same reason `candidates` is read before it.
             snapshot=$(mktemp -d)
+            cp package-lock.json "$snapshot/bulk-lock.json"
+            git checkout HEAD -- "${manifests[@]}"
+            # The names the loop rejects, so the group re-apply below neither
+            # retries them nor reports them twice.
+            held=()
             for name in $candidates; do
+              # A byte-exact copy to roll back to, so a rejected package
+              # leaves no trace — restoring from a shell variable would drop
+              # the trailing newline npm writes and register as a change of
+              # its own. tar rather than cp, so a workspace manifest comes
+              # back at its own path rather than flattened into one directory.
               tar -cf "$snapshot/manifests.tar" -- "${manifests[@]}"
               if ! attempt=$(npm update --save --ignore-scripts -- "$name" 2>&1); then
                 # `|| true` on both extractions below, and only there: the
@@ -481,7 +503,170 @@ jobs:
               fi
               tar -xf "$snapshot/manifests.tar"
               printf -- '- `%s`: %s\n' "$name" "$reason" >> holdback.md
+              held+=("$name")
             done
+
+            # What the loop cannot reach: a package that only moves TOGETHER
+            # with another. `vitest` and `@vitest/coverage-v8` peer-pin each
+            # other to one exact release, so `npm update` of either alone
+            # changes nothing (naming both in one `npm update` does no
+            # better), the checker passes the unchanged tree, and the pair is
+            # neither held back nor moved — the bulk resolve had taken both,
+            # and the PR body said nothing. That is how gedmap, newshacker
+            # and readmo shipped every rebuild week without vitest 4.1.11,
+            # the release carrying a `@vitest/mocker` advisory fix, until
+            # Dependabot offered the 4 → 5 major instead.
+            #
+            # Only an `npm install` of every member at an explicit version
+            # moves such a group, so: ask the checker what the bulk moved
+            # that the rebuild did not, re-apply all of it at the bulk's
+            # versions — one resolve per manifest, since `npm install`
+            # writes the range into the manifest of the workspace it runs
+            # for, `.` being the root — and validate the result exactly as
+            # the loop validates each package. A group npm or the checker
+            # rejects is rolled back and named, never silently left behind.
+            # Its own assignment, like `candidates` above: a command
+            # substitution that fails inside a redirection yields an empty
+            # list and the loop below silently re-applies nothing.
+            dropped=$(node "$CHECKER" dropped "$snapshot/bulk-lock.json" ${held[@]+"${held[@]}"})
+            declare -A members=() range_of=() version_of=() section_of=() record_of=()
+            consumers=()
+            while IFS=$'\t' read -r kind consumer name version range section record; do
+              [ "$kind" = direct ] || continue
+              if [ -z "${members[$consumer]+x}" ]; then
+                consumers+=("$consumer")
+                members[$consumer]=""
+              fi
+              members[$consumer]+="$name "
+              # Re-applied by writing the bulk's declared RANGE into the
+              # declaring manifest, never by installing name@<version>: a
+              # bare version is saved under the ambient save-prefix, which
+              # would turn a `~` declaration the bulk kept as `~` into a `^`
+              # one — an operator change the checker rejects and the bulk
+              # resolve never made, so the whole group would roll back for
+              # a move that was fine (Codex). The version is for the report.
+              range_of["$consumer/$name"]=$range
+              version_of["$consumer/$name"]=$version
+              section_of["$consumer/$name"]=$section
+              record_of["$consumer/$name"]=$record
+            done <<< "$dropped"
+            if [ "${#consumers[@]}" -gt 0 ]; then
+              tar -cf "$snapshot/manifests.tar" -- "${manifests[@]}"
+              rejected=""
+              # Every range change lands in its manifest FIRST, then ONE
+              # resolve covers them all. Installing per manifest would
+              # resolve the root's members while a workspace still pinned
+              # the old partner (or the reverse), so a peer-pinned pair
+              # split across two manifests would fail the first resolve on
+              # the very conflict the second was about to remove (Codex).
+              # `npm pkg set` writes through npm's own manifest writer,
+              # keeping the file's formatting, and runs no dependency code;
+              # bracket syntax, since a package name can contain a dot.
+              for consumer in "${consumers[@]}"; do
+                for name in ${members[$consumer]}; do
+                  key="$consumer/$name"
+                  if [ "$consumer" = . ]; then
+                    declare_range=(npm pkg set "${section_of[$key]}[$name]=${range_of[$key]}")
+                  else
+                    declare_range=(npm pkg set --workspace "$consumer" "${section_of[$key]}[$name]=${range_of[$key]}")
+                  fi
+                  if ! attempt=$("${declare_range[@]}" 2>&1); then
+                    rejected=$(printf '%s\n' "$attempt" | grep -v '^$' | tail -n 1 || true)
+                    rejected="npm could not write the range: ${rejected:-no output}"
+                    break 2
+                  fi
+                done
+              done
+              # Then each member's own lockfile record goes, so the resolve
+              # has to place it afresh. The range write alone is not enough:
+              # the bulk keeps a declaration whose range already admits the
+              # new version (`~4.1.10` spans 4.1.11, and npm does not narrow
+              # it), so writing that range back changes nothing, and an
+              # `npm install` with nothing to do reads the lockfile and
+              # keeps HEAD's copies — the member dropped a second time, now
+              # past the re-apply meant to catch it (Codex). An edge whose
+              # record is gone is one npm must place afresh, at the newest
+              # its range admits, together with every other member's, and
+              # the manifests stay as written. Verified against npm 11.19
+              # with the vitest pair under `~` ranges, root and workspace
+              # alike: this reproduces the bulk's lockfile; `npm update`
+              # naming both members does not move them, and an explicit
+              # `name@range` cannot name a workspace's member.
+              if [ -z "$rejected" ]; then
+                records=()
+                for consumer in "${consumers[@]}"; do
+                  for name in ${members[$consumer]}; do
+                    [ "${record_of[$consumer/$name]}" = - ] || records+=("${record_of[$consumer/$name]}")
+                  done
+                done
+                if [ "${#records[@]}" -gt 0 ] && ! attempt=$(node "$CHECKER" unresolve "${records[@]}" 2>&1); then
+                  rejected=$(printf '%s\n' "$attempt" | grep -v '^$' | tail -n 1 || true)
+                  rejected="the checker could not remove the lockfile records: ${rejected:-no output}"
+                fi
+              fi
+              # No names: reconcile the lockfile with the manifests just
+              # written and the records just removed, all in one resolve.
+              if [ -z "$rejected" ] && ! attempt=$(npm install --ignore-scripts 2>&1); then
+                # Same wording rule as the loop's: npm's failure is already
+                # caught, what follows only phrases it.
+                rejected=$(printf '%s\n' "$attempt" | grep -v '^$' | tail -n 1 || true)
+                rejected="npm could not resolve it: ${rejected:-no output}"
+              fi
+              if [ -z "$rejected" ] && ! attempt=$(node "$CHECKER" 2>&1 >/dev/null); then
+                rejected=$(printf '%s\n' "$attempt" | sed -n 's/^::error:://p' | head -n 1 || true)
+                rejected=${rejected:-$(printf '%s\n' "$attempt" | head -n 1 || true)}
+                rejected=${rejected:-the checker rejected the resulting diff}
+              fi
+              if [ -n "$rejected" ]; then
+                tar -xf "$snapshot/manifests.tar"
+                for consumer in "${consumers[@]}"; do
+                  for name in ${members[$consumer]}; do
+                    printf -- '- `%s`: moved to %s (`%s`) in the bulk resolve only together with the rest of this group, and re-applying the group failed: %s\n' "$name" "${version_of[$consumer/$name]}" "${range_of[$consumer/$name]}" "$rejected" >> holdback.md
+                  done
+                done
+              fi
+            fi
+            # A transitive copy the bulk moved that no single re-resolve
+            # reached is named too: nothing can ask for it by version, and a
+            # move dropped in silence is the failure this whole pass exists
+            # to end. "Transitive copy", not "undeclared package": the name
+            # can be declared and have a nested copy of its own that moved —
+            # the report is about the copy, and must not deny the
+            # declaration (Codex). "That move did not ship", not "it stays
+            # where HEAD had it": the bulk may have introduced the package,
+            # and HEAD then had nowhere for it to stay (Codex). Read again
+            # AFTER the group, since a member's own subdependencies come
+            # along with it.
+            #
+            # The same read also names any held-back package the accepted
+            # group carried along after all — a member's subdependency,
+            # moved to a version the checker accepted. Its hold-back line
+            # would claim a move that shipped, so it goes (Codex); the PR
+            # body's summary lists the move like any other. Matched on the
+            # whole "- `name`: " prefix, so one name is never another's.
+            #
+            # And a member the accepted group's resolve placed back at
+            # HEAD's version after all is named too, rather than read as
+            # nothing (Codex): `rejected` is the group's verdict here — reset
+            # when the group began, and no direct record survives without a
+            # group — so the rejected case, whose members are already named
+            # above, does not name them twice.
+            left=$(node "$CHECKER" dropped "$snapshot/bulk-lock.json" ${held[@]+"${held[@]}"})
+            while IFS=$'\t' read -r kind name member version range _; do
+              case "$kind" in
+                direct)
+                  if [ -z "${rejected:-}" ]; then
+                    printf -- '- `%s`: moved to %s (`%s`) in the bulk resolve only together with the rest of this group, and re-applying the group resolved without it, so that move did not ship\n' "$member" "$version" "$range" >> holdback.md
+                  fi ;;
+                transitive)
+                  printf -- '- `%s`: moved in the bulk resolve only as a transitive copy, one no manifest resolves directly, and no single re-resolve reached it; a transitive copy cannot be asked for by version, so that move did not ship\n' "$name" >> holdback.md ;;
+                moved)
+                  # `|| true`: grep -v exits 1 when nothing is left, which
+                  # is a legitimate outcome, not a failure.
+                  grep -v -F -- "- \`$name\`: " holdback.md > "$snapshot/holdback.rest" || true
+                  mv -- "$snapshot/holdback.rest" holdback.md ;;
+              esac
+            done <<< "$left"
             rm -rf -- "$snapshot"
 
             # The rebuild is reported whether or not it held anything back,

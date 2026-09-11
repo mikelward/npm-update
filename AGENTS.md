@@ -181,6 +181,37 @@ has stopped biting.
   new range into whichever manifest declares the dependency, so a workspace's
   `package.json` is part of what the rebuild has to snapshot and roll back;
   `manifestPaths` in the checker is what names them.
+- **A package that only moves TOGETHER with another is out of reach one at
+  a time, so the loop's leftovers are re-applied as a group.** `npm update
+  <name>` cannot move a package whose installed partner pins it to an exact
+  version, and the partner is pinned right back: `vitest` and
+  `@vitest/coverage-v8` re-resolve to no change alone, naming both in one
+  `npm update` does no better, and only a resolve that has to place both
+  afresh moves them. Before the pass had this second half, such a pair
+  validated as unchanged and fell out of the batch neither held back nor
+  moved — gedmap, newshacker and readmo shipped every rebuild week without
+  vitest 4.1.11, the release carrying a `@vitest/mocker` advisory fix, until
+  Dependabot offered the 4 → 5 major instead. So the bulk lockfile is kept
+  aside before the restore, the checker's `dropped` mode names what the bulk
+  moved that the rebuild did not, the declared part is re-applied as one
+  group — the bulk's own ranges written into their declaring manifests, each
+  member's lockfile record removed (the checker's `unresolve` mode), then a
+  single bare `npm install` — and validated like any step of the loop, and
+  what still fails — or a dropped transitive, which nothing can ask for by
+  version, or a member the accepted group's resolve still left at HEAD — is
+  named in `holdback.md`. The record goes because the range write alone is
+  not enough: the bulk keeps a declaration whose range already admits the
+  new version (`~4.1.10` spans 4.1.11, and `npm update --save` does not
+  narrow it), so writing that range back changes nothing, and a bare
+  `npm install` with nothing to do reads the lockfile and keeps HEAD's
+  copies. An edge whose record is gone is one npm must place afresh, at the
+  newest its range admits, in the same resolve as every other member's,
+  root and workspace alike, with the manifests left as written — verified
+  against npm 11.19 with the vitest pair under `~` ranges, where it
+  reproduces the bulk's own lockfile and `npm update` naming both members
+  does not. The test runs the real step end to end against a fake npm that
+  is lockfile-driven the same way, because the failure it guards is the
+  loop finishing green with a package missing.
 - **A week where everything is blocked fails loudly.** Silence would be
   indistinguishable from "nothing to update", which is the failure this
   whole pass exists to end.
