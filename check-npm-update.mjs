@@ -1504,6 +1504,20 @@ export function rebuildCandidates({ manifestBefore, lockBefore, lockAfter, works
  * subtree, so a child of it the rebuild left behind is counted again
  * (Codex).
  *
+ * Nor is anything beneath an optional dependency npm does not install on
+ * the runner — one `isInstallable` refuses for this platform, the wasm32
+ * build of a native module, say — a move of this batch's. npm keeps
+ * the lockfile records beneath such a package through a targeted
+ * `npm update <name>` and prunes them in a full `npm update`, so the same
+ * tree reads as a removal in the bulk resolve and a retention in the
+ * rebuild: gedmap's first batch after the subtree rule still named
+ * tailwind's six wasm runtime shims as dropped moves when nothing had moved
+ * at all. Such a record and everything reachable only through it are left
+ * out of the count on every side. Only such a record: an optional package
+ * npm DOES install here (a `cpu: ["x64"]` binding on an x64 runner, say)
+ * is treated like any other, since what npm prunes and keeps beneath it is
+ * a real removal or retention (Codex).
+ *
  * `moved`: a held-back name the rebuild nonetheless carried to exactly
  * where the bulk had it — the group re-apply brought it along as a
  * member's subdependency — so its line in `holdback.md` would claim a move
@@ -1662,7 +1676,15 @@ export function droppedByRebuild({
   // recorded edge — and the same walk refusing to enter a held-back name's
   // record. A copy the first walk reaches and the second does not sits only
   // beneath a hold-back, and is that hold-back's, not a move of its own.
-  const reachable = (packages, avoid) => {
+  // An optional dependency npm did not install on this runner, by the same
+  // `isInstallable` reading of its `cpu`/`os` lists the validator uses
+  // (strings, negations and unsupported shapes included — Codex). npm
+  // prunes the lockfile records beneath one in a full `npm update` and
+  // keeps them through a targeted one, so its subtree reads as removed in
+  // the bulk and retained in the rebuild when nothing moved. An optional
+  // package npm does install here is any other package.
+  const uninstallable = (entry) => !isInstallable(entry);
+  const reachable = (packages, avoid, enterUninstallable) => {
     const seen = new Set();
     const queue = consumers.map(([consumer]) => consumer);
     while (queue.length) {
@@ -1676,6 +1698,7 @@ export function droppedByRebuild({
           if (avoid.has(name)) continue;
           const hit = resolveEdgeInstance(packages, from, name);
           if (!hit || seen.has(hit.path)) continue;
+          if (!enterUninstallable && uninstallable(hit.entry)) continue;
           seen.add(hit.path);
           queue.push(hit.path);
         }
@@ -1777,12 +1800,18 @@ export function droppedByRebuild({
     .sort();
   const stillHeld = new Set([...held].filter((name) => !moved.includes(name)));
 
+  const none = new Set();
   const heldOnly = (packages) => {
     if (stillHeld.size === 0) return new Set();
-    const avoiding = reachable(packages, stillHeld);
-    return new Set([...reachable(packages, new Set())].filter((path) => !avoiding.has(path)));
+    const avoiding = reachable(packages, stillHeld, false);
+    return new Set([...reachable(packages, none, false)].filter((path) => !avoiding.has(path)));
   };
-  const excluded = (packages, directPaths) => new Set([...directPaths, ...heldOnly(packages)]);
+  const uninstallableOnly = (packages) => {
+    const installed = reachable(packages, none, false);
+    return new Set([...reachable(packages, none, true)].filter((path) => !installed.has(path)));
+  };
+  const excluded = (packages, directPaths) =>
+    new Set([...directPaths, ...heldOnly(packages), ...uninstallableOnly(packages)]);
   const tBefore = tallied(before, excluded(before, rBefore.paths));
   const tBulk = tallied(bulk, excluded(bulk, rBulk.paths));
   const tAfter = tallied(after, excluded(after, rAfter.paths));
