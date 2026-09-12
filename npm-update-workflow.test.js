@@ -100,11 +100,56 @@ describe("npm-update reusable workflow", () => {
     // release-worthy rather than internal plumbing (AGENTS.md "Commit
     // messages" — a bare subject means a consumer could notice the
     // difference). Also guards against a stray "deps: " creeping back in.
-    expect(workflow).toContain('title="Update dependencies ($today)"');
-    expect(workflow).toContain(
-      'title="Update dependencies ($today) — CHECKS FAILING"',
-    );
+    expect(workflow).toContain('title="Update dependencies"');
+    expect(workflow).toContain('title="Update dependencies — CHECKS FAILING"');
     expect(workflow).not.toMatch(/title="deps: /);
+  });
+
+  it("keeps the run date out of the commit subject and PR title", () => {
+    // The title becomes the merge commit's subject, and a consumer that
+    // ships subjects as release notes puts it in front of users — where a
+    // run date is the one part that varies week to week and the one part a
+    // user cannot act on. Asserted as an absence, so re-adding it to tell
+    // weekly batches apart fails here: the commit's own author date, the
+    // `deps/update-<date>` branch and the PR all still record when a batch
+    // ran.
+    //
+    // Run the real block rather than matching its source: the first version
+    // grepped for `title="…"` and so read only double-quoted assignments,
+    // leaving a single-quoted arm — `title='Update dependencies ($today)'`,
+    // perfectly valid shell — unexamined while the other arms kept the
+    // assertion green (Codex). Executing it is quote-style-agnostic by
+    // construction, which is the AGENTS.md "Testing" rule about this
+    // suite's false-pass failure mode.
+    const openPr = doc.jobs.publish.steps.find((s) => s.name === "Open the pull request");
+    const startMarker = "# No date in the title, deliberately.";
+    const start = openPr.run.indexOf(startMarker);
+    expect(start).toBeGreaterThan(-1);
+    // The parser hands back the block scalar already dedented, so the outer
+    // `fi` sits at column 0 and the nested REGEN_SHA one is indented — this
+    // marker therefore cannot match the inner block's close.
+    const endMarker = "\nfi\n";
+    const end = openPr.run.indexOf(endMarker, start);
+    expect(end).toBeGreaterThan(-1);
+    const block = openPr.run.slice(start, end + endMarker.length);
+
+    const runTitle = (passed, regenSha) =>
+      execFileSync("bash", ["-c", `set -euo pipefail\n${block}\nprintf '%s' "$title"`], {
+        encoding: "utf8",
+        env: { ...process.env, PASSED: passed, REGEN_SHA: regenSha },
+      });
+
+    for (const passed of ["true", "false"]) {
+      for (const regenSha of ["", "abc1234"]) {
+        const title = runTitle(passed, regenSha);
+        expect(title).toMatch(/^Update dependencies/);
+        expect(title).not.toMatch(/\d{4}-\d{2}-\d{2}/);
+        expect(title).not.toMatch(/[()]/);
+      }
+    }
+    // And the date is not smuggled in through $today either — the branch is
+    // the only thing that still carries it.
+    expect(runTitle("true", "")).not.toMatch(/\$today/);
   });
 
   it("takes the Node major from .nvmrc rather than naming one", () => {
@@ -1473,7 +1518,7 @@ describe("the regenerate hook", () => {
     // commit's subject — and the rebuilt file is called out in the verdict,
     // inside the passed branch, so a failing check still outranks it.
     expect(openPr.run).toMatch(
-      /if \[ "\$PASSED" != 'true' \]; then\n\s*title="Update dependencies \(\$today\) — CHECKS FAILING"[^]*?else\n\s*title="Update dependencies \(\$today\)"\n\s*verdict='All checks passed in the job that produced this branch\.'\n\s*if \[ -n "\$REGEN_SHA" \]; then\n[^]*?verdict="\$verdict This batch also rebuilt a derived file/,
+      /if \[ "\$PASSED" != 'true' \]; then\n\s*title="Update dependencies — CHECKS FAILING"[^]*?else\n\s*title="Update dependencies"\n\s*verdict='All checks passed in the job that produced this branch\.'\n\s*if \[ -n "\$REGEN_SHA" \]; then\n[^]*?verdict="\$verdict This batch also rebuilt a derived file/,
     );
   });
 
