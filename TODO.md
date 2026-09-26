@@ -26,6 +26,18 @@ Deferred work, recorded here so it isn't lost.
 
 ## The extracted workflow
 
+- [ ] **Group the fallback through ordinary peer chains, not just lockstep
+      ones.** The group re-apply's per-set fallback links declared names by
+      their own peer fields and by lockstep pairs (chains through undeclared
+      names included), but not through an undeclared package whose peer
+      edges are ordinary: direct `a` and `c` linked only by a transitive
+      `b` (`a` → `b` → `c`, versions unequal) are retried apart and can
+      each fail on the other's old range, holding back a set that would
+      resolve together. Cost is a hold-back only, never a split. The catch
+      is over-merging: following every transitive peer edge can fold
+      unrelated sets into one (eslint plugins all peer `eslint`), which is
+      what the per-set fallback exists to avoid, so this wants a bound on
+      which edges count. Raised by Codex on mikelward/npm-update#52.
 - [ ] **Retire `dispatch-workflows` once every consumer supplies a
       credential.** It patches one required check at a time; the `token` /
       `app-id` secrets make the whole `pull_request` round run, which covers
