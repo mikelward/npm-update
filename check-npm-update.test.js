@@ -20,7 +20,7 @@
 import { describe, expect, it } from './vitest-shim.mjs'
 
 import { execFileSync } from 'node:child_process'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -41,6 +41,10 @@ import {
   manifestPaths,
   rebuildCandidates,
   droppedByRebuild,
+  lockstepMembers,
+  lockstepPartnerRecords,
+  lockstepPairs,
+  lockstepSplits,
   unresolved,
   updateSummary,
   workspacePaths,
@@ -2799,22 +2803,23 @@ describe('droppedByRebuild', () => {
   // a and b peer-pin each other, c is a's subdependency, r is untouched
   // and its subdependency x is the crossing the loop holds r back for.
   const manifest = { dependencies: { a: '^1.0.0', b: '~1.0.0', r: '^1.0.0' } }
+  const pinned = (v, peer) => ({ version: v, peerDependencies: { [peer]: v } })
   const head = lock(
-    { 'node_modules/a': '1.0.0', 'node_modules/b': '1.0.0', 'node_modules/c': '1.0.0', 'node_modules/r': '1.0.0', 'node_modules/x': '0.1.0' },
+    { 'node_modules/a': pinned('1.0.0', 'b'), 'node_modules/b': pinned('1.0.0', 'a'), 'node_modules/c': '1.0.0', 'node_modules/r': '1.0.0', 'node_modules/x': '0.1.0' },
     { dependencies: { a: '^1.0.0', b: '~1.0.0', r: '^1.0.0' } },
   )
   // The bulk resolve's root record carries the ranges `npm update --save`
   // wrote: the operator kept, the floor moved.
   const bulk = lock(
-    { 'node_modules/a': '1.1.0', 'node_modules/b': '1.1.0', 'node_modules/c': '1.0.1', 'node_modules/r': '1.0.0', 'node_modules/x': '0.2.0' },
+    { 'node_modules/a': pinned('1.1.0', 'b'), 'node_modules/b': pinned('1.1.0', 'a'), 'node_modules/c': '1.0.1', 'node_modules/r': '1.0.0', 'node_modules/x': '0.2.0' },
     { dependencies: { a: '^1.1.0', b: '~1.1.0', r: '^1.0.0' } },
   )
 
   it('offers a declared pair the loop left at HEAD as a group, with the bulk\'s versions and declared ranges, and names the dropped transitives', () => {
     expect(droppedByRebuild({ manifestBefore: manifest, lockBefore: head, lockBulk: bulk, lockAfter: head, heldBack: ['r'] })).toEqual({
       direct: [
-        { consumer: '.', name: 'a', version: '1.1.0', range: '^1.1.0', section: 'dependencies', path: 'node_modules/a' },
-        { consumer: '.', name: 'b', version: '1.1.0', range: '~1.1.0', section: 'dependencies', path: 'node_modules/b' },
+        { consumer: '.', name: 'a', version: '1.1.0', range: '^1.1.0', section: 'dependencies', path: 'node_modules/a', group: 1 },
+        { consumer: '.', name: 'b', version: '1.1.0', range: '~1.1.0', section: 'dependencies', path: 'node_modules/b', group: 1 },
       ],
       transitive: ['c', 'x'],
       moved: [],
@@ -3015,7 +3020,7 @@ describe('droppedByRebuild', () => {
     const ws = { 'packages/w': { manifestBefore: { name: 'w', dependencies: { dep: '^1.0.0' } } } }
     const at = (v) => lock({ 'packages/w': { name: 'w', version: '0.0.0' }, 'node_modules/w': { link: true }, 'packages/w/node_modules/dep': v })
     expect(droppedByRebuild({ manifestBefore: { dependencies: { w: '*' } }, lockBefore: at('1.0.0'), lockBulk: at('1.2.0'), lockAfter: at('1.0.0'), workspaces: ws })).toEqual({
-      direct: [{ consumer: 'packages/w', name: 'dep', version: '1.2.0', range: '1.2.0', section: 'dependencies', path: 'packages/w/node_modules/dep' }],
+      direct: [{ consumer: 'packages/w', name: 'dep', version: '1.2.0', range: '1.2.0', section: 'dependencies', path: 'packages/w/node_modules/dep', group: 1 }],
       transitive: [],
       moved: [],
     })
@@ -3335,7 +3340,7 @@ describe('the CLI run from a nested npm tree', () => {
     writeFileSync(join(cwd, 'package-lock.json'), lockFor('1.0.0'))
     // Version and the bulk record's declared range, which is what the
     // workflow re-applies by (this fixture's root record keeps ^1.0.0).
-    expect(runFrom(cwd, 'dropped', bulk)).toBe('direct\t.\tdep\t1.0.2\t^1.0.0\tdependencies\tnode_modules/dep\n')
+    expect(runFrom(cwd, 'dropped', bulk)).toBe('direct\t.\tdep\t1.0.2\t^1.0.0\tdependencies\tnode_modules/dep\t1\n')
     // A name the loop held back is not offered again.
     expect(runFrom(cwd, 'dropped', bulk, 'dep')).toBe('')
     // And a package the loop did move is not dropped, whatever version it reached.
@@ -3588,5 +3593,472 @@ describe('satisfiesRange', () => {
     // not make the whole range unanswerable when another admits the version.
     expect(satisfiesRange('1.2.3', '1.0 - 2.0 || ^1.2.0')).toBe(true)
     expect(satisfiesRange('9.9.9', '1.0 - 2.0 || ^1.2.0')).toBe(null)
+  })
+})
+
+describe('lockstep pairs', () => {
+  const CLI = fileURLToPath(new URL('./check-npm-update.mjs', import.meta.url))
+  // The shape that broke gedmap and newshacker on 2026-09-26: react-dom
+  // peers on react with a range (`^19.2.8`) that admits the react the
+  // rebuild took alone, so every range check passed on a tree React refuses
+  // to render with. Three lockfiles, as droppedByRebuild takes them.
+  const lock = (packages, dependencies = {}) => ({ lockfileVersion: 3, packages: { '': { dependencies }, ...packages } })
+  const declared = { react: '*', 'react-dom': '*', '@types/react': '*', '@types/react-dom': '*', '@babel/core': '*', '@babel/helper': '*' }
+  const tree = ({ react, dom, types = '1.0.0', typesDom = '1.0.0', core = '1.0.0', helper = '1.0.0' }) =>
+    lock({
+      'node_modules/react': { version: react },
+      'node_modules/react-dom': { version: dom, peerDependencies: { react: `^${dom}` } },
+      // @types/react-dom peers on @types/react, and the bulk moves only
+      // one of them: an ordinary week, not a pair.
+      'node_modules/@types/react': { version: types },
+      'node_modules/@types/react-dom': { version: typesDom, peerDependencies: { '@types/react': '^1.0.0' } },
+      // A babel helper sits at @babel/core's version by coincidence and
+      // the bulk moves only core: not a pair either.
+      'node_modules/@babel/core': { version: core },
+      'node_modules/@babel/helper': { version: helper, peerDependencies: { '@babel/core': '^1.0.0' } },
+    }, declared)
+  const head = tree({ react: '1.0.0', dom: '1.0.0' })
+  const bulk = tree({ react: '1.1.0', dom: '1.1.0', types: '1.0.1', core: '1.0.1' })
+
+  it('pairs only the copies the bulk moved to one new version together', () => {
+    expect(lockstepPairs({ lockBefore: head, lockBulk: bulk })).toEqual([
+      { names: ['react-dom', 'react'], directions: [['react-dom', 'react']], was: '1.0.0', to: '1.1.0' },
+    ])
+    expect(lockstepMembers({ lockBefore: head, lockBulk: bulk })).toEqual(['react', 'react-dom'])
+  })
+
+  it('reports a tree that takes one member without the other, in either direction', () => {
+    for (const [react, dom] of [['1.1.0', '1.0.0'], ['1.0.0', '1.1.0']]) {
+      const split = lockstepSplits({ lockBefore: head, lockBulk: bulk, lockAfter: tree({ react, dom }) })
+      expect(split).toHaveLength(1)
+      expect(split[0]).toContain('react-dom')
+      expect(split[0]).toContain('released in lockstep')
+    }
+  })
+
+  it('passes a tree that moves both, or neither', () => {
+    expect(lockstepSplits({ lockBefore: head, lockBulk: bulk, lockAfter: bulk })).toEqual([])
+    expect(lockstepSplits({ lockBefore: head, lockBulk: bulk, lockAfter: head })).toEqual([])
+  })
+
+  it('does not read an unrelated nested copy of the peer as a split', () => {
+    // A nested react 0.9.0 under some other package declares no peer on
+    // react-dom, so it says nothing about the pair. Checked from the peer's
+    // side too, it reported a split of an unchanged pair and would reject
+    // every step of a rebuild (Codex).
+    const withStray = (react, dom) =>
+      lock({
+        ...tree({ react, dom }).packages,
+        'node_modules/legacy': { version: '1.0.0', dependencies: { react: '^0.9.0' } },
+        'node_modules/legacy/node_modules/react': { version: '0.9.0' },
+      }, declared)
+    const before = withStray('1.0.0', '1.0.0')
+    const bulkStray = withStray('1.1.0', '1.1.0')
+    expect(lockstepSplits({ lockBefore: before, lockBulk: bulkStray, lockAfter: before })).toEqual([])
+    expect(lockstepSplits({ lockBefore: before, lockBulk: bulkStray, lockAfter: bulkStray })).toEqual([])
+    // A real split beside it is still caught.
+    expect(lockstepSplits({ lockBefore: before, lockBulk: bulkStray, lockAfter: withStray('1.1.0', '1.0.0') })).toHaveLength(1)
+  })
+
+  it('still catches a split after a release between dropped the peer declaration', () => {
+    // react-dom 1.0.5 sits between HEAD's 1.0.0 and the bulk's 1.1.0 and
+    // declares no peer. Requiring the declaration on the rebuilt copy
+    // waved react-dom 1.0.5 with react 1.0.0 through (Codex).
+    const head = tree({ react: '1.0.0', dom: '1.0.0' })
+    const bulk = tree({ react: '1.1.0', dom: '1.1.0' })
+    const after = lock({ ...head.packages, 'node_modules/react-dom': { version: '1.0.5' } })
+    expect(lockstepSplits({ lockBefore: head, lockBulk: bulk, lockAfter: after })).toHaveLength(1)
+  })
+
+  it('counts a partner npm no longer installs as a split', () => {
+    // react-dom 1.0.5 drops the peer field and npm prunes react with it:
+    // react-dom would ship without the react it moves with (Codex).
+    const head = tree({ react: '1.0.0', dom: '1.0.0' })
+    const bulk = tree({ react: '1.1.0', dom: '1.1.0' })
+    const { 'node_modules/react': _, ...rest } = head.packages
+    const after = lock({ ...rest, 'node_modules/react-dom': { version: '1.0.5' } })
+    expect(lockstepSplits({ lockBefore: head, lockBulk: bulk, lockAfter: after })).toHaveLength(1)
+    expect(lockstepSplits({ lockBefore: head, lockBulk: bulk, lockAfter: after })[0]).toContain('not installed')
+  })
+
+  it('lists the partner records a member resolves, for the group re-apply to remove', () => {
+    const head = tree({ react: '1.0.0', dom: '1.0.0' })
+    const bulk = tree({ react: '1.1.0', dom: '1.1.0' })
+    // Only react-dom is in the group: its partner's record comes along.
+    expect(lockstepPartnerRecords({ lockBefore: head, lockBulk: bulk, lockAfter: head, names: ['react-dom'] })).toEqual(['node_modules/react'])
+    // Only react in the group, react-dom transitive: the react-dom copies
+    // that resolve it come along, or react-dom stays at HEAD (Codex).
+    expect(lockstepPartnerRecords({ lockBefore: head, lockBulk: bulk, lockAfter: head, names: ['react'] })).toEqual(['node_modules/react-dom'])
+    // A chain a-b-c with only a named: b's and c's records both come along,
+    // or c stays at HEAD and splits from b (Codex).
+    const chain = (v) =>
+      lock({
+        'node_modules/a': { version: v, peerDependencies: { b: `^${v}` } },
+        'node_modules/b': { version: v, peerDependencies: { c: `^${v}` } },
+        'node_modules/c': { version: v },
+      }, { a: '*' })
+    expect(lockstepPartnerRecords({ lockBefore: chain('1.0.0'), lockBulk: chain('1.1.0'), lockAfter: chain('1.0.0'), names: ['a'] })).toEqual(['node_modules/b', 'node_modules/c'])
+    // Both in the group: each already brings its own record.
+    expect(lockstepPartnerRecords({ lockBefore: head, lockBulk: bulk, lockAfter: head, names: ['react', 'react-dom'] })).toEqual([])
+    // A name in no pair brings nothing.
+    expect(lockstepPartnerRecords({ lockBefore: head, lockBulk: bulk, lockAfter: head, names: ['u'] })).toEqual([])
+    // An unrelated nested react-dom that never peered on react does not
+    // bring the nested react it happens to resolve (Codex).
+    const withUnrelated = lock({
+      ...head.packages,
+      'node_modules/legacy': { version: '1.0.0', dependencies: { 'react-dom': '*', react: '*' } },
+      'node_modules/legacy/node_modules/react-dom': { version: '0.9.0' },
+      'node_modules/legacy/node_modules/react': { version: '0.9.0' },
+    }, declared)
+    expect(lockstepPartnerRecords({ lockBefore: head, lockBulk: bulk, lockAfter: withUnrelated, names: ['react-dom'] })).toEqual(['node_modules/react'])
+  })
+
+  it('reads every copy of the member, holding back rather than missing a split', () => {
+    // A parent-only rebuild step advances an unrelated nested react-dom that
+    // never peered on react, to a mismatch neither tree had. Choosing which
+    // copies "participate" by declaration or path lost real splits (Codex),
+    // so every copy is read and this step is held back: over-reporting only
+    // ever holds back.
+    const withNested = (react, dom, nested) =>
+      lock({
+        ...tree({ react, dom }).packages,
+        'node_modules/legacy': { version: '1.0.0', dependencies: { 'react-dom': '*' } },
+        'node_modules/legacy/node_modules/react-dom': { version: nested },
+      }, declared)
+    const head = withNested('1.0.0', '1.0.0', '5.0.0')
+    const bulk = withNested('1.1.0', '1.1.0', '5.1.0')
+    expect(lockstepPairs({ lockBefore: head, lockBulk: bulk })).toHaveLength(1)
+    expect(lockstepSplits({ lockBefore: head, lockBulk: bulk, lockAfter: head })).toEqual([])
+    expect(lockstepSplits({ lockBefore: head, lockBulk: bulk, lockAfter: bulk })).toEqual([])
+    expect(lockstepSplits({ lockBefore: head, lockBulk: bulk, lockAfter: withNested('1.0.0', '1.0.0', '5.1.0') })).toHaveLength(1)
+  })
+
+  it('counts a split whose member dropped the peer field and moved', () => {
+    // The rebuild takes an in-between react-dom with no peer field AND npm
+    // nests it at a path neither tree had: path-based selection missed this
+    // copy entirely (Codex).
+    const head = tree({ react: '1.0.0', dom: '1.0.0' })
+    const bulk = tree({ react: '1.1.0', dom: '1.1.0' })
+    const { 'node_modules/react-dom': _, ...rest } = head.packages
+    const after = lock({
+      ...rest,
+      'node_modules/app-shell': { version: '1.0.0', dependencies: { 'react-dom': '*' } },
+      'node_modules/app-shell/node_modules/react-dom': { version: '1.0.5' },
+    }, declared)
+    expect(lockstepSplits({ lockBefore: head, lockBulk: bulk, lockAfter: after })).toHaveLength(1)
+  })
+
+  it('does not count a mismatch the tree already had at HEAD', () => {
+    // An old react-dom nested under another package, with no react of its
+    // own, resolves the root react at a different version before and after
+    // the batch alike. It is not this batch's split.
+    const withOld = (react, dom) =>
+      lock({
+        ...tree({ react, dom }).packages,
+        'node_modules/legacy': { version: '1.0.0', dependencies: { 'react-dom': '^0.9.0' } },
+        'node_modules/legacy/node_modules/react-dom': { version: '0.9.0' },
+      }, declared)
+    const head = withOld('1.0.0', '1.0.0')
+    const bulk = withOld('1.1.0', '1.1.0')
+    expect(lockstepPairs({ lockBefore: head, lockBulk: bulk })).toHaveLength(1)
+    expect(lockstepSplits({ lockBefore: head, lockBulk: bulk, lockAfter: head })).toEqual([])
+    expect(lockstepSplits({ lockBefore: head, lockBulk: bulk, lockAfter: bulk })).toEqual([])
+    expect(lockstepSplits({ lockBefore: head, lockBulk: bulk, lockAfter: withOld('1.1.0', '1.0.0') })).toHaveLength(1)
+  })
+
+  it('keeps a pair two workspaces carry on different release lines', () => {
+    // One workspace on react 1, another on react 2, each copy matched with
+    // its own react-dom. Requiring one version for the name dropped the
+    // pair, and the rebuild could then split either line (Codex).
+    const lines = (one, two) =>
+      lock({
+        'packages/a': { name: 'a', version: '0.0.0', dependencies: { react: '*', 'react-dom': '*' } },
+        'packages/b': { name: 'b', version: '0.0.0', dependencies: { react: '*', 'react-dom': '*' } },
+        'packages/a/node_modules/react': { version: one },
+        'packages/a/node_modules/react-dom': { version: one, peerDependencies: { react: `^${one}` } },
+        'packages/b/node_modules/react': { version: two },
+        'packages/b/node_modules/react-dom': { version: two, peerDependencies: { react: `^${two}` } },
+      })
+    const head = lines('1.0.0', '2.0.0')
+    const bulk = lines('1.1.0', '2.1.0')
+    expect(lockstepMembers({ lockBefore: head, lockBulk: bulk })).toEqual(['react', 'react-dom'])
+    const split = lock({ ...bulk.packages, 'packages/b/node_modules/react-dom': { version: '2.0.0', peerDependencies: { react: '^2.0.0' } } })
+    expect(lockstepSplits({ lockBefore: head, lockBulk: bulk, lockAfter: split })).toHaveLength(1)
+    expect(lockstepSplits({ lockBefore: head, lockBulk: bulk, lockAfter: bulk })).toEqual([])
+  })
+
+  it('counts copies, not distinct versions, on both sides', () => {
+    // Three workspaces, each with its own pair. Two at 1.0.0 and one at
+    // 1.1.0 at HEAD; the bulk moves one of the 1.0.0 pairs. The distinct
+    // versions read {1.0.0, 1.1.0} on both sides, and the pair was missed
+    // (Codex).
+    const ws = (versions) =>
+      lock(Object.fromEntries(versions.flatMap((v, i) => [
+        [`packages/w${i}`, { name: `w${i}`, version: '0.0.0', dependencies: { react: '*', 'react-dom': '*' } }],
+        [`packages/w${i}/node_modules/react`, { version: v }],
+        [`packages/w${i}/node_modules/react-dom`, { version: v, peerDependencies: { react: `^${v}` } }],
+      ])))
+    const head = ws(['1.0.0', '1.0.0', '1.1.0'])
+    const bulk = ws(['1.1.0', '1.0.0', '1.1.0'])
+    expect(lockstepMembers({ lockBefore: head, lockBulk: bulk })).toEqual(['react', 'react-dom'])
+
+    // An old nested react-dom 1.1.0 resolving the root react 1.0.0 is a
+    // mismatch at HEAD. A rebuild that newly splits the root pair the same
+    // way (react-dom 1.1.0, react 1.0.0) has one more of it than HEAD did,
+    // and that one is a split (Codex).
+    const withOld = (react, dom) =>
+      lock({
+        ...tree({ react, dom }).packages,
+        'node_modules/legacy': { version: '1.0.0', dependencies: { 'react-dom': '*' } },
+        'node_modules/legacy/node_modules/react-dom': { version: '1.1.0' },
+      }, declared)
+    const before = withOld('1.0.0', '1.0.0')
+    const moved = withOld('1.1.0', '1.1.0')
+    expect(lockstepSplits({ lockBefore: before, lockBulk: moved, lockAfter: before })).toEqual([])
+    expect(lockstepSplits({ lockBefore: before, lockBulk: moved, lockAfter: withOld('1.0.0', '1.1.0') })).toHaveLength(1)
+    // And the same split with the old copy pruned in the same rebuild: the
+    // count holds level, but the split is at a path that had none (Codex).
+    const pruned = tree({ react: '1.0.0', dom: '1.1.0' })
+    expect(lockstepSplits({ lockBefore: before, lockBulk: moved, lockAfter: pruned })).toHaveLength(1)
+  })
+
+  it('groups a pair found through nested copies even when the declared copies carry no peer field', () => {
+    // The root copies declare nothing; a nested pair under `shell` is what
+    // makes react/react-dom a pair. The loop skips both as a pair, so the
+    // fallback must keep them in one group (Codex).
+    const at = (v) =>
+      lock({
+        'node_modules/react': { version: v },
+        'node_modules/react-dom': { version: v },
+        'node_modules/shell': { version: '1.0.0', dependencies: { react: '*', 'react-dom': '*' } },
+        'node_modules/shell/node_modules/react': { version: v },
+        'node_modules/shell/node_modules/react-dom': { version: v, peerDependencies: { react: `^${v}` } },
+      }, { react: '^1.0.0', 'react-dom': '^1.0.0', shell: '*' })
+    const { direct } = droppedByRebuild({
+      manifestBefore: { dependencies: { react: '^1.0.0', 'react-dom': '^1.0.0', shell: '*' } },
+      lockBefore: at('1.0.0'),
+      lockBulk: at('1.1.0'),
+      lockAfter: at('1.0.0'),
+    })
+    const groupOf = Object.fromEntries(direct.map(({ name, group }) => [name, group]))
+    expect(groupOf.react).toBe(groupOf['react-dom'])
+  })
+
+  it('groups two declared names chained through a transitive lockstep member', () => {
+    // Direct a and c, transitive b, with pairs a-b and b-c. Grouping only
+    // among declared names put a and c apart, so the fallback re-applied
+    // each without the other's range and failed both (Codex).
+    const at = (v) =>
+      lock({
+        'node_modules/a': { version: v, peerDependencies: { b: `^${v}` } },
+        'node_modules/b': { version: v, peerDependencies: { c: `^${v}` } },
+        'node_modules/c': { version: v },
+      }, { a: '^1.0.0', c: '^1.0.0' })
+    const { direct } = droppedByRebuild({
+      manifestBefore: { dependencies: { a: '^1.0.0', c: '^1.0.0' } },
+      lockBefore: at('1.0.0'),
+      lockBulk: at('1.1.0'),
+      lockAfter: at('1.0.0'),
+    })
+    const groupOf = Object.fromEntries(direct.map(({ name, group }) => [name, group]))
+    expect(Object.keys(groupOf).sort()).toEqual(['a', 'c'])
+    expect(groupOf.a).toBe(groupOf.c)
+    expect(groupOf.a).toBe(1)
+  })
+
+  it('checks both directions of a pair whose members peer on each other', () => {
+    // Root a and b peer on each other; a nested b under `x` resolves the
+    // root a. Moving the root pair and leaving the nested b behind splits
+    // only the b -> a direction; keeping one direction per pair missed it
+    // (Codex).
+    const tree = (root, nested) =>
+      lock({
+        'node_modules/a': { version: root, peerDependencies: { b: root } },
+        'node_modules/b': { version: root, peerDependencies: { a: root } },
+        'node_modules/x': { version: '1.0.0', dependencies: { b: '*' } },
+        'node_modules/x/node_modules/b': { version: nested, peerDependencies: { a: nested } },
+      }, { a: '*', b: '*', x: '*' })
+    const head = tree('1.0.0', '1.0.0')
+    const bulk = tree('1.1.0', '1.1.0')
+    expect(lockstepPairs({ lockBefore: head, lockBulk: bulk })[0].directions).toHaveLength(2)
+    expect(lockstepSplits({ lockBefore: head, lockBulk: bulk, lockAfter: tree('1.1.0', '1.0.0') })).toHaveLength(1)
+    expect(lockstepSplits({ lockBefore: head, lockBulk: bulk, lockAfter: bulk })).toEqual([])
+  })
+
+  it('keeps a mutual pair\'s reverse direction when only the forward one moved', () => {
+    // a -> b is declared only by the root a, which moves 1.0.0 -> 1.1.0.
+    // b -> a is declared by the root b and by q's nested b, which trade
+    // versions (1.0.0 <-> 1.1.0), so its multiset holds still. Keeping only
+    // directions that moved dropped b -> a, the one view of q's copies
+    // (Codex).
+    const decl = { a: '*', b: '*', q: '*' }
+    const at = (root, nested) =>
+      lock({
+        'node_modules/a': { version: root, peerDependencies: { b: root } },
+        'node_modules/b': { version: root, peerDependencies: { a: root } },
+        'node_modules/q': { version: '1.0.0', dependencies: { a: '*', b: '*' } },
+        'node_modules/q/node_modules/a': { version: nested.a },
+        'node_modules/q/node_modules/b': { version: nested.b, peerDependencies: { a: nested.b } },
+      }, decl)
+    const head = at('1.0.0', { a: '1.1.0', b: '1.1.0' })
+    const bulk = at('1.1.0', { a: '1.0.0', b: '1.0.0' })
+    const [pair] = lockstepPairs({ lockBefore: head, lockBulk: bulk })
+    expect(pair.directions).toHaveLength(2)
+    // q's b taken to 1.0.0 while its a stays at 1.1.0: only b -> a sees it.
+    const split = at('1.1.0', { a: '1.1.0', b: '1.0.0' })
+    expect(lockstepSplits({ lockBefore: head, lockBulk: bulk, lockAfter: split })).toHaveLength(1)
+    expect(lockstepSplits({ lockBefore: head, lockBulk: bulk, lockAfter: bulk })).toEqual([])
+  })
+
+  it('does not call a split what the bulk itself took apart', () => {
+    // @types/react moved alone and the babel helper stayed behind core in
+    // the bulk resolve, so a tree keeping them apart is not a split.
+    const after = tree({ react: '1.1.0', dom: '1.1.0', types: '1.0.1', core: '1.0.1' })
+    expect(lockstepSplits({ lockBefore: head, lockBulk: bulk, lockAfter: after })).toEqual([])
+  })
+
+  it('pairs nothing when the two were apart at HEAD', () => {
+    // Converging on one version is not evidence they are released together.
+    const apart = tree({ react: '1.0.0', dom: '0.9.0' })
+    expect(lockstepPairs({ lockBefore: apart, lockBulk: bulk })).toEqual([])
+  })
+
+  it('finds a pair npm hoisted between the lockfiles, and a split of it', () => {
+    // At HEAD the pair sits nested under the package that uses it; the bulk
+    // hoisted both to the root. Matching lockfile keys finds no HEAD copy
+    // at the bulk's path and no pair, and the rebuild can split them (Codex).
+    const shell = { 'node_modules/shell': { version: '1.0.0', dependencies: { react: '*', 'react-dom': '*' } } }
+    const nested = lock({
+      ...shell,
+      'node_modules/shell/node_modules/react': { version: '1.0.0' },
+      'node_modules/shell/node_modules/react-dom': { version: '1.0.0', peerDependencies: { react: '^1.0.0' } },
+    })
+    const hoisted = (react, dom) =>
+      lock({
+        ...shell,
+        'node_modules/react': { version: react },
+        'node_modules/react-dom': { version: dom, peerDependencies: { react: `^${dom}` } },
+      })
+    expect(lockstepPairs({ lockBefore: nested, lockBulk: hoisted('1.1.0', '1.1.0') })).toEqual([
+      { names: ['react-dom', 'react'], directions: [['react-dom', 'react']], was: '1.0.0', to: '1.1.0' },
+    ])
+    expect(lockstepSplits({ lockBefore: nested, lockBulk: hoisted('1.1.0', '1.1.0'), lockAfter: hoisted('1.1.0', '1.0.0') })).toHaveLength(1)
+    expect(lockstepSplits({ lockBefore: nested, lockBulk: hoisted('1.1.0', '1.1.0'), lockAfter: hoisted('1.1.0', '1.1.0') })).toEqual([])
+    // And the rebuild putting them back where HEAD had them, split, is
+    // caught from the same dependent.
+    const renested = lock({
+      ...shell,
+      'node_modules/shell/node_modules/react': { version: '1.1.0' },
+      'node_modules/shell/node_modules/react-dom': { version: '1.0.0', peerDependencies: { react: '^1.0.0' } },
+    })
+    expect(lockstepSplits({ lockBefore: nested, lockBulk: hoisted('1.1.0', '1.1.0'), lockAfter: renested })).toHaveLength(1)
+  })
+
+  it('finds a pair whose dependent npm hoisted, too', () => {
+    // A level further out than the member hoist above: the package that
+    // uses the pair is itself nested at HEAD and hoisted by the bulk, with
+    // the pair under it each time. Anchoring at a dependent's path missed
+    // this (Codex); names read each lockfile on its own and cannot.
+    const pair = (under, v) => ({
+      [`${under}node_modules/react`]: { version: v },
+      [`${under}node_modules/react-dom`]: { version: v, peerDependencies: { react: `^${v}` } },
+    })
+    const head = lock({
+      'node_modules/app': { version: '1.0.0', dependencies: { shell: '*' } },
+      'node_modules/app/node_modules/shell': { version: '1.0.0', dependencies: { react: '*', 'react-dom': '*' } },
+      ...pair('node_modules/app/node_modules/shell/', '1.0.0'),
+    })
+    const bulk = lock({
+      'node_modules/app': { version: '1.0.0', dependencies: { shell: '*' } },
+      'node_modules/shell': { version: '1.0.0', dependencies: { react: '*', 'react-dom': '*' } },
+      ...pair('', '1.1.0'),
+    })
+    expect(lockstepMembers({ lockBefore: head, lockBulk: bulk })).toEqual(['react', 'react-dom'])
+  })
+
+  it('groups a pair by name, across workspaces and the root', () => {
+    // One workspace declares react-dom and resolves react from the root's
+    // declaration: still one pair, and re-applying the halves apart makes
+    // each fail the lockstep check (Codex). Keyed by name, both
+    // workspaces' copies share the group too -- the stated cost.
+    const at = (v) =>
+      lock({
+        '': { dependencies: { react: '^1.0.0' } },
+        'packages/a': { name: 'a', version: '0.0.0', dependencies: { 'react-dom': '^1.0.0' } },
+        'packages/b': { name: 'b', version: '0.0.0', dependencies: { react: '^1.0.0', 'react-dom': '^1.0.0' } },
+        'node_modules/a': { link: true },
+        'node_modules/b': { link: true },
+        'node_modules/react': { version: v },
+        'packages/a/node_modules/react-dom': { version: v, peerDependencies: { react: `^${v}` } },
+        'packages/b/node_modules/react': { version: v },
+        'packages/b/node_modules/react-dom': { version: v, peerDependencies: { react: `^${v}` } },
+      })
+    const { direct } = droppedByRebuild({
+      manifestBefore: { dependencies: { react: '^1.0.0' } },
+      lockBefore: at('1.0.0'),
+      lockBulk: at('1.1.0'),
+      lockAfter: at('1.0.0'),
+      workspaces: {
+        'packages/a': { manifestBefore: { name: 'a', dependencies: { 'react-dom': '^1.0.0' } } },
+        'packages/b': { manifestBefore: { name: 'b', dependencies: { react: '^1.0.0', 'react-dom': '^1.0.0' } } },
+      },
+    })
+    expect(direct.length).toBe(4)
+    expect(new Set(direct.map(({ group }) => group)).size).toBe(1)
+  })
+
+  it('pairs nothing on a lockfile it cannot walk', () => {
+    expect(lockstepPairs({ lockBefore: { lockfileVersion: 1 }, lockBulk: bulk })).toEqual([])
+    expect(lockstepSplits({ lockBefore: head, lockBulk: bulk, lockAfter: { lockfileVersion: 1 } })).toEqual([])
+  })
+
+  it('groups the dropped members by peer link, so one pair failing need not sink another', () => {
+    const at = (v) =>
+      lock({
+        'node_modules/react': { version: v },
+        'node_modules/react-dom': { version: v, peerDependencies: { react: `^${v}` } },
+        'node_modules/vitest': { version: v, peerDependencies: { '@vitest/coverage-v8': v } },
+        'node_modules/@vitest/coverage-v8': { version: v, peerDependencies: { vitest: v } },
+        'node_modules/lone': { version: v },
+      })
+    const manifest = { dependencies: { react: '^1.0.0', 'react-dom': '^1.0.0', vitest: '^1.0.0', '@vitest/coverage-v8': '^1.0.0', lone: '^1.0.0' } }
+    const { direct } = droppedByRebuild({ manifestBefore: manifest, lockBefore: at('1.0.0'), lockBulk: at('1.1.0'), lockAfter: at('1.0.0') })
+    const groupOf = Object.fromEntries(direct.map(({ name, group }) => [name, group]))
+    expect(Object.keys(groupOf).sort()).toEqual(['@vitest/coverage-v8', 'lone', 'react', 'react-dom', 'vitest'])
+    expect(groupOf.react).toBe(groupOf['react-dom'])
+    expect(groupOf.vitest).toBe(groupOf['@vitest/coverage-v8'])
+    expect(new Set(Object.values(groupOf)).size).toBe(3)
+  })
+
+  it('refuses a split from the command line, and lists the members', () => {
+    const repo = mkdtempSync(join(tmpdir(), 'lockstep-'))
+    try {
+      const git = (...args) =>
+        execFileSync('git', ['-C', repo, '-c', 'user.name=t', '-c', 'user.email=t@example.com', '-c', 'commit.gpgsign=false', '-c', 'core.hooksPath=/dev/null', ...args])
+      writeFileSync(join(repo, 'package.json'), '{}\n')
+      writeFileSync(join(repo, 'package-lock.json'), JSON.stringify(head))
+      git('init', '-q')
+      git('add', '-A')
+      git('commit', '-q', '-m', 'base')
+      const bulkPath = join(repo, 'bulk-lock.json')
+      writeFileSync(bulkPath, JSON.stringify(bulk))
+      const run = (...args) => execFileSync(process.execPath, [CLI, ...args], { cwd: repo, encoding: 'utf8' })
+      expect(run('lockstep-members', bulkPath)).toBe('react\nreact-dom\n')
+      writeFileSync(join(repo, 'package-lock.json'), JSON.stringify(bulk))
+      expect(run('lockstep', bulkPath)).toBe('')
+      writeFileSync(join(repo, 'package-lock.json'), JSON.stringify(tree({ react: '1.1.0', dom: '1.0.0' })))
+      let status = 0
+      let stdout = ''
+      try {
+        run('lockstep', bulkPath)
+      } catch (err) {
+        status = err.status
+        stdout = err.stdout
+      }
+      expect(status).toBe(1)
+      expect(stdout).toContain('released in lockstep')
+    } finally {
+      rmSync(repo, { recursive: true, force: true })
+    }
   })
 })

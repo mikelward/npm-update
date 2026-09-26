@@ -223,6 +223,26 @@ has stopped biting.
   does not. The test runs the real step end to end against a fake npm that
   is lockfile-driven the same way, because the failure it guards is the
   loop finishing green with a package missing.
+- **Packages released in lockstep move together or not at all.** A pair is
+  two package names where every copy of one resolves its peer, the other, at
+  its own version, at HEAD and after the bulk, and the bulk moved them
+  (`lockstepPairs`). Names and npm's own peer resolution, never copies
+  matched across lockfiles: copy matching lost pairs to every hoist or
+  dedupe, one level further out each review round (maintainer's call,
+  2026-09-26). The cost is that a pair is one group across workspaces. No metadata says
+  "these must match" — react-dom 19.2.8's `^19.2.8` admits react 19.3.0 — so
+  the fact comes from the bulk resolve, and all three conditions are what
+  keep @babel/* (sharing core's version by coincidence) and @types/react
+  (moving alone) out of it. The 2026-09-26 batch took react alone, held
+  react-dom for its scheduler's 0.x step, passed every check here, and
+  failed 8 of gedmap's 21 test files. So pair members never go through the
+  loop alone, every accepted state is refused if it splits a pair, and the
+  group re-apply falls back to one peer-linked set at a time when the whole
+  group fails — one pair crossing a boundary must not take a clean pair
+  (vitest, carrying an advisory fix) down with it. Like the rest of this
+  pass it shapes the batch in the untrusted job; `publish` does not re-run
+  it, since it needs the bulk lockfile only that job holds, and a split is
+  a broken batch the consumer's own tests catch, not a trust failure.
 - **A week where everything is blocked fails loudly.** Silence would be
   indistinguishable from "nothing to update", which is the failure this
   whole pass exists to end.
