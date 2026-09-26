@@ -1643,6 +1643,8 @@ export function droppedByRebuild({
     direct.push({
       consumer: consumer || ".",
       name,
+      // Where the bulk put it, for the peer links the grouping below reads.
+      bulkPath: rBulk.pathByKey.get(key),
       version: chosen,
       range: declaredRangeIn(bulk[consumer], name, section) ?? chosen,
       // The manifest section that declares it, so the workflow can write the
@@ -1656,6 +1658,51 @@ export function droppedByRebuild({
   const byConsumerThenName = (x, y) =>
     x.consumer.localeCompare(y.consumer) || x.name.localeCompare(y.name);
   direct.sort(byConsumerThenName);
+
+  // The members fall into GROUPS: names joined, directly or through each
+  // other, by a peer dependency one of their bulk copies declares on
+  // another. A group is what has to move together, so it is the unit the
+  // workflow falls back to when re-applying every member at once fails:
+  // react and react-dom crossing a boundary under their scheduler must not
+  // take vitest and its coverage plugin down with them. A member with no
+  // peer among the others is a group of its own. Numbered from 1 in the
+  // order above, so the output is stable for a given input.
+  // Keyed by name, like the pairs themselves: a pair declared in one
+  // workspace and resolved from the root's declaration is still one pair,
+  // and keying by consumer split it into two groups the fallback then
+  // re-applies apart (Codex). The cost, stated in lockstepPairs, is that
+  // two workspaces' copies of a pair share a group.
+  const parent = new Map(direct.map(({ name }) => [name, name]));
+  const find = (name) => {
+    while (parent.get(name) !== name) name = parent.get(name);
+    return name;
+  };
+  for (const { name, bulkPath } of direct) {
+    const peers = bulkPath ? bulk[bulkPath]?.peerDependencies : null;
+    if (peers === null || typeof peers !== "object") continue;
+    for (const peer of Object.keys(peers)) {
+      if (parent.has(peer)) parent.set(find(peer), find(name));
+    }
+  }
+  // And every lockstep pair, whichever copies it was found through: a pair
+  // detected in nested copies while the declared ones carry no peer field
+  // is skipped by the loop as a pair, so it has to be one group here too,
+  // or the fallback re-applies its halves apart and the lockstep check
+  // rejects both (Codex). A transitive name in a pair joins too, as a link
+  // only: direct a and c paired through an undeclared b are one chain, and
+  // re-applying them apart fails both (Codex).
+  for (const { names: [name, peer] } of lockstepPairs({ lockBefore, lockBulk })) {
+    if (!parent.has(name)) parent.set(name, name);
+    if (!parent.has(peer)) parent.set(peer, peer);
+    parent.set(find(peer), find(name));
+  }
+  const groupOf = new Map();
+  for (const entry of direct) {
+    const root = find(entry.name);
+    if (!groupOf.has(root)) groupOf.set(root, groupOf.size + 1);
+    entry.group = groupOf.get(root);
+    delete entry.bulkPath;
+  }
 
   // Copies counted per version — a MULTISET, since two copies at one version
   // are two copies, and the bulk moving one of them is a move (Codex). Paths
@@ -1848,6 +1895,243 @@ export function unresolved(lockfile, paths) {
     ...lockfile,
     packages: Object.fromEntries(Object.entries(packages).filter(([path]) => !gone(path))),
   };
+}
+
+/**
+ * Packages released in LOCKSTEP: two package NAMES where one declares a peer
+ * dependency on the other, every copy of the first sits at the version of
+ * the copy of the second it resolves, both at HEAD and after the bulk
+ * resolve, and the bulk moved them. react and react-dom are the case that
+ * bit: React refuses to render when the two differ, yet react-dom 19.2.8's
+ * peer range `^19.2.8` admits react 19.3.0, so the rebuild took react alone,
+ * every range check passed, and 8 of gedmap's 21 test files failed. vitest
+ * and @vitest/coverage-v8 are the same shape with an exact peer pin.
+ *
+ * Nothing in the metadata says "these must match exactly" — a peer range is
+ * a floor, not an equality — so this reads the fact from the bulk resolve
+ * instead: a publisher that moved both to one version in the same week is
+ * one this batch must not split. Requiring all three conditions is what
+ * keeps it narrow. Two packages that merely happen to share a version at
+ * HEAD (most of @babel/* sits at @babel/core's) are not a pair unless the
+ * bulk also took both to one new version together; and a peer the bulk
+ * moved alone (@types/react ahead of @types/react-dom) is ordinary.
+ *
+ * NAMES, not copies, on purpose. Two rounds of review found copy-level
+ * matching missing pairs whenever npm hoisted or deduped something between
+ * the lockfiles — a member, then the dependent anchoring it — and each fix
+ * moved the same gap one level out (Codex). Each lockfile is read on its
+ * own, so nothing is matched across them and relocation cannot matter. The
+ * price is coarseness: a pair is one pair across every workspace, so when
+ * one workspace's copies cannot move, another's are held with them — the
+ * holding-back direction, never a split.
+ */
+export function lockstepPairs({ lockBefore, lockBulk }) {
+  if (![lockBefore, lockBulk].every(isWalkableLock)) return [];
+  const before = peerVersions(lockBefore.packages);
+  const bulk = peerVersions(lockBulk.packages);
+  const pairs = [];
+  const seen = new Map();
+  // Directions first, pairs second. A direction counts when every copy
+  // declaring it resolves its peer at its own version in both trees; the
+  // PAIR moved when any of its directions did. Every lockstep direction is
+  // kept on the pair, moved or not: with mutual peers, the reverse direction
+  // can hold the same versions while the forward one moves, and it is still
+  // the only view of the copies it covers (Codex, twice).
+  for (const [key, then] of before) {
+    const now = bulk.get(key);
+    if (!then.lockstep || !now?.lockstep) continue;
+    const was = [...then.versions].sort();
+    const to = [...now.versions].sort();
+    // A multiset, compared whole: two workspaces at 1.0 and one at 1.1
+    // taken to one at 1.0 and two at 1.1 is a move, though the distinct
+    // versions read {1.0, 1.1} on both sides (Codex).
+    const moved = was.join("\0") !== to.join("\0");
+    const [name, peer] = key.split("\0");
+    const unordered = [name, peer].sort().join("\0");
+    const pair = seen.get(unordered) ?? { names: [name, peer], directions: [], moved: false, was: [], to: [] };
+    seen.set(unordered, pair);
+    pair.directions.push([name, peer]);
+    if (moved) {
+      pair.moved = true;
+      pair.was.push(...was);
+      pair.to.push(...to);
+    }
+  }
+  for (const pair of seen.values()) {
+    if (!pair.moved) continue;
+    pairs.push({
+      names: pair.names,
+      directions: pair.directions,
+      was: [...new Set(pair.was)].sort().join(", "),
+      to: [...new Set(pair.to)].sort().join(", "),
+    });
+  }
+  return pairs;
+}
+
+// The name npm installed a copy under, which is the name it resolves by.
+const nameOf = (path) => path.slice(path.lastIndexOf("node_modules/") + "node_modules/".length);
+
+// For each (name, peer) where some copy of `name` declares `peer` as a peer
+// dependency: the versions those copies are at, and whether every one of
+// them resolves its peer at its own version. Per copy, not one version for
+// the name: two workspaces can carry the same pair on different release
+// lines, each copy matched with its own peer (Codex). A copy whose peer is
+// not installed says nothing either way.
+const peerVersions = (packages) => {
+  const out = new Map();
+  for (const [path, entry] of Object.entries(packages)) {
+    if (!RESOLVED_COPY.test(path) || !entry?.version) continue;
+    const peers = entry.peerDependencies;
+    if (peers === null || typeof peers !== "object") continue;
+    const name = nameOf(path);
+    for (const peer of Object.keys(peers)) {
+      const partner = resolveEdgeInstance(packages, path, peer);
+      if (!partner) continue;
+      const key = `${name}\0${peer}`;
+      const found = out.get(key) ?? { versions: [], lockstep: true };
+      found.versions.push(entry.version);
+      if (partner.version !== entry.version) found.lockstep = false;
+      out.set(key, found);
+    }
+  }
+  return out;
+};
+
+/**
+ * Every lockstep pair the tree on disk splits: some copy of one member
+ * resolving the other at a different version. Empty on an unwalkable
+ * lockfile, which the validator refuses regardless.
+ */
+export function lockstepSplits({ lockBefore, lockBulk, lockAfter }) {
+  if (!isWalkableLock(lockAfter)) return [];
+  const packages = lockAfter.packages;
+  const out = [];
+  for (const { directions, was, to } of lockstepPairs({ lockBefore, lockBulk })) {
+    // Every copy of the member that declared the peer at HEAD and in the
+    // bulk, asked what it resolves the other to, the way npm resolves it
+    // from that copy's place in the tree. Not only copies that still carry
+    // the declaration: an in-range release between HEAD's and the bulk's can
+    // drop the peer field, and requiring it would wave that split through
+    // (Codex). Never the peer's own copies: an unrelated nested copy of the
+    // peer declares nothing (Codex). And only mismatches the tree did not
+    // already have at HEAD or in the bulk: an old copy under some other
+    // package that resolves the pair's peer is there before and after this
+    // batch, and would otherwise reject every step of the rebuild -- the
+    // bulk's own tree included. One line per pair: the first split found
+    // is the whole verdict.
+    for (const [one, other] of directions) {
+      // An old mismatch is exempt only at the lockfile path it already had,
+      // in HEAD's tree or the bulk's. Counting mismatches by version pair let
+      // a new split hide behind an old copy with the same pair -- first when
+      // the old copy stayed, then when the same rebuild pruned it (Codex,
+      // twice). Matching the path errs the safe way: an old copy npm moved
+      // reads as a split, which holds the pair back rather than shipping one.
+      //
+      // Every copy of the member by NAME, whether or not it still declares
+      // the peer and wherever npm put it. Selecting "participating" copies
+      // by declaration or by path lost a split each way: an in-between
+      // release drops the peer field, and a rebuild can drop it AND move the
+      // copy to a path neither tree had (Codex, three rounds). Reading every
+      // copy can only over-report: an unrelated copy of the name that a
+      // rebuild step moves to a mismatch neither tree had holds that step
+      // back. That is the direction this pass errs in, never a shipped split.
+      const mismatches = (tree) =>
+        Object.entries(tree).flatMap(([path, entry]) => {
+          if (!RESOLVED_COPY.test(path) || !entry?.version || nameOf(path) !== one) return [];
+          // A partner npm no longer installs is a split too: an in-between
+          // release that drops the peer field lets npm prune the other
+          // member, and the member then ships alone (Codex). A copy that
+          // already had no partner at HEAD or in the bulk stays exempt below.
+          const partner = resolveEdgeInstance(tree, path, other);
+          const partnerVersion = partner ? partner.version : "not installed";
+          return partnerVersion !== entry.version ? [[path, entry.version, partnerVersion]] : [];
+        });
+      const already = new Set(
+        [...mismatches(lockBefore.packages), ...mismatches(lockBulk.packages)].map((m) => m.join("\0")),
+      );
+      const split = mismatches(packages)
+        .find((m) => !already.has(m.join("\0")))
+        ?.slice(1);
+      if (!split) continue;
+      const [version, partnerVersion] = split;
+      out.push(
+        `${one} ${version} and ${other} ${partnerVersion} are released in lockstep — the bulk resolve moved both from ${was} to ${to} together — and this tree splits them. Every range check can pass on a split like this and the pair still refuse to run together (React does, for react and react-dom), so they move together or not at all.`,
+      );
+      break;
+    }
+  }
+  return out;
+}
+
+/**
+ * The lockfile records of the lockstep partners `names` resolve in the tree
+ * on disk: for each pair with one side in `names`, the other side's records
+ * as the declaring copies resolve them -- the partner a named member's copy
+ * resolves, or the declaring copies that resolve a named peer. The group re-apply
+ * removes these along with the members' own records. A partner npm only
+ * auto-installs as a peer is declared nowhere, so `dropped` never names it;
+ * left in place, a partner still inside the moved member's peer range stays
+ * at HEAD, the lockstep check refuses the split, and a pair that could move
+ * is held back (Codex). A copy of the member whose partner resolves to one
+ * of `names` itself is left to that name's own record.
+ */
+export function lockstepPartnerRecords({ lockBefore, lockBulk, lockAfter, names }) {
+  if (!isWalkableLock(lockAfter)) return [];
+  const packages = lockAfter.packages;
+  const named = new Set(names);
+  const pairs = lockstepPairs({ lockBefore, lockBulk });
+  // Every name linked to a named one through pairs, so a chain a-b-c with
+  // only `a` named clears c's records as well as b's; stopping at b left c
+  // at HEAD and split b from c (Codex).
+  const linked = new Set(named);
+  for (let grew = true; grew; ) {
+    grew = false;
+    for (const { names: [x, y] } of pairs) {
+      if (linked.has(x) !== linked.has(y)) {
+        linked.add(x);
+        linked.add(y);
+        grew = true;
+      }
+    }
+  }
+  const out = new Set();
+  for (const { directions } of pairs) {
+    for (const [one, other] of directions) {
+      if (!linked.has(one) || !linked.has(other) || (named.has(one) && named.has(other))) continue;
+      // Either side may be the one the group names, and in a chain neither
+      // need be. Through each declaring copy: the partner it resolves when
+      // that side is not named, and the copy itself when its own name is
+      // not, since a transitive react-dom kept at HEAD splits a direct react
+      // just as surely (Codex).
+      for (const path of Object.keys(packages)) {
+        if (!RESOLVED_COPY.test(path) || nameOf(path) !== one) continue;
+        // Only a copy that declares the peer: an unrelated copy of the name
+        // resolves the same name for its own reasons, and removing THAT
+        // record could re-place a subtree held back for a crossing (Codex).
+        // Unlike the split check, erring narrow here costs a hold-back at
+        // most, since the lockstep check still reads every copy.
+        const peers = packages[path]?.peerDependencies;
+        if (peers === null || typeof peers !== "object" || !Object.hasOwn(peers, other)) continue;
+        const partner = resolveEdgeInstance(packages, path, other);
+        if (!partner) continue;
+        if (!named.has(other)) out.add(partner.path);
+        if (!named.has(one)) out.add(path);
+      }
+    }
+  }
+  return [...out].sort();
+}
+
+/**
+ * The names in any lockstep pair, one each: what the rebuild's
+ * one-package-at-a-time loop leaves to the group re-apply rather than trying
+ * alone, where the best case is a split and the worst is npm refusing the
+ * peer conflict and the pair being held back for a reason that is not its
+ * own.
+ */
+export function lockstepMembers({ lockBefore, lockBulk }) {
+  return [...new Set(lockstepPairs({ lockBefore, lockBulk }).flatMap(({ names }) => names))].sort();
 }
 
 export function updateSummary({ manifestBefore, manifestAfter, lockBefore, lockAfter, workspaces = {} }) {
@@ -2054,10 +2338,10 @@ function main() {
   // in the PR body in its place. The same applies to `names`, whose caller
   // would otherwise read "Dependency diff validated" as its list of packages
   // and hold back every one of them.
-  const MODES = ["summary", "candidates", "manifests", "dropped", "unresolve"];
+  const MODES = ["summary", "candidates", "manifests", "dropped", "unresolve", "lockstep", "lockstep-members", "lockstep-partners"];
   if (mode !== undefined && !MODES.includes(mode)) {
     console.error(
-      `Unknown mode "${mode}". Run with no arguments to validate, "summary" for the PR-body section, "candidates" for the names the hold-back pass re-resolves, "manifests" for the manifest paths the batch can rewrite, "dropped <bulk-lockfile> [held-back-name...]" for what the rebuild left behind, or "unresolve <record-path...>" to remove those records from package-lock.json so the next install places them afresh.`,
+      `Unknown mode "${mode}". Run with no arguments to validate, "summary" for the PR-body section, "candidates" for the names the hold-back pass re-resolves, "manifests" for the manifest paths the batch can rewrite, "dropped <bulk-lockfile> [held-back-name...]" for what the rebuild left behind, "unresolve <record-path...>" to remove those records from package-lock.json so the next install places them afresh, "lockstep <bulk-lockfile>" to refuse a tree that splits a lockstep pair, "lockstep-members <bulk-lockfile>" for the names in those pairs, or "lockstep-partners <bulk-lockfile> <name...>" for the lockfile records of those names' lockstep partners.`,
     );
     process.exit(2);
   }
@@ -2092,7 +2376,9 @@ function main() {
   // is a group member whose range goes back into `<section>` of the
   // consumer's manifest (`.` for the root, else a workspace path; the
   // version is for the report) and whose lockfile record `<path>` (`-` when
-  // the consumer resolves none) goes before the resolve; `transitive <name>` is a
+  // the consumer resolves none) goes before the resolve, and `<group>`
+  // numbers the peer-linked set it belongs to (see droppedByRebuild);
+  // `transitive <name>` is a
   // dropped move nothing can ask for by name; `moved <name>` is a held-back
   // name the accepted group carried along after all, whose hold-back line
   // has to go. The names after the lockfile path are the ones the loop
@@ -2111,12 +2397,45 @@ function main() {
     });
     const lines = [
       ...direct.map(
-        ({ consumer, name, version, range, section, path }) =>
-          `direct\t${consumer}\t${name}\t${version}\t${range}\t${section}\t${path ?? "-"}`,
+        ({ consumer, name, version, range, section, path, group }) =>
+          `direct\t${consumer}\t${name}\t${version}\t${range}\t${section}\t${path ?? "-"}\t${group}`,
       ),
       ...transitive.map((name) => `transitive\t${name}`),
       ...moved.map((name) => `moved\t${name}`),
     ];
+    process.stdout.write(lines.length ? lines.join("\n") + "\n" : "");
+    return;
+  }
+
+  // The lockstep modes both read the bulk lockfile the workflow kept aside.
+  // `lockstep` fails (exit 1) on a tree that splits a pair, one line per
+  // split on stdout; `lockstep-members` prints the pairs' names, one per
+  // line, for the loop to leave to the group re-apply.
+  if (mode === "lockstep" || mode === "lockstep-members") {
+    const bulkPath = process.argv[3];
+    if (!bulkPath) {
+      console.error(`The "${mode}" mode needs the bulk resolve's lockfile path.`);
+      process.exit(2);
+    }
+    const lockBulk = JSON.parse(readFileSync(bulkPath, "utf8"));
+    const inputs = { ...gatherInputs(), lockBulk };
+    const lines = mode === "lockstep" ? lockstepSplits(inputs) : lockstepMembers(inputs);
+    process.stdout.write(lines.length ? lines.join("\n") + "\n" : "");
+    if (mode === "lockstep" && lines.length) process.exit(1);
+    return;
+  }
+
+  // The records of the named members' lockstep partners in the tree on
+  // disk, one per line, for the group re-apply to remove with the members'
+  // own (see `lockstepPartnerRecords`). No names prints nothing.
+  if (mode === "lockstep-partners") {
+    const bulkPath = process.argv[3];
+    if (!bulkPath) {
+      console.error('The "lockstep-partners" mode needs the bulk resolve\'s lockfile path.');
+      process.exit(2);
+    }
+    const lockBulk = JSON.parse(readFileSync(bulkPath, "utf8"));
+    const lines = lockstepPartnerRecords({ ...gatherInputs(), lockBulk, names: process.argv.slice(4) });
     process.stdout.write(lines.length ? lines.join("\n") + "\n" : "");
     return;
   }

@@ -2520,9 +2520,9 @@ describe("holding back only what a breaking transitive blocks", () => {
     // move the bulk made legitimately (Codex). One resolve rather than one
     // per manifest: a peer-pinned pair split across two manifests would
     // fail the first on the conflict the second removes (Codex).
-    expect(run).toContain('declare_range=(npm pkg set "${section_of[$key]}[$name]=${range_of[$key]}")');
+    expect(run).toContain('declare_range=(npm pkg set "${section_of[$key]}[${name_of[$key]}]=${range_of[$key]}")');
     expect(run).toContain(
-      'declare_range=(npm pkg set --workspace "$consumer" "${section_of[$key]}[$name]=${range_of[$key]}")',
+      'declare_range=(npm pkg set --workspace "${consumer_of[$key]}" "${section_of[$key]}[${name_of[$key]}]=${range_of[$key]}")',
     );
     // Between the range writes and the resolve, each member's own lockfile
     // record goes: a `~` the bulk left alone makes the range write a
@@ -2755,13 +2755,13 @@ describe("holding back only what a breaking transitive blocks", () => {
       // the bulk left alone.
       expect(r.ranges).toEqual({ a: "^1.0.5", b: "~1.0.0", r: "^1.0.0" });
       // Every candidate tried alone first -- declared names, then the
-      // transitives the bulk moved -- then each member's declared range
+      // transitives the bulk moved -- except the pair, which the bulk moved
+      // in lockstep and so goes straight to the group; then each member's
+      // declared range
       // written into its manifest (b's a no-op), then ONE resolve for the
       // whole group. The records went in between, through the checker: the
       // fake install moves the pair only because they did.
       expect(r.calls).toEqual([
-        "npm update --save --ignore-scripts -- a",
-        "npm update --save --ignore-scripts -- b",
         "npm update --save --ignore-scripts -- r",
         "npm update --save --ignore-scripts -- c",
         "npm update --save --ignore-scripts -- x",
@@ -2831,6 +2831,209 @@ describe("holding back only what a breaking transitive blocks", () => {
       // trusted copy of holdback.md is written, as in the rollback case).
       expect(r.status).toBeGreaterThan(0);
       expect(r.stdout).toContain("Nothing survived the rebuild");
+    } finally {
+      r.cleanup();
+    }
+  });
+
+  // Lockstep pairs, end to end: the real step and checker, a fake npm. The
+  // 2026-09-26 batch took react alone and held react-dom back for its
+  // scheduler's 0.x step, which passed every range check and failed 8 of
+  // gedmap's 21 test files. Here react/react-dom and a vitest-like pair
+  // (vitest, cov) both moved in lockstep in the bulk; `u` moves cleanly on
+  // its own and `r` drags `x` across a 0.x step so the batch rebuilds.
+  // `domCrosses` is the week react-dom's new release needs the next 0.x
+  // scheduler: then the react pair has to stay together at HEAD, and the
+  // vitest pair must still ship.
+  function runLockstepPass({ domCrosses, reactDeclared = true }) {
+    const scratch = mkdtempSync(join(tmpdir(), "npm-update-lockstep-"));
+    const repo = join(scratch, "repo");
+    const bin = join(scratch, "bin");
+    mkdirSync(repo);
+    mkdirSync(bin);
+    const HEAD = { react: "1.0.0", "react-dom": "1.0.0", sched: "0.1.0", vitest: "1.0.0", cov: "1.0.0", r: "1.0.0", x: "0.1.0", u: "1.0.0" };
+    const BULK = { react: "1.1.0", "react-dom": "1.1.0", sched: domCrosses ? "0.2.0" : "0.1.0", vitest: "1.1.0", cov: "1.1.0", r: "1.0.0", x: "0.2.0", u: "1.0.1" };
+    // Without reactDeclared, react is only react-dom's peer: npm installs
+    // it, but no manifest names it, so `dropped` never lists it.
+    const declared = ["react", "react-dom", "vitest", "cov", "r", "u"].filter((n) => reactDeclared || n !== "react");
+    const rangesAt = (v) => Object.fromEntries(declared.map((n) => [n, n === "r" ? "^1.0.0" : `^${v[n]}`]));
+    // The tree as npm would write it, from a version per name and the
+    // manifest's ranges; a name with no version has no record.
+    writeFileSync(
+      join(scratch, "tree.mjs"),
+      [
+        `const crosses = ${JSON.stringify(domCrosses)};`,
+        "export const lock = (v, deps) => {",
+        '  const packages = { "": { name: "app", version: "1.0.0", dependencies: deps } };',
+        "  const put = (name, extra = {}) => {",
+        '    if (v[name]) packages[`node_modules/${name}`] = { version: v[name], resolved: `https://registry.example.com/${name}-${v[name]}.tgz`, ...extra };',
+        "  };",
+        '  put("react");',
+        '  put("react-dom", { dependencies: { sched: crosses && v["react-dom"] === "1.1.0" ? "^0.2.0" : "^0.1.0" }, peerDependencies: { react: `^${v["react-dom"]}` } });',
+        '  put("sched");',
+        '  put("vitest", { peerDependencies: { cov: v.vitest } });',
+        '  put("cov", { peerDependencies: { vitest: v.cov } });',
+        '  put("r", { dependencies: { x: "^0.1.0 || ^0.2.0" } });',
+        '  put("x");',
+        '  put("u");',
+        '  return JSON.stringify({ name: "app", version: "1.0.0", lockfileVersion: 3, requires: true, packages }, null, 2) + "\\n";',
+        "};",
+        'export const manifest = (deps) => JSON.stringify({ name: "app", version: "1.0.0", dependencies: deps }, null, 2) + "\\n";',
+        "",
+      ].join("\n"),
+    );
+    // npm, as far as this step exercises it. `update` moves r's x and u
+    // alone, refuses react-dom alone on the peer conflict (npm's ERESOLVE),
+    // and moves nothing else; `install` places a pair afresh when both of
+    // its records are gone, exactly as the other end-to-end test's does.
+    writeFileSync(
+      join(scratch, "npm.mjs"),
+      [
+        'import { readFileSync, writeFileSync } from "node:fs";',
+        'import { lock, manifest } from "./tree.mjs";',
+        `const crosses = ${JSON.stringify(domCrosses)};`,
+        'const m = JSON.parse(readFileSync("package.json", "utf8"));',
+        'const { packages } = JSON.parse(readFileSync("package-lock.json", "utf8"));',
+        "const v = Object.fromEntries(Object.entries(packages).filter(([p]) => p).map(([p, e]) => [p.slice(\"node_modules/\".length), e.version]));",
+        "const args = process.argv.slice(2);",
+        'if (args[0] === "update") {',
+        "  const name = args[args.length - 1];",
+        '  if (name === "react-dom") { console.error("npm error code ERESOLVE"); process.exit(1); }',
+        '  if (name === "r") v.x = "0.2.0";',
+        '  else if (name === "u") { v.u = "1.0.1"; m.dependencies.u = "^1.0.1"; }',
+        '  else if (name === "react") { v.react = "1.1.0"; m.dependencies.react = "^1.1.0"; }',
+        "  else process.exit(0);",
+        '} else if (args[0] === "pkg") {',
+        "  const [, section, name, range] = args[2].match(/^([^[]+)\\[([^\\]]+)\\]=(.*)$/);",
+        "  m[section][name] = range;",
+        '  writeFileSync("package.json", manifest(m.dependencies));',
+        "  process.exit(0);",
+        '} else if (args[0] === "install") {',
+        // react-dom placed afresh takes the newest its range admits; a react
+        // whose record is still there stays at HEAD, as npm keeps a peer the
+        // new react-dom's range still admits.
+        '  if (!v["react-dom"]) { v["react-dom"] = "1.1.0"; v.sched = crosses ? "0.2.0" : "0.1.0"; }',
+        '  if (!v.react) v.react = "1.1.0";',
+        '  if (!v.vitest && !v.cov) { v.vitest = "1.1.0"; v.cov = "1.1.0"; }',
+        "} else { console.error(`fake npm: unexpected invocation: npm ${args.join(\" \")}`); process.exit(1); }",
+        'writeFileSync("package.json", manifest(m.dependencies));',
+        'writeFileSync("package-lock.json", lock(v, m.dependencies));',
+        "",
+      ].join("\n"),
+    );
+    writeFileSync(
+      join(bin, "npm"),
+      ["#!/bin/bash", 'echo "npm $*" >> "$WORK/npm-calls.log"', 'exec node "$WORK/npm.mjs" "$@"', ""].join("\n"),
+      { mode: 0o755 },
+    );
+    const git = (...args) =>
+      execFileSync("git", [
+        "-C", repo,
+        "-c", "user.name=t", "-c", "user.email=t@example.com",
+        "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null",
+        ...args,
+      ]);
+    const treeModule = join(scratch, "tree.mjs");
+    const render = (v, ranges) =>
+      execFileSync(
+        process.execPath,
+        ["--input-type=module", "-e", `import { lock, manifest } from ${JSON.stringify(treeModule)}; process.stdout.write(JSON.stringify([lock(${JSON.stringify(v)}, ${JSON.stringify(ranges)}), manifest(${JSON.stringify(ranges)})]))`],
+        { encoding: "utf8" },
+      );
+    const [headLock, headManifest] = JSON.parse(render(HEAD, rangesAt(HEAD)));
+    const [bulkLock, bulkManifest] = JSON.parse(render(BULK, rangesAt(BULK)));
+    git("init", "-q");
+    writeFileSync(join(repo, "package.json"), headManifest);
+    writeFileSync(join(repo, "package-lock.json"), headLock);
+    git("add", "-A");
+    git("commit", "-q", "-m", "base");
+    writeFileSync(join(repo, "package.json"), bulkManifest);
+    writeFileSync(join(repo, "package-lock.json"), bulkLock);
+    const out = join(scratch, "out.txt");
+    writeFileSync(out, "");
+    writeFileSync(join(scratch, "summary.txt"), "");
+    let status = 0;
+    let stdout = "";
+    try {
+      stdout = execFileSync("bash", ["-c", step.run], {
+        cwd: repo,
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+        env: {
+          ...process.env,
+          PATH: `${bin}:${process.env.PATH}`,
+          WORK: scratch,
+          CHECKER: fileURLToPath(new URL("./check-npm-update.mjs", import.meta.url)),
+          GITHUB_OUTPUT: out,
+          GITHUB_STEP_SUMMARY: join(scratch, "summary.txt"),
+          RUNNER_TEMP: scratch,
+        },
+      });
+    } catch (err) {
+      status = err.status;
+      stdout = `${err.stdout ?? ""}${err.stderr ?? ""}`;
+    }
+    const packages = JSON.parse(readFileSync(join(repo, "package-lock.json"), "utf8")).packages;
+    return {
+      status,
+      stdout,
+      versions: Object.fromEntries(
+        Object.entries(packages).filter(([p]) => p).map(([p, e]) => [p.slice("node_modules/".length), e.version]),
+      ),
+      holdback: readFileSync(join(repo, "holdback.md"), "utf8"),
+      calls: readFileSync(join(scratch, "npm-calls.log"), "utf8").trim().split("\n"),
+      cleanup: () => rmSync(scratch, { recursive: true, force: true }),
+    };
+  }
+
+  it("moves a lockstep pair together through the group, never one member alone", () => {
+    const r = runLockstepPass({ domCrosses: false });
+    try {
+      expect(r.status).toBe(0);
+      // Both pairs at the bulk's versions, u on its own, r held for x.
+      expect(r.versions).toEqual({ react: "1.1.0", "react-dom": "1.1.0", sched: "0.1.0", vitest: "1.1.0", cov: "1.1.0", r: "1.0.0", x: "0.1.0", u: "1.0.1" });
+      // No pair member was ever asked for alone: that is where react
+      // shipped without react-dom, and where npm refuses react-dom alone
+      // on the peer conflict and holds it back for a reason not its own.
+      for (const name of ["react", "react-dom", "vitest", "cov"]) {
+        expect(r.calls).not.toContain(`npm update --save --ignore-scripts -- ${name}`);
+      }
+      expect(r.calls.filter((c) => c === "npm install --ignore-scripts")).toHaveLength(1);
+      expect(r.holdback).toMatch(/^- `r`:/m);
+      expect(r.holdback).not.toMatch(/^- `(react|react-dom|vitest|cov|u)`:/m);
+    } finally {
+      r.cleanup();
+    }
+  });
+
+  it("moves a lockstep partner npm only installs as a peer along with its declared member", () => {
+    // react declared nowhere: only react-dom's record would be removed, npm
+    // would keep react at HEAD inside react-dom's peer range, and the
+    // lockstep check would hold back a pair that could move (Codex).
+    const r = runLockstepPass({ domCrosses: false, reactDeclared: false });
+    try {
+      expect(r.status).toBe(0);
+      expect(r.versions).toEqual({ react: "1.1.0", "react-dom": "1.1.0", sched: "0.1.0", vitest: "1.1.0", cov: "1.1.0", r: "1.0.0", x: "0.1.0", u: "1.0.1" });
+      expect(r.calls.filter((c) => c === "npm install --ignore-scripts")).toHaveLength(1);
+      expect(r.holdback).not.toMatch(/react/);
+    } finally {
+      r.cleanup();
+    }
+  });
+
+  it("keeps a pair together at HEAD when it cannot move, and still ships an unrelated pair", () => {
+    const r = runLockstepPass({ domCrosses: true });
+    try {
+      expect(r.status).toBe(0);
+      // The react pair together at HEAD, not split; the vitest pair shipped
+      // even though the all-at-once group failed on react-dom's scheduler.
+      expect(r.versions).toEqual({ react: "1.0.0", "react-dom": "1.0.0", sched: "0.1.0", vitest: "1.1.0", cov: "1.1.0", r: "1.0.0", x: "0.1.0", u: "1.0.1" });
+      // Everything at once first, then each peer-linked set on its own.
+      expect(r.calls.filter((c) => c === "npm install --ignore-scripts")).toHaveLength(3);
+      for (const name of ["react", "react-dom"]) {
+        expect(r.holdback).toMatch(new RegExp(`^- \`${name}\`: moved to 1\\.1\\.0 \\(\`\\^1\\.1\\.0\`\\) in the bulk resolve only together with the rest of this group, and re-applying the group failed: .*0\\.1\\.0 -> 0\\.2\\.0`, "m"));
+      }
+      expect(r.holdback).not.toMatch(/^- `(vitest|cov|u)`:/m);
     } finally {
       r.cleanup();
     }

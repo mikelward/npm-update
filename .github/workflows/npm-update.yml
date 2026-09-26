@@ -413,7 +413,10 @@ jobs:
       # ranges written into their manifests, then a single resolve —
       # validated the same way, and rolled back and NAMED if that fails. A
       # dropped transitive, which nothing can ask for by version, is named
-      # as such.
+      # as such. Packages the bulk moved in LOCKSTEP (react and react-dom)
+      # skip the loop and go straight to that group, and no accepted state
+      # may split them; when the whole group fails, each peer-linked set is
+      # re-applied on its own.
       #
       # This still executes no dependency code — every resolve below carries
       # `--ignore-scripts`, exactly like the bulk one above — so it stays
@@ -474,7 +477,25 @@ jobs:
             # The names the loop rejects, so the group re-apply below neither
             # retries them nor reports them twice.
             held=()
+            # Packages released in LOCKSTEP (react and react-dom, vitest and
+            # its coverage plugin: a peer of each other, one version at HEAD,
+            # moved to one new version together by the bulk) are never tried
+            # alone. The best that can come of it is a split: react taken,
+            # react-dom held, every range check green, and a consumer whose
+            # tests then fail with React refusing to render (gedmap and
+            # newshacker, 2026-09-26). The worst is npm refusing the peer
+            # conflict and the pair being held back for a reason that is not
+            # its own. They go to the group re-apply below, which moves each
+            # peer-linked set as one. Its own assignment, like `candidates`.
+            lockstep_names=$(node "$CHECKER" lockstep-members "$snapshot/bulk-lock.json")
+            declare -A lockstep=()
+            while IFS= read -r m; do
+              [ -n "$m" ] && lockstep[$m]=1
+            done <<< "$lockstep_names"
             for name in $candidates; do
+              if [ -n "${lockstep[$name]+x}" ]; then
+                continue
+              fi
               # A byte-exact copy to roll back to, so a rejected package
               # leaves no trace — restoring from a shell variable would drop
               # the trailing newline npm writes and register as a change of
@@ -498,6 +519,11 @@ jobs:
                 reason=$(printf '%s\n' "$attempt" | sed -n 's/^::error:://p' | head -n 1 || true)
                 reason=${reason:-$(printf '%s\n' "$attempt" | head -n 1 || true)}
                 reason=${reason:-the checker rejected the resulting diff}
+              elif ! attempt=$(node "$CHECKER" lockstep "$snapshot/bulk-lock.json" 2>&1); then
+                # Moving one package can drag a lockstep pair apart even
+                # when neither member is the name asked for.
+                reason=$(printf '%s\n' "$attempt" | grep -v '^$' | head -n 1 || true)
+                reason=${reason:-the lockstep check failed with no output}
               else
                 continue
               fi
@@ -519,25 +545,26 @@ jobs:
             #
             # Only an `npm install` of every member at an explicit version
             # moves such a group, so: ask the checker what the bulk moved
-            # that the rebuild did not, re-apply all of it at the bulk's
-            # versions — one resolve per manifest, since `npm install`
-            # writes the range into the manifest of the workspace it runs
-            # for, `.` being the root — and validate the result exactly as
-            # the loop validates each package. A group npm or the checker
-            # rejects is rolled back and named, never silently left behind.
+            # that the rebuild did not — the lockstep pairs the loop left to
+            # this step included — re-apply all of it at the bulk's versions
+            # in one resolve, and validate the result exactly as the loop
+            # validates each package. A group npm or the checker rejects is
+            # rolled back and named, never silently left behind.
             # Its own assignment, like `candidates` above: a command
             # substitution that fails inside a redirection yields an empty
             # list and the loop below silently re-applies nothing.
             dropped=$(node "$CHECKER" dropped "$snapshot/bulk-lock.json" ${held[@]+"${held[@]}"})
-            declare -A members=() range_of=() version_of=() section_of=() record_of=()
-            consumers=()
-            while IFS=$'\t' read -r kind consumer name version range section record; do
+            # Keyed `consumer/name`, in the checker's order; the parts are
+            # kept separately because a scoped name has a slash of its own.
+            declare -A consumer_of=() name_of=() range_of=() version_of=() section_of=() record_of=() group_of=()
+            keys=()
+            groups=()
+            while IFS=$'\t' read -r kind consumer name version range section record group; do
               [ "$kind" = direct ] || continue
-              if [ -z "${members[$consumer]+x}" ]; then
-                consumers+=("$consumer")
-                members[$consumer]=""
-              fi
-              members[$consumer]+="$name "
+              key="$consumer/$name"
+              keys+=("$key")
+              consumer_of[$key]=$consumer
+              name_of[$key]=$name
               # Re-applied by writing the bulk's declared RANGE into the
               # declaring manifest, never by installing name@<version>: a
               # bare version is saved under the ambient save-prefix, which
@@ -545,14 +572,29 @@ jobs:
               # one — an operator change the checker rejects and the bulk
               # resolve never made, so the whole group would roll back for
               # a move that was fine (Codex). The version is for the report.
-              range_of["$consumer/$name"]=$range
-              version_of["$consumer/$name"]=$version
-              section_of["$consumer/$name"]=$section
-              record_of["$consumer/$name"]=$record
+              range_of[$key]=$range
+              version_of[$key]=$version
+              section_of[$key]=$section
+              record_of[$key]=$record
+              # The peer-linked set it belongs to: what the fallback below
+              # re-applies on its own when the whole group cannot move.
+              group_of[$key]=$group
+              case " ${groups[*]-} " in
+                *" $group "*) ;;
+                *) groups+=("$group") ;;
+              esac
             done <<< "$dropped"
-            if [ "${#consumers[@]}" -gt 0 ]; then
-              tar -cf "$snapshot/manifests.tar" -- "${manifests[@]}"
+
+            # Re-apply the members named by key and validate the result as
+            # the loop validates each package, plus the lockstep check; on
+            # failure roll back and leave the reason in `rejected` (empty on
+            # success). A function because the fallback below runs it again
+            # per peer-linked set.
+            apply_group() {
+              local key attempt
+              local -a records=()
               rejected=""
+              tar -cf "$snapshot/manifests.tar" -- "${manifests[@]}"
               # Every range change lands in its manifest FIRST, then ONE
               # resolve covers them all. Installing per manifest would
               # resolve the root's members while a workspace still pinned
@@ -562,20 +604,17 @@ jobs:
               # `npm pkg set` writes through npm's own manifest writer,
               # keeping the file's formatting, and runs no dependency code;
               # bracket syntax, since a package name can contain a dot.
-              for consumer in "${consumers[@]}"; do
-                for name in ${members[$consumer]}; do
-                  key="$consumer/$name"
-                  if [ "$consumer" = . ]; then
-                    declare_range=(npm pkg set "${section_of[$key]}[$name]=${range_of[$key]}")
-                  else
-                    declare_range=(npm pkg set --workspace "$consumer" "${section_of[$key]}[$name]=${range_of[$key]}")
-                  fi
-                  if ! attempt=$("${declare_range[@]}" 2>&1); then
-                    rejected=$(printf '%s\n' "$attempt" | grep -v '^$' | tail -n 1 || true)
-                    rejected="npm could not write the range: ${rejected:-no output}"
-                    break 2
-                  fi
-                done
+              for key in "$@"; do
+                if [ "${consumer_of[$key]}" = . ]; then
+                  declare_range=(npm pkg set "${section_of[$key]}[${name_of[$key]}]=${range_of[$key]}")
+                else
+                  declare_range=(npm pkg set --workspace "${consumer_of[$key]}" "${section_of[$key]}[${name_of[$key]}]=${range_of[$key]}")
+                fi
+                if ! attempt=$("${declare_range[@]}" 2>&1); then
+                  rejected=$(printf '%s\n' "$attempt" | grep -v '^$' | tail -n 1 || true)
+                  rejected="npm could not write the range: ${rejected:-no output}"
+                  break
+                fi
               done
               # Then each member's own lockfile record goes, so the resolve
               # has to place it afresh. The range write alone is not enough:
@@ -593,13 +632,27 @@ jobs:
               # naming both members does not move them, and an explicit
               # `name@range` cannot name a workspace's member.
               if [ -z "$rejected" ]; then
-                records=()
-                for consumer in "${consumers[@]}"; do
-                  for name in ${members[$consumer]}; do
-                    [ "${record_of[$consumer/$name]}" = - ] || records+=("${record_of[$consumer/$name]}")
-                  done
+                local -a member_names=()
+                for key in "$@"; do
+                  member_names+=("${name_of[$key]}")
+                  if [ "${record_of[$key]}" != - ]; then
+                    records+=("${record_of[$key]}")
+                  fi
                 done
-                if [ "${#records[@]}" -gt 0 ] && ! attempt=$(node "$CHECKER" unresolve "${records[@]}" 2>&1); then
+                # And the records of the members' lockstep partners: one npm
+                # only auto-installs as a peer is declared nowhere, so it is
+                # never a member, and a partner still inside the moved
+                # member's peer range would stay at HEAD and fail the
+                # lockstep check on a pair that could move (Codex).
+                if ! attempt=$(node "$CHECKER" lockstep-partners "$snapshot/bulk-lock.json" "${member_names[@]}" 2>&1); then
+                  rejected=$(printf '%s\n' "$attempt" | grep -v '^$' | tail -n 1 || true)
+                  rejected="the checker could not list the lockstep partners: ${rejected:-no output}"
+                else
+                  while IFS= read -r partner; do
+                    [ -n "$partner" ] && records+=("$partner")
+                  done <<< "$attempt"
+                fi
+                if [ -z "$rejected" ] && [ "${#records[@]}" -gt 0 ] && ! attempt=$(node "$CHECKER" unresolve "${records[@]}" 2>&1); then
                   rejected=$(printf '%s\n' "$attempt" | grep -v '^$' | tail -n 1 || true)
                   rejected="the checker could not remove the lockfile records: ${rejected:-no output}"
                 fi
@@ -617,17 +670,50 @@ jobs:
                 rejected=${rejected:-$(printf '%s\n' "$attempt" | head -n 1 || true)}
                 rejected=${rejected:-the checker rejected the resulting diff}
               fi
+              if [ -z "$rejected" ] && ! attempt=$(node "$CHECKER" lockstep "$snapshot/bulk-lock.json" 2>&1); then
+                rejected=$(printf '%s\n' "$attempt" | grep -v '^$' | head -n 1 || true)
+                rejected=${rejected:-the lockstep check failed with no output}
+              fi
               if [ -n "$rejected" ]; then
                 tar -xf "$snapshot/manifests.tar"
-                for consumer in "${consumers[@]}"; do
-                  for name in ${members[$consumer]}; do
-                    printf -- '- `%s`: moved to %s (`%s`) in the bulk resolve only together with the rest of this group, and re-applying the group failed: %s\n' "$name" "${version_of[$consumer/$name]}" "${range_of[$consumer/$name]}" "$rejected" >> holdback.md
-                    # Held back now, like the loop's rejects: the read below
-                    # then charges the member's own subtree to this line
-                    # rather than naming each copy under it as a drop.
-                    held+=("$name")
+              fi
+            }
+            # Named with the bulk's version, its declared range and the
+            # reason, and held back now like the loop's rejects: the read
+            # below then charges the member's own subtree to this line
+            # rather than naming each copy under it as a drop.
+            name_rejected() {
+              local reason=$1 key
+              shift
+              for key in "$@"; do
+                printf -- '- `%s`: moved to %s (`%s`) in the bulk resolve only together with the rest of this group, and re-applying the group failed: %s\n' "${name_of[$key]}" "${version_of[$key]}" "${range_of[$key]}" "$reason" >> holdback.md
+                held+=("${name_of[$key]}")
+              done
+            }
+            # Everything at once first: whatever couples the members, one
+            # resolve that places them all is what the bulk did. Only when
+            # that fails, and there is more than one peer-linked set to
+            # separate, is each set tried on its own, so one pair crossing a
+            # boundary (react-dom taking scheduler across a 0.x step) does
+            # not take an unrelated pair that moves cleanly (vitest and its
+            # coverage plugin, carrying an advisory fix) down with it.
+            if [ "${#keys[@]}" -gt 0 ]; then
+              apply_group "${keys[@]}"
+              if [ -n "$rejected" ] && [ "${#groups[@]}" -gt 1 ]; then
+                for group in "${groups[@]}"; do
+                  set_keys=()
+                  for key in "${keys[@]}"; do
+                    if [ "${group_of[$key]}" = "$group" ]; then
+                      set_keys+=("$key")
+                    fi
                   done
+                  apply_group "${set_keys[@]}"
+                  if [ -n "$rejected" ]; then
+                    name_rejected "$rejected" "${set_keys[@]}"
+                  fi
                 done
+              elif [ -n "$rejected" ]; then
+                name_rejected "$rejected" "${keys[@]}"
               fi
             fi
             # A transitive copy the bulk moved that no single re-resolve
@@ -652,9 +738,8 @@ jobs:
             # And a member the accepted group's resolve placed back at
             # HEAD's version after all is named too, rather than read as
             # nothing (Codex). A rejected group's members are held by now,
-            # so the read cannot offer them again; the guard on `rejected`
-            # (the group's verdict, reset when the group began) is the
-            # belt to that suspender.
+            # so the read cannot offer them again and names only members of
+            # a set that was accepted.
             #
             # Only what sits on the manifests' own side of a hold-back is
             # read as a drop: a copy reachable only through a held-back
@@ -666,9 +751,7 @@ jobs:
             while IFS=$'\t' read -r kind name member version range _; do
               case "$kind" in
                 direct)
-                  if [ -z "${rejected:-}" ]; then
-                    printf -- '- `%s`: moved to %s (`%s`) in the bulk resolve only together with the rest of this group, and re-applying the group resolved without it, so that move did not ship\n' "$member" "$version" "$range" >> holdback.md
-                  fi ;;
+                  printf -- '- `%s`: moved to %s (`%s`) in the bulk resolve only together with the rest of this group, and re-applying the group resolved without it, so that move did not ship\n' "$member" "$version" "$range" >> holdback.md ;;
                 transitive)
                   transitives+=("$name") ;;
                 moved)
