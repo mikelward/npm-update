@@ -23,6 +23,11 @@ Deferred work, recorded here so it isn't lost.
       ruleset waits on forever) — the posture piloted in mikelward/lanes
       and mikelward/ci-commit-artifact. Fold into the same repo-rules
       invocation as the lanes flip.
+- [ ] **Assert `AGENTS.md` stays under 24,000 bytes**, beside the
+      front-matter checks in `agents-front-matter.test.js`: Antigravity
+      silently truncates a rule file past that, and an `AGENTS.md` edit
+      already rides the code lane here, so the suite would catch an overflow
+      before it merged. Mirrors mikelward/stopdash#932.
 
 ## The extracted workflow
 
