@@ -22,351 +22,238 @@ run. Consumers track `@main`, so **a merge here reaches every consumer's
 weekly run with no release step in between.** Everything below follows from
 that.
 
-Keep this file as short as it can be and still work. Every session loads it
-whole, so each rule costs context on every turn: add one the first time
-something bites, say it once in the fewest words that carry the *why*, rewrite
-or trim an existing rule rather than appending beside it, and delete one that
-has stopped biting.
+Keep this file as short as it can be and still work, **under 24,000 bytes**
+(`wc -c AGENTS.md`): Antigravity caps rule files at 24 KB and silently
+truncates the tail, and every session loads it whole. Add a rule the first
+time something bites, say it once in the fewest words that carry the *why*,
+rewrite or trim an existing rule rather than appending beside it, and delete
+one that has stopped biting. Incident histories and long derivations live in
+`AGENTS-REFERENCE.md`, under the same headings.
 
 ## The extraction
 
-- **gedmap, newshacker, and readmo all consume this repository now.** The
+- **gedmap, newshacker, and readmo all consume this repository now.** Their
   per-repo `scripts/check-npm-update.mjs` and full
-  `.github/workflows/npm-update.yml` copies are retired everywhere; each
-  consumer keeps only a thin caller plus whatever `with:` inputs it needs
-  (readmo's `regenerate`/`regenerated-files` for its Deno import map). A fix
-  here reaches all three on their next scheduled run.
-- **A change that touches consumers goes through ONE of them first.** Never
-  open the same change across the consumers at once: they share one automated
-  reviewer, so a finding against a change made three times is the same finding
-  three times, and two more chances to fix it in only some of them.
+  `.github/workflows/npm-update.yml` copies are retired; each keeps only a
+  thin caller plus the `with:` inputs it needs (readmo's
+  `regenerate`/`regenerated-files` for its Deno import map), so a fix here
+  reaches all three on their next scheduled run.
+- **A change that touches consumers goes through ONE of them first**, never
+  all at once: they share one automated reviewer, so a finding against a
+  change made three times is the same finding three times, and two more
+  chances to fix it in only some of them.
 
 ## Trust model
 
-- **The update job runs untrusted code; the publish job is what actually
-  vouches for a commit.** `npm update` executes arbitrary lifecycle scripts
-  from whatever the batch resolves, so `update` never holds the write token
-  and `publish` — a fresh runner that installs nothing — is the only job that
-  pushes, gated on re-deriving the manifest diff itself and checking the
-  fingerprints `update` recorded before any install ran.
-- **`passed` is derived in `publish`, from `checks.md`'s own fingerprint-
-  verified content — not read as a boolean the untrusted step reported
-  about itself.** `update` no longer emits a `passed` output at all;
-  `publish`'s "Derive the check verdict from checks.md" step greps the
-  downloaded, fingerprint-checked file for a `- ❌ ` line and fails closed
-  (treats as failed) on an empty or unrecognized file, never silently
-  passing. This closes the gap where a `passed` boolean and `checks.md`'s
-  content — both produced inside the same untrusted step that runs
-  `npm update` — could diverge with nothing to catch it: before, a bug or a
-  forged `passed=true` could sail past the gate even while `checks.md`
-  itself showed a failure, since the two were computed and trusted
-  independently.
-- **`checks.md`, `deps-stat.txt` and `holdback.md` still carry a residual gap
-  the manifests don't have, and this doesn't close it.** All three files, and
-  their fingerprints, are still computed *inside* the same untrusted step that
-  runs `npm update` — unlike `package.json`/`package-lock.json`, whose
-  fingerprints `publish` independently verifies against a clean checkout.
-  A sufficiently sophisticated lifecycle script could in principle leave a
-  detached background process that waits for that step to write these
-  files and their fingerprints, then overwrites both together before the
-  step's shell exits (the runner only captures `GITHUB_OUTPUT` at that
-  point) — a fingerprint check proves the downloaded artifact matches what
-  the step wrote, not that what it wrote was genuine. This can't get
-  malicious *code* merged — the manifests it would need to forge are
-  checked independently — and deriving `passed` from `checks.md` (above)
-  means there's only ONE thing left to forge for a false pass, not two
-  independently-forgeable signals that could also disagree with each
-  other. But a forger sophisticated enough to fake `checks.md`'s content
-  consistently with its own fingerprint still isn't caught, and
-  `deps-stat.txt`'s content (purely informational — the PR body's diffstat,
-  never gates anything) is untouched either way. `holdback.md` sits with
-  `deps-stat.txt` on that scale: it gates nothing, but it is the only place
-  the PR admits a package was left behind, so an emptied copy turns an honest
-  body into one claiming the batch moved everything. What it names is
-  independently checkable against the diff by anyone reading the PR — a
-  held-back package is one that did not move. Closing that fully would
-  need `publish` to re-derive the verdict from a clean re-execution, not
-  just re-read a file the untrusted job already wrote — out of scope here.
-  Read the PR body's check results as evidence from the batch, not proof
-  independently established — the same posture the sibling per-repo copies
-  already took before this repository existed.
+- **The update job runs untrusted code; the publish job is what vouches for
+  a commit.** `npm update` executes arbitrary lifecycle scripts from whatever
+  the batch resolves, so `update` never holds the write token, and `publish`
+  — a fresh runner that installs nothing — is the only job that pushes, gated
+  on re-deriving the manifest diff itself and checking the fingerprints
+  `update` recorded before any install ran.
+- **`passed` is derived in `publish` from `checks.md`'s fingerprint-verified
+  content, never a boolean the untrusted step reports about itself** (it
+  emits none): publish's "Derive the check verdict from checks.md" step greps
+  for a `- ❌ ` line and fails closed on an empty or unrecognized file. A
+  separate boolean, written by the same step as `checks.md`, could diverge
+  from it unnoticed — a forged `passed=true` sailed past while the file
+  showed a failure.
+- **`checks.md`, `deps-stat.txt` and `holdback.md` keep a residual gap the
+  manifests don't have.** They and their fingerprints come from the untrusted
+  step (the manifests' are verified against a clean checkout), so a lifecycle
+  script's background process could rewrite a file and its fingerprint
+  together before the step exits. It can't merge code, and deriving `passed`
+  from `checks.md` leaves one thing to forge, not two, still uncaught;
+  `deps-stat.txt` and
+  `holdback.md` gate nothing, though an emptied `holdback.md` claims
+  everything moved (checkable against the diff). Closing it needs a clean
+  re-execution in `publish`, out of scope: read the PR body's check results
+  as evidence from the batch, not independently established proof.
 - **A regenerated file auto-merges like any other batch** (maintainer,
-  2026-09-01). Its content is fingerprint-checked in `publish`, never
-  re-derived there — the consumer's `regenerate` command runs in the untrusted
-  window, after the install with lifecycle scripts — and the first version
-  withheld auto-merge for that reason, retitling the PR for a human. Reversed:
-  what vouches for the content is the consumer's own checks on the PR head,
-  which auto-merge waits for regardless, and readmo's suite asserts every
-  import-map entry against the lockfile `publish` did re-validate. The hold
-  bought a parked weekly PR, which is the PR that goes unnoticed. A consumer
-  declaring `regenerate` owes its derived file a check of that kind; the batch
-  names the rebuilt file in the PR body either way.
+  2026-09-01). `regenerate` runs in the untrusted window, so `publish` only
+  fingerprint-checks its output, and the first version withheld auto-merge
+  for that, retitling the PR for a human. Reversed: the consumer's own checks
+  on the PR head vouch for it and auto-merge waits for them (readmo's suite
+  asserts every import-map entry against the lockfile `publish` re-validated);
+  the hold only bought a parked weekly PR nobody notices. A consumer declaring
+  `regenerate` owes its derived file such a check; the PR body names the
+  rebuilt file either way.
 - **The update job caches nothing.** It checks out the default branch, so a
-  cache it saved would be scoped there and restorable by every workflow in the
-  repository, the consumer's own `ci.yml` included (same `cache: npm`, same
-  lockfile-derived key). Lifecycle scripts run here with sudo, and setup-node's
-  post step saves whatever `~/.npm` holds whenever the primary key missed — a
-  forged packument with a long `max-age` would then feed the consumer's next
-  `npm ci` and this workflow's next resolve, ahead of the fingerprint.
-  setup-node has no read-only mode, so `cache: npm` is simply absent — the
-  posture gradle-update takes with `cache-read-only: true` and rust-update
-  with no cargo cache in that job.
+  saved cache would be restorable by every workflow there, the consumer's
+  `ci.yml` included (same `cache: npm` key); with lifecycle scripts running as
+  sudo and setup-node saving `~/.npm` on a missed key, a forged packument with
+  a long `max-age` would feed the next `npm ci` and resolve, ahead of the
+  fingerprint. setup-node has no read-only mode, so `cache: npm` is absent (as
+  gradle-update uses `cache-read-only: true`, rust-update no cargo cache).
 - **The batch credential lives in an environment only the publish job
-  declares.** A secret passed through `workflow_call` reaches the runner of
-  every job in the called workflow, the update job included — a runner holds a
-  job's whole secrets context for log masking whether or not a step references
-  it — so "the credential lives only in the publish job" was never what the
-  platform delivered. An environment secret reaches only the job that declares
-  the environment. So publish declares `inputs.environment` (default
-  `npm-update`), the update job never declares one, the caller passes
-  `secrets: inherit`, and `NPM_UPDATE_PAT` (or the `NPM_UPDATE_APP_*` pair) is
-  set on that environment rather than on the repository —
-  `repo secrets --env npm-update` in mikelward/repo does exactly that. The
-  explicit `secrets:` block is the legacy route and still works. The cost
-  `inherit` carries is that every OTHER repository-level secret of the consumer
-  now reaches the update job too, which is why mikelward/repo's `repo audit`
-  reports repository-level secrets: a consumer running this batch keeps its
-  secrets environment-scoped.
+  declares.** A `workflow_call` secret reaches every job's runner (a runner
+  holds a job's whole secrets context for log masking), the update job's
+  included; an environment secret reaches only the job declaring it. So
+  publish declares `inputs.environment` (default `npm-update`), update
+  declares none, the caller passes `secrets: inherit`, and `NPM_UPDATE_PAT`
+  (or the `NPM_UPDATE_APP_*` pair) is set on that environment, not the
+  repository (`repo secrets --env npm-update` in mikelward/repo). The explicit
+  `secrets:` block is the legacy route and still works. `inherit` also sends
+  every OTHER repository-level secret to the update job, which is why
+  `repo audit` reports them: a consumer running this batch keeps its secrets
+  environment-scoped.
 
 ## Holding back only what is blocked
 
-- **One package's breaking transitive move must not sink the batch.** It did,
-  for two consecutive weeks in gedmap, newshacker and readmo: `rolldown`
-  resolving `@oxc-project/types` across 0.144 → 0.146 failed the diff, so no
-  PR opened anywhere and every other package that moved cleanly waited behind
-  it, with nothing but a failed scheduled run to say so.
-- **The rebuild is incremental, not attributive.** The hold-back step goes
-  back to HEAD and re-resolves one package at a time, validating after each
-  and reverting the ones that fail. That makes the result correct by
-  construction — every accepted state validates, so the final one does —
-  rather than depending on tracing a crossing back to whichever direct
-  dependency "caused" it, which a hoisted or shared subdependency makes a
-  guess. It runs only in a week the batch would otherwise have shipped
-  nothing.
+- **One package's breaking transitive move must not sink the batch**: one
+  crossing (`rolldown` taking `@oxc-project/types` 0.144 → 0.146) blocked
+  every clean move for two weeks, with only a failed scheduled run to say so.
+- **The rebuild is incremental, not attributive**: from HEAD, re-resolve one
+  package at a time, validate after each, revert the ones that fail. That is
+  correct by construction (every accepted state validates, so the final one
+  does), where tracing a crossing to the direct dependency that "caused" it
+  is a guess under a hoisted or shared subdependency. It runs only in a week
+  the batch would otherwise have shipped nothing.
 - **The candidate set is the declared names PLUS every name the bulk resolve
-  moved.** Declared names alone silently narrow the batch: a bare
-  `npm update` walks the whole tree, `npm update <name>` re-resolves one
-  package's subtree, so a rebuild driven by the declared list keeps the
-  direct moves and drops every transitive one — and the PR body then reports
-  "0 transitive" as if there had been nothing to take. clothescast's first
-  batch shipped exactly that, leaving behind the `form-data` security fix a
-  Dependabot PR had been waiting on since June, because a crossing under an
-  unrelated subdependency had sent it down the rebuild path. A transitive
-  name is a fine argument to `npm update` — it writes to no manifest — so
-  this needed a longer list, not a new mechanism.
-- **A candidate is a name whose copies differ by PATH or by version.** Two
-  copies trading versions between lockfile paths leave the version multiset
-  identical while the tree really changed, so a multiset comparison drops that
-  move in silence (Codex, on review of this pass). Being coarser than the
-  PR-body summary here is deliberate: an extra candidate costs one `npm
-  update` that does nothing, a missing one costs a move nothing reports.
-- **An unreadable lockfile on EITHER side degrades to the declared names.**
-  Substituting an empty map for just the unreadable one makes every package on
-  the other side look moved — the whole tree in the candidate list, a registry
-  resolve each, which is the opposite of degrading (Codex). "Unreadable" is
-  `isWalkableLock`, the same question the validator refuses on — no `packages`
-  map, or one with no root record to seed the walk — since a shape the walk
-  rejects is one whose diff means nothing. A test asserts the two agree rather
-  than trusting them to be edited together.
-- **`candidates` is read BEFORE the manifests go back to HEAD.** Half of what
-  it reports is what the bulk resolve moved, and that only exists on disk
-  until the restore. Move the call below `git checkout HEAD` and the list
-  quietly collapses to the declared names — the same silent narrowing, with
-  the tests still green unless they assert a transitive survived.
-- **It changes nothing about what gets trusted.** The step runs inside the
-  window before any dependency code executes (`--ignore-scripts`, like the
-  bulk resolve), and its verdicts are the untrusted job's own: `publish`
-  re-validates the final diff from its own clean checkout regardless, so the
-  worst a tampered checker copy there can do is produce a batch publish then
-  refuses.
-- **The checker is fetched OUTSIDE the consumer's tree, and that is
-  load-bearing.** A gedmap pilot checked it out into the repository with
-  `actions/checkout` (which cannot write anywhere else) and the consumer's own
-  `npm test` collected this repository's `*.test.js` files a few steps later —
-  the batch opened its PR titled CHECKS FAILING over tests that have nothing to
-  do with it. A clone into `$RUNNER_TEMP` also means no tree-check allowlist
-  entry, so the check that catches dependency code writing to the repository
-  stays exactly as tight as it was.
-- **Restore every manifest, not the root pair.** `npm update --save` writes the
-  new range into whichever manifest declares the dependency, so a workspace's
-  `package.json` is part of what the rebuild has to snapshot and roll back;
-  `manifestPaths` in the checker is what names them.
-- **A package that only moves TOGETHER with another is out of reach one at
-  a time, so the loop's leftovers are re-applied as a group.** `npm update
-  <name>` cannot move a package whose installed partner pins it to an exact
-  version, and the partner is pinned right back: `vitest` and
-  `@vitest/coverage-v8` re-resolve to no change alone, naming both in one
-  `npm update` does no better, and only a resolve that has to place both
-  afresh moves them. Before the pass had this second half, such a pair
-  validated as unchanged and fell out of the batch neither held back nor
-  moved — gedmap, newshacker and readmo shipped every rebuild week without
-  vitest 4.1.11, the release carrying a `@vitest/mocker` advisory fix, until
-  Dependabot offered the 4 → 5 major instead. So the bulk lockfile is kept
-  aside before the restore, the checker's `dropped` mode names what the bulk
-  moved that the rebuild did not, the declared part is re-applied as one
-  group — the bulk's own ranges written into their declaring manifests, each
-  member's lockfile record removed (the checker's `unresolve` mode), then a
-  single bare `npm install` — and validated like any step of the loop, and
-  what still fails — or a dropped transitive, which nothing can ask for by
-  version, or a member the accepted group's resolve still left at HEAD — is
-  named in `holdback.md`. A transitive is a drop of its own only on the
-  manifests' side of a hold-back: a copy reachable only through a held-back
-  record moved for that hold-back's reasons, and its line covers it —
-  gedmap's first batch with this pass named eslint and rolldown and then
-  thirty-four packages that had moved only because they had. Nor is
-  anything beneath an optional dependency npm does not install on the
-  runner (its `cpu`/`os` lists, read by `isInstallable`, name only other
-  platforms): a full `npm update` prunes
-  its lockfile records on a runner that does not install it and a targeted
-  one keeps them, which read as six dropped moves of tailwind's wasm
-  runtime shims when nothing had moved. What is left is one line naming
-  them all, not a paragraph each. The record goes because the range write alone is
-  not enough: the bulk keeps a declaration whose range already admits the
-  new version (`~4.1.10` spans 4.1.11, and `npm update --save` does not
-  narrow it), so writing that range back changes nothing, and a bare
-  `npm install` with nothing to do reads the lockfile and keeps HEAD's
-  copies. An edge whose record is gone is one npm must place afresh, at the
-  newest its range admits, in the same resolve as every other member's,
-  root and workspace alike, with the manifests left as written — verified
-  against npm 11.19 with the vitest pair under `~` ranges, where it
-  reproduces the bulk's own lockfile and `npm update` naming both members
-  does not. The test runs the real step end to end against a fake npm that
-  is lockfile-driven the same way, because the failure it guards is the
-  loop finishing green with a package missing.
-- **Packages released in lockstep move together or not at all.** A pair is
-  two package names where every copy of one resolves its peer, the other, at
-  its own version, at HEAD and after the bulk, and the bulk moved them
-  (`lockstepPairs`). Names and npm's own peer resolution, never copies
-  matched across lockfiles: copy matching lost pairs to every hoist or
-  dedupe, one level further out each review round (maintainer's call,
-  2026-09-26). The cost is that a pair is one group across workspaces. No metadata says
-  "these must match" — react-dom 19.2.8's `^19.2.8` admits react 19.3.0 — so
-  the fact comes from the bulk resolve, and all three conditions are what
-  keep @babel/* (sharing core's version by coincidence) and @types/react
-  (moving alone) out of it. The 2026-09-26 batch took react alone, held
-  react-dom for its scheduler's 0.x step, passed every check here, and
-  failed 8 of gedmap's 21 test files. So pair members never go through the
-  loop alone, every accepted state is refused if it splits a pair, and the
-  group re-apply falls back to one peer-linked set at a time when the whole
-  group fails — one pair crossing a boundary must not take a clean pair
-  (vitest, carrying an advisory fix) down with it. Like the rest of this
-  pass it shapes the batch in the untrusted job; `publish` does not re-run
-  it, since it needs the bulk lockfile only that job holds, and a split is
-  a broken batch the consumer's own tests catch, not a trust failure.
-- **A week where everything is blocked fails loudly.** Silence would be
-  indistinguishable from "nothing to update", which is the failure this
-  whole pass exists to end.
+  moved.** `npm update <name>` re-resolves one subtree, so a declared-only
+  rebuild silently drops every transitive move and reports "0 transitive"
+  (clothescast's first batch left a `form-data` security fix behind). A
+  transitive name writes to no manifest, so it is a fine argument to
+  `npm update`.
+- **A candidate is a name whose copies differ by PATH or by version**: copies
+  trading versions between lockfile paths leave the version multiset
+  identical. Being coarser than the PR-body summary is deliberate — an extra
+  candidate costs a no-op `npm update`, a missing one a move nothing reports.
+- **An unreadable lockfile on EITHER side degrades to the declared names** —
+  an empty map for one side would mark the whole tree moved, a registry
+  resolve each. "Unreadable" is `isWalkableLock`, the validator's own question
+  (no `packages` map, or no root record to seed the walk), since a diff the
+  walk rejects means nothing; a test asserts the two agree.
+- **`candidates` is read BEFORE the manifests go back to HEAD**: what the bulk
+  moved exists on disk only until the restore, and after it the list silently
+  collapses to the declared names, tests green unless one asserts a
+  transitive survived.
+- **It changes nothing about what gets trusted**: the step runs before any
+  dependency code (`--ignore-scripts`), and `publish` re-validates the final
+  diff from its own clean checkout, so a tampered checker copy can at worst
+  produce a batch publish refuses.
+- **The checker is fetched OUTSIDE the consumer's tree**, into
+  `$RUNNER_TEMP`, and that is load-bearing: checked out inside it, the
+  consumer's `npm test` ran this repository's `*.test.js` and titled the batch
+  CHECKS FAILING; outside, it needs no tree-check allowlist entry, so the
+  check that catches dependency code writing to the repository stays as tight.
+- **Restore every manifest, not the root pair**: `npm update --save` writes
+  into whichever manifest declares the dependency, workspaces' included;
+  `manifestPaths` names them.
+- **The loop's leftovers are re-applied as a group**: a package an installed
+  partner pins exactly (`vitest`, `@vitest/coverage-v8`) moves neither alone
+  nor with both named in one `npm update`, and fell out neither moved nor held
+  back. The bulk lockfile is kept aside; the checker's `dropped` mode names
+  what the bulk moved and the rebuild didn't; the declared part gets the
+  bulk's ranges written back and each member's lockfile record removed
+  (`unresolve` — a range already admitting the new version writes back
+  unchanged, and `npm install` would keep HEAD's copies), then one bare
+  `npm install` places them afresh, validated like any loop step. What still
+  fails, a dropped transitive (one line naming them all), or a member left
+  at HEAD goes in `holdback.md` — except a transitive reachable only through a
+  held-back record (its line covers it) or under an optional dependency the
+  runner doesn't install (`isInstallable`), which aren't moves. The test runs
+  the real step against a lockfile-driven fake npm: the failure is the loop
+  finishing green with a package missing.
+- **Packages released in lockstep move together or not at all**
+  (`lockstepPairs`): two names where every copy of one resolves its peer, the
+  other, at its own version, at HEAD and after the bulk, and the bulk moved
+  both — names and npm's peer resolution, never copies matched across
+  lockfiles, which lost pairs to every hoist or dedupe (maintainer's call,
+  2026-09-26), at the cost that a pair is one group across workspaces. No
+  metadata says "must match" (react-dom 19.2.8's `^19.2.8` admits react 19.3.0); the three
+  conditions keep coincidental sharers (@babel/*) and lone movers
+  (@types/react) out. Members never go through the loop alone, a state that
+  splits a pair is refused, and the group re-apply falls back to one
+  peer-linked set at a time so a crossing pair can't sink a clean one.
+  `publish` doesn't re-run it (it needs the bulk lockfile); a split is a
+  broken batch the consumer's tests catch, not a trust failure.
+- **A week where everything is blocked fails loudly** — silence would be
+  indistinguishable from "nothing to update", the failure this pass exists to
+  end.
 
 ## Ordering inside the update job
 
-- **The regenerate hook runs between the install and the rest of the checks.**
-  It used to run after the whole suite, which meant a consumer whose tests
-  assert a derived file matches the lockfile failed those tests on every batch
-  that moved a pinned package — readmo, whose Deno import map pins
-  `fast-xml-parser` and `sanitize-html`, reported three failures, a
-  `CHECKS FAILING` title and withheld auto-merge on a branch whose own CI then
-  passed. A suite that cries wolf on every real batch is the one nobody reads.
-- **The install is therefore its own step, and still a reported check.** Its
-  verdict travels to the check step as a step output and is prepended to the
-  report, so `checks.md` still holds all four checks exactly once — which is
-  what publish's verdict step requires, and what would close every batch if the
-  hand-off ever dropped it.
-- **Fingerprint-then-check still brackets the derived files.** They are
-  produced and fingerprinted in the same step, and the tree-verification step
-  re-verifies those fingerprints after lint/test/build — so a later check that
-  rewrites one is still caught, exactly as when regeneration ran last.
+- **The regenerate hook runs between the install and the rest of the
+  checks**: after the suite, a consumer whose tests assert a derived file
+  matches the lockfile (readmo) failed them on every batch moving a pinned
+  package — `CHECKS FAILING` on a branch whose own CI passed. A suite that
+  cries wolf on every real batch is the one nobody reads.
+- **The install is therefore its own step, and still a reported check**: its
+  verdict travels as a step output, prepended to the report, so `checks.md`
+  holds all four checks exactly once, as publish's verdict step requires (a
+  dropped hand-off would close every batch).
+- **Fingerprint-then-check still brackets the derived files**: fingerprinted
+  in the step that produces them and re-verified after lint/test/build, so a
+  later check that rewrites one is still caught.
 
 ## A guard that fires on every run is a broken guard
 
-- **The ignored-file check has to be declarable, or the consumer it fires on
-  publishes nothing.** clothescast's Cloud Functions build emits a gitignored
-  `functions/lib/`, which was not one of the built-in build outputs, so every
-  weekly batch aborted after its own build step from June onward — 42 runs, no
-  PR, and a Dependabot security bump left open for two months behind the batch
-  that should have carried it. Nothing alerts on a scheduled workflow that
-  fails, so the symptom was silence. `ignored-build-outputs` is the input the
-  step's own comment had already anticipated.
-- **A declared path is data, so compare it as a whole record.** Splicing
-  consumer values into the `grep -E` pattern would let a metacharacter widen it
-  to paths nobody declared; the loop matches the regenerated-files loop in the
-  tracked scan for the same reason.
-- **Filter declared entries BEFORE stripping the outside-directory marker.**
-  An entry outside `working-directory` carries a trailing tab precisely so a
-  bare name cannot satisfy the allowlist meant for the one inside it — filter
-  after the strip and a repository-root `lib/` passes on a declaration that
-  named `functions/lib/`. Written the wrong way round first; the test that
-  plants exactly that is what caught it.
+- **The ignored-file check has to be declarable** (`ignored-build-outputs`),
+  or the consumer it fires on publishes nothing: clothescast's gitignored
+  `functions/lib/` aborted every weekly batch for months, and nothing alerts
+  on a failing scheduled workflow, so the symptom was silence.
+- **A declared path is data, so compare it as a whole record**: spliced into
+  `grep -E`, a metacharacter widens it to paths nobody declared (as in the
+  regenerated-files loop).
+- **Filter declared entries BEFORE stripping the outside-directory marker**:
+  an entry outside `working-directory` carries a trailing tab so a bare name
+  can't satisfy the allowlist meant for the one inside it; filter after the
+  strip and a repository-root `lib/` passes on a `functions/lib/`
+  declaration. A test plants exactly that.
 
 ## Who opens the pull request
 
-- **A pull request opened by `GITHUB_TOKEN` starts no `on: pull_request`
-  workflow, and that is the root of a whole class of stuck batches.** Every
-  required check has to be dispatched by name — the two hard-coded ones plus
-  whatever `dispatch-workflows` declares — and a required check nobody
-  thought to name holds the batch open forever on a status nothing produces.
-  readmo hit it when `zizmor` became required there; clothescast's batch PRs
-  get their scan only when a `pull_request: edited` event happens to fire.
-- **The `token` / `app-id` credential closes the class, where
-  `dispatch-workflows` closes one name at a time.** Opened as a real
-  collaborator, the ordinary `pull_request` round runs on its own — including
-  for checks added later, which is the half a declared list can never cover.
-  Both stay: the dispatches are the fallback when no credential is supplied,
-  and harmless once redundant.
-- **The credential goes to the publish job only.** That job installs nothing
-  and runs no dependency code, which is the entire reason a stronger
-  credential is safe here; the update job runs whatever the batch resolved and
-  keeps its read-only `GITHUB_TOKEN`. A test asserts the update job names none
-  of the three secrets — put a credential there and an unreviewed package gets
-  the token that can push to `main`.
-- **The PR body says which checks actually ran, and that differs by
-  credential.** Under `GITHUB_TOKEN` the honest sentence is "CI does not
-  start here on its own, so this job dispatched it"; opened as a
-  collaborator, the ordinary `pull_request` round ran and the dispatches were
-  belt-and-braces. Printing the first in the second case misreports what
-  verified the batch, and the two dispatch-failure notes are worse — they
-  send a reader chasing a check that is already there (Codex).
-- **The dispatches stay on `GITHUB_TOKEN` deliberately.** A dispatch is an
-  Actions API write; the minted App token is granted contents and
-  pull-requests only. Routing them through the default token keeps them
-  working under every credential and keeps a consumer's PAT down to the two
-  scopes this job uses for authorship.
+- **A PR opened by `GITHUB_TOKEN` starts no `on: pull_request` workflow**, so
+  each required check must be dispatched by name (two hard-coded, plus
+  `dispatch-workflows`), and one nobody named holds the batch open forever on
+  a status nothing produces (readmo's `zizmor`).
+- **The `token` / `app-id` credential closes that class**, where
+  `dispatch-workflows` closes one name at a time: opened as a real
+  collaborator, the ordinary `pull_request` round runs, checks added later
+  included. Both stay — the dispatches are the no-credential fallback and
+  harmless once redundant.
+- **The credential goes to the publish job only**, which installs nothing and
+  runs no dependency code — the whole reason a stronger credential is safe
+  there; the update job keeps its read-only `GITHUB_TOKEN`, and a test asserts
+  it names none of the three secrets, or an unreviewed package gets a token
+  that can push to `main`.
+- **The PR body says which checks actually ran**: under `GITHUB_TOKEN`, "CI
+  does not start here on its own, so this job dispatched it"; as a
+  collaborator, the ordinary round ran. The wrong sentence (or a
+  dispatch-failure note) misreports what verified the batch.
+- **The dispatches stay on `GITHUB_TOKEN` deliberately**: a dispatch is an
+  Actions API write the minted App token (contents and pull-requests only)
+  can't make; this keeps them working under every credential and a
+  consumer's PAT to the two scopes authorship uses.
 
 ## What this repository must not grow
 
 - **No dependencies. No `package.json`, no lockfile, no build step.** What a
-  consumer's workflow runs is the source here, which is what makes an unpinned
-  `@main` reference reviewable by reading it. `vitest-shim.mjs` exists so the
-  suite ported from the consumers runs under `node --test` without installing
-  anything; extending the shim beats adding a test framework. `yaml-lite`
-  (the minimal YAML-subset parser some structural tests use, for the class
-  of check a regex over raw text can't do reliably — like "no `${{ }}`
-  expression is spliced into any `run:` script anywhere in the workflow")
-  is dependency-free too but is NOT vendored: the canonical copy is
-  `mikelward/yaml-lite`, tracked `@main` like the fleet's other shared
-  machinery (lanes, codex-review). CI checks it out into `.yaml-lite/`
-  (see ci.yml); locally, clone it as a sibling
-  (`git clone https://github.com/mikelward/yaml-lite ../yaml-lite`) — the
-  suite fails with that instruction, never skips, when the parser is
-  missing. Fix parser bugs there, not here. Use it only where the regex
-  approach has already shown it can't tell the difference reliably, and
-  leave the rest of the suite's regex-based assertions alone; they're not
-  fragile the way that one was.
+  consumer's workflow runs is the source here, which is what makes an
+  unpinned `@main` reference reviewable by reading it. `vitest-shim.mjs` runs
+  the suite ported from the consumers under `node --test`; extend the shim
+  rather than add a test framework. `yaml-lite`, the dependency-free YAML
+  parser for checks a regex over raw text can't do reliably (no `${{ }}`
+  spliced into any `run:` script), is NOT vendored: `mikelward/yaml-lite` is
+  canonical, tracked `@main` like lanes and codex-review; fix parser bugs
+  there. Use it only where a regex has proven unreliable, and leave the other
+  regex assertions alone.
 
 ## Testing
 
-- `node --test *.test.js`. No install step — there is nothing to install.
-  The one setup step is a one-time
-  `git clone https://github.com/mikelward/yaml-lite ../yaml-lite` (a git
-  clone, not a package manager): the structural tests resolve the parser
-  from CI's `.yaml-lite/` checkout or that sibling clone, and fail with
-  that exact command — never skip — when both are missing.
+- `node --test *.test.js`, with nothing to install. The one setup step is a
+  one-time `git clone https://github.com/mikelward/yaml-lite ../yaml-lite` (a
+  git clone, not a package manager): the structural tests resolve the parser
+  from CI's `.yaml-lite/` checkout or that sibling clone, and fail with that
+  exact command — never skip — when both are missing.
 - **Add or update tests with any change.** This suite is the only thing
   between a push and every consumer's weekly run, so a change that ships
   untested ships unreviewed.
 - The suite's failure mode is a *false pass* — a set difference against an
   empty set is empty, a matcher that forgets to assert is green — so assert
-  behavior, and where a check is derived from parsing a file, assert first
-  that the parse found something.
+  behavior, and where a check parses a file, assert first that the parse found
+  something.
 - **Fix any preexisting test failure as the first commit of the series.**
   Don't stack new work on a red baseline.
 - **Don't disable a failing check** to make it pass, and don't paper over a
@@ -396,20 +283,17 @@ has stopped biting.
 - **Open the pull request without being asked**, ready for review, not a draft.
 - **Refresh the title and body with the push — body first, then push** — so
   they describe the branch's latest state, not the scope it had when opened.
-- **Codex is the automated reviewer**, and its reviews are triggered
-  automatically. Address its comments without being asked, folding each fix
-  into the commit it belongs to — the one exception being a real finding out of
-  scope for this pull request, which you defer instead (see *Deferring a
-  finding* below). Judge every comment on merit: verify the claim before
-  acting, and if it doesn't hold up, reply saying why and decline. A comment
-  citing a rule is a *reading* of that rule, not the rule — check what the rule
-  actually says, since an over-strict reading (the privacy rules especially,
-  where stricter always feels safer) costs real capability. A genuine conflict
-  between the rule and what the code needs is the maintainer's call, not one to
-  resolve by quietly narrowing the code. Declining doesn't clear the required
-  `codex` status: post the rebuttal, then `@codex review` once — or let the
-  next push do it, if the rebuttal is up first. Escalate if it re-raises, or if
-  five minutes on that review has not landed either.
+  With no PR yet, push, then update as soon as one is opened.
+- **Codex is the automated reviewer**, triggered automatically. Address its
+  comments unasked, folding each fix into its commit, or defer a real
+  out-of-scope finding (below). Judge each on merit: verify it, and if it
+  doesn't hold, reply why and decline. A cited rule is a *reading* — check
+  what it says; an over-strict reading (privacy especially) costs real
+  capability, and a genuine rule-vs-code conflict is the maintainer's call,
+  not one to settle by quietly narrowing the code. Declining doesn't clear
+  the required `codex` status: post the rebuttal, then `@codex review` once
+  (or let the next push do it, if the rebuttal is up first); escalate if it
+  re-raises, or if that review hasn't landed five minutes on.
 - **Once Codex has +1'd a PR's head, never make an unnecessary change to it
   without asking first** (maintainer, 2026-10-13): a to-do, tidy-up or extra
   fix re-runs CI and Codex for nothing, so it waits for a yes or goes in a
@@ -421,20 +305,19 @@ has stopped biting.
   it, and ask whether a different design would delete the class rather than the
   instance; a design change is the maintainer's call, not one to make solo.
 - **Restate every review finding in the next message you send, not just the
-  count.** One bullet each: review comment, top-level comment or review body
-  alike, most blocking first — what it claims, where, and what you did about
-  it, or the options where it's the maintainer's call. Summarize them all in
-  that one reply; ask only the most blocking question.
+  count**: one bullet each (review comment, top-level comment or review body),
+  most blocking first — what it claims, where, and what you did, or the
+  options where it's the maintainer's call — all in that one reply; ask only
+  the most blocking question.
 - **Never leave a review thread silently dismissed** — every thread ends in a
   reply or a resolve.
-- **Deferring a real-but-out-of-scope finding.** Don't ask the maintainer to
-  merge past it: note the follow-up in `TODO.md`, commit and push that first,
-  reply on the thread citing the sha, and resolve. A finding with no thread
-  (top-level comment or review body) still gets the `TODO.md` record, the push,
-  and the reply — only the resolve is skipped. The push re-triggers Codex, so
-  don't also poke it unless five minutes pass with nothing back; escalate if
-  the re-review re-raises it, or is still missing five minutes after the
-  poke.
+- **Deferring a real-but-out-of-scope finding**: don't ask the maintainer to
+  merge past it — note it in `TODO.md`, commit and push that first, reply on
+  the thread citing the sha, and resolve. A finding with no thread (top-level
+  comment or review body) still gets the record, push and reply; only the
+  resolve is skipped. The push re-triggers Codex, so don't also poke it unless
+  five minutes pass with nothing back; escalate if the re-review re-raises it,
+  or is still missing five minutes after the poke.
 
 ## Language and spelling
 
@@ -464,16 +347,17 @@ has stopped biting.
 - **One question at a time** — in plain chat or the client's question tool
   (`AskUserQuestion` in Claude Code, `ask_question` in Antigravity); stop and
   wait for the answer before proceeding on an assumed one.
-- **Answer a mid-turn message first.** A user message that arrives while you're working
-  — the "sent while you were working" interjection — is addressed in your very next
-  output, before any further tool call, even if it's one sentence.
-- **Message only when the user needs to see it** (maintainer, 2026-10-15): each one
-  notifies their phone. Work and listen in silence; speak up for a question or blocker,
-  something to merge or act on, a merge, or a change from the plan or their
-  instructions, a review-prompted one included. Never for progress (a client's nudge
-  doesn't count), a review or a push alone (its report rides the next message), routine
-  machinery, or a mistake caught and fixed before it reached the repo. The session-start
-  `AGENTS.md` line still opens every session.
+- **Answer a mid-turn message first** — the "sent while you were working"
+  interjection — in your very next output, before any further tool call, even
+  if it's one sentence.
+- **Message only when the user needs to see it** (maintainer, 2026-10-15): each
+  one notifies their phone. Work and listen in silence; speak up for a
+  question or blocker, something to merge or act on, a merge, or a change from
+  the plan or their instructions, a review-prompted one included. Never for
+  progress (a client's nudge doesn't count), a review or a push alone (its
+  report rides the next message), routine machinery, or a mistake caught and
+  fixed before it reached the repo. The session-start `AGENTS.md` line still
+  opens every session.
 
 ## Privacy
 
