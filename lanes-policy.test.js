@@ -47,6 +47,8 @@ describe("the lane policy", () => {
     // A rule this suite has not vetted is a rule nothing here exercises.
     assert.deepEqual(rules, [
       { verdict: "code", pattern: "AGENTS.md" },
+      { verdict: "code", pattern: "CLAUDE.md" },
+      { verdict: "code", pattern: "GEMINI.md" },
       { verdict: "docs", pattern: "**/*.md" },
     ]);
     assert.deepEqual(directives.prefixes, ["docs"]);
@@ -63,6 +65,13 @@ describe("the lane policy", () => {
     // agents-front-matter.test.js asserts the front matter at its top; as
     // docs, an AGENTS.md-only edit could break it with that test never run.
     assert.equal(classify("AGENTS.md"), "code");
+  });
+
+  test("CLAUDE.md and GEMINI.md ride the code lane too", () => {
+    // agents-front-matter.test.js asserts both are symlinks to AGENTS.md; as
+    // docs, a links-only edit could break that with the test never run.
+    assert.equal(classify("CLAUDE.md"), "code");
+    assert.equal(classify("GEMINI.md"), "code");
   });
 
   test("everything a consumer's weekly run executes is code", () => {
