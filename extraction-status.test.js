@@ -46,7 +46,7 @@ describe("the extraction's status text stays consistent", () => {
 
   test("README.md, AGENTS.md, and npm-update.yml all say the consumers have migrated", () => {
     assert.match(readme, /all three now consume it/);
-    assert.match(agents, /gedmap, newshacker, and readmo all consume this repository now/);
+    assert.match(agents, /workflow\s+that\s+gedmap,\s+newshacker\s+and\s+readmo\s+call/);
     assert.match(workflow, /readmo and\n# newshacker have since migrated too/);
   });
 });
