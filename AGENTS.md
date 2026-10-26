@@ -22,7 +22,7 @@ run. Consumers track `@main`, so **a merge here reaches every consumer's
 weekly run with no release step in between.** Everything below follows from
 that.
 
-Keep this file as short as it can be and still work, **under 24,000 bytes**
+Keep this file as short as it can be and still work, **under 22,000 bytes**
 (`wc -c AGENTS.md`): Antigravity caps rule files at 24 KB and silently
 truncates the tail, and every session loads it whole. Add a rule the first
 time something bites, say it once in the fewest words that carry the *why*,
@@ -55,36 +55,28 @@ one that has stopped biting. Incident histories and long derivations live in
   content, never a boolean the untrusted step reports about itself** (it
   emits none): publish's "Derive the check verdict from checks.md" step greps
   for a `- ❌ ` line and fails closed on an empty or unrecognized file. A
-  separate boolean, written by the same step as `checks.md`, could diverge
-  from it unnoticed — a forged `passed=true` sailed past while the file
-  showed a failure.
+  separate boolean from the same step could diverge from it unnoticed.
 - **`checks.md`, `deps-stat.txt` and `holdback.md` keep a residual gap the
   manifests don't have.** They and their fingerprints come from the untrusted
   step (the manifests' are verified against a clean checkout), so a lifecycle
   script's background process could rewrite a file and its fingerprint
-  together before the step exits. It can't merge code, and deriving `passed`
-  from `checks.md` leaves one thing to forge, not two, still uncaught;
-  `deps-stat.txt` and
-  `holdback.md` gate nothing, though an emptied `holdback.md` claims
-  everything moved (checkable against the diff). Closing it needs a clean
+  together before the step exits. It can't merge code; `checks.md` is the
+  one thing left to forge; the other two gate nothing (an emptied
+  `holdback.md` is checkable against the diff). Closing it needs a clean
   re-execution in `publish`, out of scope: read the PR body's check results
-  as evidence from the batch, not independently established proof.
+  as evidence from the batch, not proof.
 - **A regenerated file auto-merges like any other batch** (maintainer,
-  2026-09-01). `regenerate` runs in the untrusted window, so `publish` only
-  fingerprint-checks its output, and the first version withheld auto-merge
-  for that, retitling the PR for a human. Reversed: the consumer's own checks
-  on the PR head vouch for it and auto-merge waits for them (readmo's suite
-  asserts every import-map entry against the lockfile `publish` re-validated);
-  the hold only bought a parked weekly PR nobody notices. A consumer declaring
-  `regenerate` owes its derived file such a check; the PR body names the
-  rebuilt file either way.
-- **The update job caches nothing.** It checks out the default branch, so a
-  saved cache would be restorable by every workflow there, the consumer's
-  `ci.yml` included (same `cache: npm` key); with lifecycle scripts running as
-  sudo and setup-node saving `~/.npm` on a missed key, a forged packument with
-  a long `max-age` would feed the next `npm ci` and resolve, ahead of the
-  fingerprint. setup-node has no read-only mode, so `cache: npm` is absent (as
-  gradle-update uses `cache-read-only: true`, rust-update no cargo cache).
+  2026-09-01): `regenerate` runs in the untrusted window and `publish` only
+  fingerprint-checks it, but the consumer's own checks on the PR head vouch
+  for it, and auto-merge waits for them; a hold only parks a PR nobody
+  notices. A consumer declaring `regenerate` owes its derived file such a
+  check (readmo's suite asserts its import map against the lockfile); the PR
+  body names the rebuilt file either way.
+- **The update job caches nothing.** On the default branch its saved cache
+  would restore into every workflow there, the consumer's `ci.yml` included,
+  so a packument a sudo lifecycle script forged would feed the next `npm ci`
+  ahead of the fingerprint. setup-node has no read-only mode, so `cache: npm`
+  is absent (gradle-update: `cache-read-only: true`; rust-update: no cache).
 - **The batch credential lives in an environment only the publish job
   declares.** A `workflow_call` secret reaches every job's runner (a runner
   holds a job's whole secrets context for log masking), the update job's
@@ -92,11 +84,10 @@ one that has stopped biting. Incident histories and long derivations live in
   publish declares `inputs.environment` (default `npm-update`), update
   declares none, the caller passes `secrets: inherit`, and `NPM_UPDATE_PAT`
   (or the `NPM_UPDATE_APP_*` pair) is set on that environment, not the
-  repository (`repo secrets --env npm-update` in mikelward/repo). The explicit
-  `secrets:` block is the legacy route and still works. `inherit` also sends
-  every OTHER repository-level secret to the update job, which is why
-  `repo audit` reports them: a consumer running this batch keeps its secrets
-  environment-scoped.
+  repository (`repo secrets --env npm-update` in mikelward/repo); the explicit
+  `secrets:` block is the legacy route. `inherit` also sends every OTHER
+  repository-level secret to the update job, so a consumer keeps its secrets
+  environment-scoped (`repo audit` reports the rest).
 
 ## Holding back only what is blocked
 
@@ -104,11 +95,9 @@ one that has stopped biting. Incident histories and long derivations live in
   crossing (`rolldown` taking `@oxc-project/types` 0.144 → 0.146) blocked
   every clean move for two weeks, with only a failed scheduled run to say so.
 - **The rebuild is incremental, not attributive**: from HEAD, re-resolve one
-  package at a time, validate after each, revert the ones that fail. That is
-  correct by construction (every accepted state validates, so the final one
-  does), where tracing a crossing to the direct dependency that "caused" it
-  is a guess under a hoisted or shared subdependency. It runs only in a week
-  the batch would otherwise have shipped nothing.
+  package at a time, validate after each, revert the ones that fail — correct
+  by construction, where blaming a direct dependency is a guess under a
+  hoisted subdependency. It runs only in a week that would ship nothing.
 - **The candidate set is the declared names PLUS every name the bulk resolve
   moved.** `npm update <name>` re-resolves one subtree, so a declared-only
   rebuild silently drops every transitive move and reports "0 transitive"
@@ -161,11 +150,11 @@ one that has stopped biting. Incident histories and long derivations live in
   both — names and npm's peer resolution, never copies matched across
   lockfiles, which lost pairs to every hoist or dedupe (maintainer's call,
   2026-09-26), at the cost that a pair is one group across workspaces. No
-  metadata says "must match" (react-dom 19.2.8's `^19.2.8` admits react 19.3.0); the three
-  conditions keep coincidental sharers (@babel/*) and lone movers
-  (@types/react) out. Members never go through the loop alone, a state that
-  splits a pair is refused, and the group re-apply falls back to one
-  peer-linked set at a time so a crossing pair can't sink a clean one.
+  metadata says "must match"; the three conditions keep coincidental sharers
+  (@babel/*) and lone movers (@types/react) out. Members never go through
+  the loop alone, a state that splits a pair is refused, and the group
+  re-apply falls back to one peer-linked set at a time so a crossing pair
+  can't sink a clean one.
   `publish` doesn't re-run it (it needs the bulk lockfile); a split is a
   broken batch the consumer's tests catch, not a trust failure.
 - **A week where everything is blocked fails loudly** — silence would be
@@ -288,9 +277,8 @@ one that has stopped biting. Incident histories and long derivations live in
   comments unasked, folding each fix into its commit, or defer a real
   out-of-scope finding (below). Judge each on merit: verify it, and if it
   doesn't hold, reply why and decline. A cited rule is a *reading* — check
-  what it says; an over-strict reading (privacy especially) costs real
-  capability, and a genuine rule-vs-code conflict is the maintainer's call,
-  not one to settle by quietly narrowing the code. Declining doesn't clear
+  what it says; an over-strict one (privacy especially) costs capability,
+  and a genuine rule-vs-code conflict is the maintainer's call. Declining doesn't clear
   the required `codex` status: post the rebuttal, then `@codex review` (or
   let the next push do it, if the rebuttal is up first); escalate if it
   re-raises. A hung review — nothing back five minutes after a push or
@@ -298,21 +286,18 @@ one that has stopped biting. Incident histories and long derivations live in
   poke that hangs the same way gets a second an hour later, and only a
   second that hangs too is escalated, never the first (maintainer,
   2026-10-22).
-- **Once Codex has +1'd a PR's head, never make an unnecessary change to it
-  without asking first** (maintainer, 2026-10-13): a to-do, tidy-up or extra
-  fix re-runs CI and Codex for nothing, so it waits for a yes or goes in a
-  follow-up PR. A necessary change goes ahead unasked — a rebase for a `dirty`
-  branch, or a `behind` one where the ruleset requires it up to date, a fix for
-  red CI.
+- **Once Codex has +1'd a PR's head, make no unnecessary change without
+  asking** (maintainer, 2026-10-13): a tidy-up re-runs CI and Codex for
+  nothing, so it waits for a yes or a follow-up PR. A necessary one goes
+  ahead unasked — a rebase for `dirty` (or `behind` where required), a
+  red-CI fix.
 - **A second verified finding in the same mechanism is evidence about the
-  design, not another bug.** Look for the same shape elsewhere before fixing
-  it, and ask whether a different design would delete the class rather than the
-  instance; a design change is the maintainer's call, not one to make solo.
-- **Restate every review finding in the next message you send, not just the
-  count**: one bullet each (review comment, top-level comment or review body),
-  most blocking first — what it claims, where, and what you did, or the
-  options where it's the maintainer's call — all in that one reply; ask only
-  the most blocking question.
+  design**: look for the shape elsewhere and ask whether a different design
+  deletes the class; that's the maintainer's call, not one to make solo.
+- **Restate every review finding in your next message, not just the count**:
+  one bullet each (review comment, top-level comment or review body), most
+  blocking first — claim, where, what you did or the maintainer's options;
+  ask only the most blocking question.
 - **Never leave a review thread silently dismissed** — every thread ends in a
   reply or a resolve.
 - **Deferring a real-but-out-of-scope finding**: don't ask the maintainer to
