@@ -4,358 +4,115 @@ alwaysApply: true
 last_modified: 2026-10-26
 ---
 
-# AGENTS.md
+# npm-update
 
-Conventions for AI agents working in this repository.
+The weekly npm dependency batch: a lockfile checker and the reusable update workflow that
+gedmap, newshacker and readmo call. **Consumers track `@main`**, so a merge reaches every
+consumer's next run. gradle-update and rust-update share the design: say when a fix has a
+twin there. `AGENTS-REFERENCE.md` has the history behind each rule.
 
-`CLAUDE.md` and `GEMINI.md` are symlinks to this file, so every agent reads
-the same conventions. Edit `AGENTS.md`.
+## Fleet conventions
 
-**At the start of every session, print the full absolute path of the `AGENTS.md` you
-loaded and its `last_modified` date** (front matter), so a stale or wrong copy is caught
-before it steers the work. Bump `last_modified` whenever you edit this file.
+Shared by every mikelward repo and the user-level agent config; canonical in mikelward/conf
+`agents/AGENTS.md`. A repo's Project section overrides it.
 
-This repository is the shared home of the weekly npm dependency batch: the
-lockfile major-crossing checker plus the full reusable update workflow,
-extracted from the per-repo copies gedmap, newshacker, and readmo used to
-run. Consumers track `@main`, so **a merge here reaches every consumer's
-weekly run with no release step in between.** Everything below follows from
-that.
+### This file
 
-Keep this file as short as it can be and still work, **under 22,000 bytes**
-(`wc -c AGENTS.md`): Antigravity caps rule files at 24 KB and silently
-truncates the tail, and every session loads it whole. Add a rule the first
-time something bites, say it once in the fewest words that carry the *why*,
-rewrite or trim an existing rule rather than appending beside it, and delete
-one that has stopped biting. Incident histories and long derivations live in
-`AGENTS-REFERENCE.md`, under the same headings.
+- **Session start**. At the start of every session, print the full absolute path of the
+  `AGENTS.md` you loaded and its `last_modified` date.
+- **Canonical**. AGENTS.md is canonical; `CLAUDE.md` and `GEMINI.md` point to it. Keep it
+  brief, generic to all agents (noting per-agent exceptions), and under 22,000 bytes.
+  Bump `last_modified` whenever you edit this file.
 
-## The extraction
+### Talking to the user
 
-- **gedmap, newshacker, and readmo all consume this repository now.** Their
-  per-repo `scripts/check-npm-update.mjs` and full
-  `.github/workflows/npm-update.yml` copies are retired; each keeps only a
-  thin caller plus the `with:` inputs it needs (readmo's
-  `regenerate`/`regenerated-files` for its Deno import map), so a fix here
-  reaches all three on their next scheduled run.
-- **A change that touches consumers goes through ONE of them first**, never
-  all at once: they share one automated reviewer, so a finding against a
-  change made three times is the same finding three times, and two more
-  chances to fix it in only some of them.
+- **Questions**. One at a time; wait for the answer.
+- **Messages**. Send one only for a question, a blocker, something to act on, or a change
+  of plan. No progress reports or narrating events.
+- **Claude Code**. It reliably shows only a turn's last message; put everything there.
+- **Replies**. Short, key point first, ending with open PR links and any pending
+  question.
+- **Network access**. If you want access to a host and you can't access it or a mirror,
+  ask the user to allowlist the domain(s) along with the purpose.
 
-## Trust model
+### Git
 
-- **The update job runs untrusted code; the publish job is what vouches for
-  a commit.** `npm update` executes arbitrary lifecycle scripts from whatever
-  the batch resolves, so `update` never holds the write token, and `publish`
-  — a fresh runner that installs nothing — is the only job that pushes, gated
-  on re-deriving the manifest diff itself and checking the fingerprints
-  `update` recorded before any install ran.
-- **`passed` is derived in `publish` from `checks.md`'s fingerprint-verified
-  content, never a boolean the untrusted step reports about itself** (it
-  emits none): publish's "Derive the check verdict from checks.md" step greps
-  for a `- ❌ ` line and fails closed on an empty or unrecognized file. A
-  separate boolean from the same step could diverge from it unnoticed.
-- **`checks.md`, `deps-stat.txt` and `holdback.md` keep a residual gap the
-  manifests don't have.** They and their fingerprints come from the untrusted
-  step (the manifests' are verified against a clean checkout), so a lifecycle
-  script's background process could rewrite a file and its fingerprint
-  together before the step exits. It can't merge code; `checks.md` is the
-  one thing left to forge; the other two gate nothing (an emptied
-  `holdback.md` is checkable against the diff). Closing it needs a clean
-  re-execution in `publish`, out of scope: read the PR body's check results
-  as evidence from the batch, not proof.
-- **A regenerated file auto-merges like any other batch** (maintainer,
-  2026-09-01): `regenerate` runs in the untrusted window and `publish` only
-  fingerprint-checks it, but the consumer's own checks on the PR head vouch
-  for it, and auto-merge waits for them; a hold only parks a PR nobody
-  notices. A consumer declaring `regenerate` owes its derived file such a
-  check (readmo's suite asserts its import map against the lockfile); the PR
-  body names the rebuilt file either way.
-- **The update job caches nothing.** On the default branch its saved cache
-  would restore into every workflow there, the consumer's `ci.yml` included,
-  so a packument a sudo lifecycle script forged would feed the next `npm ci`
-  ahead of the fingerprint. setup-node has no read-only mode, so `cache: npm`
-  is absent (gradle-update: `cache-read-only: true`; rust-update: no cache).
-- **The batch credential lives in an environment only the publish job
-  declares.** A `workflow_call` secret reaches every job's runner (a runner
-  holds a job's whole secrets context for log masking), the update job's
-  included; an environment secret reaches only the job declaring it. So
-  publish declares `inputs.environment` (default `npm-update`), update
-  declares none, the caller passes `secrets: inherit`, and `NPM_UPDATE_PAT`
-  (or the `NPM_UPDATE_APP_*` pair) is set on that environment, not the
-  repository (`repo secrets --env npm-update` in mikelward/repo); the explicit
-  `secrets:` block is the legacy route. `inherit` also sends every OTHER
-  repository-level secret to the update job, so a consumer keeps its secrets
-  environment-scoped (`repo audit` reports the rest).
+- **Branches**. `<agent>/<topic>` off a fresh `origin/main` (fetch by refspec). Never
+  commit to `main`.
+- **Your branches**. Push, force-push with lease, and delete them freely. Ask before
+  touching others', `main`, settings, secrets or paid services.
+- **Commits**. One per logical change; fold in review fixes.
+- **Subjects**. Changelog lines: imperative, the user-visible change, ≤ 70 chars. PR
+  titles match.
+- **Prefixes**. `docs:`, `test:`, `build:`, `refactor:` mark what users won't notice. No
+  `feat:` or `fix:`.
+- **Model names**. Never in anything pushed.
+- **After a merge**. Branch afresh.
+- **Shallow clones**. Unshallow before trusting history or calculating a version code.
+- **Language**. US English everywhere.
 
-## Holding back only what is blocked
+### Pull requests
 
-- **One package's breaking transitive move must not sink the batch**: one
-  crossing (`rolldown` taking `@oxc-project/types` 0.144 → 0.146) blocked
-  every clean move for two weeks, with only a failed scheduled run to say so.
-- **The rebuild is incremental, not attributive**: from HEAD, re-resolve one
-  package at a time, validate after each, revert the ones that fail — correct
-  by construction, where blaming a direct dependency is a guess under a
-  hoisted subdependency. It runs only in a week that would ship nothing.
-- **The candidate set is the declared names PLUS every name the bulk resolve
-  moved.** `npm update <name>` re-resolves one subtree, so a declared-only
-  rebuild silently drops every transitive move and reports "0 transitive"
-  (clothescast's first batch left a `form-data` security fix behind). A
-  transitive name writes to no manifest, so it is a fine argument to
-  `npm update`.
-- **A candidate is a name whose copies differ by PATH or by version**: copies
-  trading versions between lockfile paths leave the version multiset
-  identical. Being coarser than the PR-body summary is deliberate — an extra
-  candidate costs a no-op `npm update`, a missing one a move nothing reports.
-- **An unreadable lockfile on EITHER side degrades to the declared names** —
-  an empty map for one side would mark the whole tree moved, a registry
-  resolve each. "Unreadable" is `isWalkableLock`, the validator's own question
-  (no `packages` map, or no root record to seed the walk), since a diff the
-  walk rejects means nothing; a test asserts the two agree.
-- **`candidates` is read BEFORE the manifests go back to HEAD**: what the bulk
-  moved exists on disk only until the restore, and after it the list silently
-  collapses to the declared names, tests green unless one asserts a
-  transitive survived.
-- **It changes nothing about what gets trusted**: the step runs before any
-  dependency code (`--ignore-scripts`), and `publish` re-validates the final
-  diff from its own clean checkout, so a tampered checker copy can at worst
-  produce a batch publish refuses.
-- **The checker is fetched OUTSIDE the consumer's tree**, into
-  `$RUNNER_TEMP`, and that is load-bearing: checked out inside it, the
-  consumer's `npm test` ran this repository's `*.test.js` and titled the batch
-  CHECKS FAILING; outside, it needs no tree-check allowlist entry, so the
-  check that catches dependency code writing to the repository stays as tight.
-- **Restore every manifest, not the root pair**: `npm update --save` writes
-  into whichever manifest declares the dependency, workspaces' included;
-  `manifestPaths` names them.
-- **The loop's leftovers are re-applied as a group**: a package an installed
-  partner pins exactly (`vitest`, `@vitest/coverage-v8`) moves neither alone
-  nor with both named in one `npm update`, and fell out neither moved nor held
-  back. The bulk lockfile is kept aside; the checker's `dropped` mode names
-  what the bulk moved and the rebuild didn't; the declared part gets the
-  bulk's ranges written back and each member's lockfile record removed
-  (`unresolve` — a range already admitting the new version writes back
-  unchanged, and `npm install` would keep HEAD's copies), then one bare
-  `npm install` places them afresh, validated like any loop step. What still
-  fails, a dropped transitive (one line naming them all), or a member left
-  at HEAD goes in `holdback.md` — except a transitive reachable only through a
-  held-back record (its line covers it) or under an optional dependency the
-  runner doesn't install (`isInstallable`), which aren't moves. The test runs
-  the real step against a lockfile-driven fake npm: the failure is the loop
-  finishing green with a package missing.
-- **Packages released in lockstep move together or not at all**
-  (`lockstepPairs`): two names where every copy of one resolves its peer, the
-  other, at its own version, at HEAD and after the bulk, and the bulk moved
-  both — names and npm's peer resolution, never copies matched across
-  lockfiles, which lost pairs to every hoist or dedupe (maintainer's call,
-  2026-09-26), at the cost that a pair is one group across workspaces. No
-  metadata says "must match"; the three conditions keep coincidental sharers
-  (@babel/*) and lone movers (@types/react) out. Members never go through
-  the loop alone, a state that splits a pair is refused, and the group
-  re-apply falls back to one peer-linked set at a time so a crossing pair
-  can't sink a clean one.
-  `publish` doesn't re-run it (it needs the bulk lockfile); a split is a
-  broken batch the consumer's tests catch, not a trust failure.
-- **A week where everything is blocked fails loudly** — silence would be
-  indistinguishable from "nothing to update", the failure this pass exists to
-  end.
+- **Opening**. Open the PR unasked; update its title and body before each push.
+- **Watching**. PR events plus one scheduled check (events miss CI success and Codex's
+  👍).
+- **Auto-merge**. Enable it on PRs that target `main`; stack dependent ones.
+- **Base moved**. After a merge, tell open PRs on that base whose body ends with a session
+  URL.
+- **Merge or close**. Answer remaining threads and stop watching.
 
-## Ordering inside the update job
+### Reviews
 
-- **The regenerate hook runs between the install and the rest of the
-  checks**: after the suite, a consumer whose tests assert a derived file
-  matches the lockfile (readmo) failed them on every batch moving a pinned
-  package — `CHECKS FAILING` on a branch whose own CI passed. A suite that
-  cries wolf on every real batch is the one nobody reads.
-- **The install is therefore its own step, and still a reported check**: its
-  verdict travels as a step output, prepended to the report, so `checks.md`
-  holds all four checks exactly once, as publish's verdict step requires (a
-  dropped hand-off would close every batch).
-- **Fingerprint-then-check still brackets the derived files**: fingerprinted
-  in the step that produces them and re-verified after lint/test/build, so a
-  later check that rewrites one is still caught.
+- **Codex**. It reviews automatically. Fix, decline with a reason, or defer to `TODO.md`
+  every comment; reply citing the commit, then resolve.
+- **Merit**. Codex over-reads rules, privacy especially: quote and decline rather than
+  cripple the code. Design changes are the user's call.
+- **Verdict**. 👍 is clean, 👀 is reviewing. Only the code review gates merging: its
+  findings (review comments, PR comments, reviews) block it. Security reviews often
+  hang; don't wait on them.
+- **Hung review**. `@codex review` after five quiet minutes, again an hour later, then
+  tell the user.
+- **After a 👍**. Ask before unneeded changes.
+- **Reports**. Give each review's findings in your next message.
 
-## A guard that fires on every run is a broken guard
+### Autonomy
 
-- **The ignored-file check has to be declarable** (`ignored-build-outputs`),
-  or the consumer it fires on publishes nothing: clothescast's gitignored
-  `functions/lib/` aborted every weekly batch for months, and nothing alerts
-  on a failing scheduled workflow, so the symptom was silence.
-- **A declared path is data, so compare it as a whole record**: spliced into
-  `grep -E`, a metacharacter widens it to paths nobody declared (as in the
-  regenerated-files loop).
-- **Filter declared entries BEFORE stripping the outside-directory marker**:
-  an entry outside `working-directory` carries a trailing tab so a bare name
-  can't satisfy the allowlist meant for the one inside it; filter after the
-  strip and a repository-root `lib/` passes on a `functions/lib/`
-  declaration. A test plants exactly that.
+- **Fix proactively**. Lint, test, presubmit, CI and review failures, unasked.
+- **Proactive refactors**. Repeated bugs in one area, duplicated code, or a change with
+  twins elsewhere: suggest the redesigned or shared version.
+- **Drive to merge**. Once the details are agreed, see the change through unattended:
+  implement it, open the PR, keep it mergeable (fix CI, answer reviews, rebase when it
+  conflicts or falls behind), and merge once CI is green and Codex 👍s, or let
+  auto-merge.
+- **Drive**. Take `TODO.md` items one at a time and drive each to merge, until done or
+  stopped.
+- **Autopilot**. Drive without asking, logging guesses in `TODO.md` under *Decisions
+  needing review*. Still ask before anything irreversible, outside this repo, or private.
+- **Red baseline**. Fix existing failures first, in their own commit.
 
-## Who opens the pull request
+### Quality
 
-- **A PR opened by `GITHUB_TOKEN` starts no `on: pull_request` workflow**, so
-  each required check must be dispatched by name (two hard-coded, plus
-  `dispatch-workflows`), and one nobody named holds the batch open forever on
-  a status nothing produces (readmo's `zizmor`).
-- **The `token` / `app-id` credential closes that class**, where
-  `dispatch-workflows` closes one name at a time: opened as a real
-  collaborator, the ordinary `pull_request` round runs, checks added later
-  included. Both stay — the dispatches are the no-credential fallback and
-  harmless once redundant.
-- **The credential goes to the publish job only**, which installs nothing and
-  runs no dependency code — the whole reason a stronger credential is safe
-  there; the update job keeps its read-only `GITHUB_TOKEN`, and a test asserts
-  it names none of the three secrets, or an unreviewed package gets a token
-  that can push to `main`.
-- **The PR body says which checks actually ran**: under `GITHUB_TOKEN`, "CI
-  does not start here on its own, so this job dispatched it"; as a
-  collaborator, the ordinary round ran. The wrong sentence (or a
-  dispatch-failure note) misreports what verified the batch.
-- **The dispatches stay on `GITHUB_TOKEN` deliberately**: a dispatch is an
-  Actions API write the minted App token (contents and pull-requests only)
-  can't make; this keeps them working under every credential and a
-  consumer's PAT to the two scopes authorship uses.
+- **Tests**. Every behavior change gets one; a bug fix's fails first. Assert behavior,
+  not structure. No sleeps or retries; never disable a failing check.
+- **Docs**. Keep `SPEC.md` and `README.md` current.
+- **CI**. Wait for it before claiming success.
+- **Errors**. Never swallow one; log it with context and clean up.
+- **Cost**. State the cost and reliability of new dependencies or services up front.
+- **Privacy**. No user data (personal paths, hostnames, tokens, keys, private remotes)
+  leaves this machine; use placeholders.
+- **Portability**. Flag anything that won't run on Linux and macOS.
 
-## What this repository must not grow
+## Project
 
-- **No dependencies. No `package.json`, no lockfile, no build step.** What a
-  consumer's workflow runs is the source here, which is what makes an
-  unpinned `@main` reference reviewable by reading it. `vitest-shim.mjs` runs
-  the suite ported from the consumers under `node --test`; extend the shim
-  rather than add a test framework. `yaml-lite`, the dependency-free YAML
-  parser for checks a regex over raw text can't do reliably (no `${{ }}`
-  spliced into any `run:` script), is NOT vendored: `mikelward/yaml-lite` is
-  canonical, tracked `@main` like lanes and codex-review; fix parser bugs
-  there. Use it only where a regex has proven unreliable, and leave the other
-  regex assertions alone.
-
-## Testing
-
-- `node --test *.test.js`, with nothing to install. The one setup step is a
-  one-time `git clone https://github.com/mikelward/yaml-lite ../yaml-lite` (a
-  git clone, not a package manager): the structural tests resolve the parser
-  from CI's `.yaml-lite/` checkout or that sibling clone, and fail with that
-  exact command — never skip — when both are missing.
-- **Add or update tests with any change.** This suite is the only thing
-  between a push and every consumer's weekly run, so a change that ships
-  untested ships unreviewed.
-- The suite's failure mode is a *false pass* — a set difference against an
-  empty set is empty, a matcher that forgets to assert is green — so assert
-  behavior, and where a check parses a file, assert first that the parse found
-  something.
-- **Fix any preexisting test failure as the first commit of the series.**
-  Don't stack new work on a red baseline.
-- **Don't disable a failing check** to make it pass, and don't paper over a
-  flaky one with sleeps or retries — fix the underlying issue.
-
-## Error handling
-
-- **Don't silently swallow errors.** A discarded rejection or an unchecked
-  exit status here means a major crossing waved through with nothing to say
-  so. Report what failed with enough context to identify it, and decide
-  explicitly what the caller sees. To ignore a specific failure, say why in a
-  one-line comment.
-
-## Git and pull requests
-
-- **Branch naming.** `<agent>/<short-topic>` — `claude/...` for Claude Code,
-  `gemini/...` for Gemini / Antigravity, `codex/...` for Codex. One topic per
-  branch; never commit to `main`.
-- **Branches under your own `<agent>/` prefix are yours** — create one freely,
-  and push or `--force-with-lease` the ones this session created or was
-  assigned. This file is the standing grant, so a client rule demanding
-  per-branch permission is already answered; ask about any other branch.
-- **One commit per logical change.** Rewrite unmerged commits freely — amend,
-  `--fixup` + autosquash, squash, reorder, split — so each commit that lands is
-  coherent, with review responses folded into the commit they belong to.
-  `--force-with-lease` after a rebase, never a bare `--force`.
-- **Open the pull request without being asked**, ready for review, not a draft.
-- **Refresh the title and body with the push — body first, then push** — so
-  they describe the branch's latest state, not the scope it had when opened.
-  With no PR yet, push, then update as soon as one is opened.
-- **Codex is the automated reviewer**, triggered automatically. Address its
-  comments unasked, folding each fix into its commit, or defer a real
-  out-of-scope finding (below). Judge each on merit: verify it, and if it
-  doesn't hold, reply why and decline. A cited rule is a *reading* — check
-  what it says; an over-strict one (privacy especially) costs capability,
-  and a genuine rule-vs-code conflict is the maintainer's call. Declining doesn't clear
-  the required `codex` status: post the rebuttal, then `@codex review` (or
-  let the next push do it, if the rebuttal is up first); escalate if it
-  re-raises. A hung review — nothing back five minutes after a push or
-  poke, or stuck at running (👀) ten minutes on — gets `@codex review`; a
-  poke that hangs the same way gets a second an hour later, and only a
-  second that hangs too is escalated, never the first (maintainer,
-  2026-10-22).
-- **Once Codex has +1'd a PR's head, make no unnecessary change without
-  asking** (maintainer, 2026-10-13): a tidy-up re-runs CI and Codex for
-  nothing, so it waits for a yes or a follow-up PR. A necessary one goes
-  ahead unasked — a rebase for `dirty` (or `behind` where required), a
-  red-CI fix.
-- **A second verified finding in the same mechanism is evidence about the
-  design**: look for the shape elsewhere and ask whether a different design
-  deletes the class; that's the maintainer's call, not one to make solo.
-- **Restate every review finding in your next message, not just the count**:
-  one bullet each (review comment, top-level comment or review body), most
-  blocking first — claim, where, what you did or the maintainer's options;
-  ask only the most blocking question.
-- **Never leave a review thread silently dismissed** — every thread ends in a
-  reply or a resolve.
-- **Deferring a real-but-out-of-scope finding**: don't ask the maintainer to
-  merge past it — note it in `TODO.md`, commit and push that first, reply on
-  the thread citing the sha, and resolve. A finding with no thread (top-level
-  comment or review body) still gets the record, push and reply; only the
-  resolve is skipped. The push re-triggers Codex, so don't also poke it unless
-  it hangs, as above; escalate if the re-review re-raises it.
-
-## Language and spelling
-
-- Use **US English** everywhere people read English: prose, commit subjects and
-  bodies, pull request titles and descriptions, comments, and identifiers —
-  `behavior` not `behaviour`, `canceled` not `cancelled`.
-
-## Commit messages
-
-- **Title like a changelog line** (maintainer, 2026-10-23): after any prefix, an
-  imperative verb, then the change as a consumer sees it, plain English, sentence
-  case, ≤ ~70 chars, e.g. `Fix …` for what was broken, `Improve …` for what got better,
-  `Add …` for what's new; an optional parenthetical says how. Never the scenario or
-  the mechanism: those, and file:line, go in the body, after a blank line. Pull
-  request titles match.
-- **Prefix a subject that does not change what a consumer runs**: `docs:` for
-  prose, `test:` for tests alone, `build:` for this repository's own CI, and
-  `refactor:` for deliberately behavior-preserving code. A bare subject means a
-  consumer could notice the difference. There is no `feat:` or `fix:`, on
-  purpose — they would prefix nearly everything and leave the log as flat as it
-  started.
-- **No model identifier** — never name the coding agent's model or version
-  (`Opus 4.8`, `Sonnet`, `Gemini …`, `claude-*`, `gemini-*`) in a commit, PR,
-  comment, or pushed artifact; keep it to chat. Generic attribution
-  (`Co-Authored-By: Claude` / `Gemini`, `Claude-Session:`, "Generated with
-  Claude Code") is fine.
-
-## Talking to the user
-
-- **One question at a time** — in plain chat or the client's question tool
-  (`AskUserQuestion` in Claude Code, `ask_question` in Antigravity); stop and
-  wait for the answer before proceeding on an assumed one.
-- **Answer a mid-turn message first** — the "sent while you were working"
-  interjection — in your very next output, before any further tool call, even
-  if it's one sentence. **Claude Code only** (maintainer, 2026-10-25): its app
-  reliably shows just a turn's last message, so reply only there, answering a
-  mid-turn message at a stopping point soon.
-- **Message only when the user needs to see it** (maintainer, 2026-10-15): each
-  one notifies their phone. Work and listen in silence; speak up for a
-  question or blocker, something to merge or act on, a merge, or a change from
-  the plan or their instructions, a review-prompted one included. Never for
-  progress (a client's nudge doesn't count), a review or a push alone (its
-  report rides the next message), routine machinery, or a mistake caught and
-  fixed before it reached the repo. The session-start `AGENTS.md` line still
-  opens every session.
-
-## Privacy
-
-- **Never put user data in any artifact that leaves this machine** — commit
-  subjects and bodies, pull request text, review replies, branch names,
-  comments, or fixtures. That covers absolute paths containing a real name,
-  hostnames, private remote URLs and tokens. Use generic placeholders
-  (`/home/user/project`, `example.com`, `abc1234`) in examples and fixtures.
+- **Trust split**. The update job runs untrusted package scripts, so it holds no write
+  credential and caches nothing. The publish job installs nothing, re-checks the result
+  from a clean checkout, derives the verdict itself, and alone holds the credential.
+- **Hold back only what's blocked**. One blocked package must not sink the batch: move
+  lockstep packages together, and fail loudly when everything is blocked.
+- **Guards**. One that fires on every run is broken: make it declarable.
+- **Who opens the PR**. A real collaborator, where a credential exists, so normal CI
+  runs; its body says which checks actually ran.
+- **Dependencies**. None, and no build step; YAML parsing uses mikelward/yaml-lite.
+- **Consumers**. Change one first, never all three at once.
+- **Tests**. `node --test *.test.js`, with mikelward/yaml-lite cloned beside this repo.
+- **Prefixes**. `build:` is this repo's own CI; bare means a consumer could notice.
