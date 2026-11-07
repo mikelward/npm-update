@@ -440,7 +440,7 @@ describe('lockfileFailures', () => {
     }
     const after = {
       ...root({ a: '^1.0.0' }),
-      'node_modules/a': pkg('1.1.0', { foo: '^2.0.0-beta.1' }),
+      'node_modules/a': pkg('1.1.0', { foo: '2.0 - 2.9' }),
       'node_modules/foo': pkg('1.5.0'),
     }
     const failures = lockfileFailures(before, after)
@@ -481,7 +481,7 @@ describe('lockfileFailures', () => {
     // the strength of an uncertain one is the wrong direction here.
     const before = {
       ...root({ a: '^1.0.0' }),
-      'node_modules/a': pkg('1.0.0', { foo: '>1.0' }),
+      'node_modules/a': pkg('1.0.0', { foo: '1.0 - 1.9' }),
       'node_modules/foo': pkg('1.5.0'),
     }
     const after = {
@@ -501,12 +501,12 @@ describe('lockfileFailures', () => {
     // npm accepts the old fit here and rejects the new one.
     const before = {
       ...root({ a: '^1.0.0' }),
-      'node_modules/a': pkg('1.0.0', { foo: '^1.0.0-beta.1' }),
+      'node_modules/a': pkg('1.0.0', { foo: '1.0 - 1.9' }),
       'node_modules/foo': pkg('1.5.0'),
     }
     const after = {
       ...root({ a: '^1.0.0' }),
-      'node_modules/a': pkg('1.1.0', { foo: '^2.0.0-beta.1' }),
+      'node_modules/a': pkg('1.1.0', { foo: '2.0 - 2.9' }),
       'node_modules/foo': pkg('1.5.0'),
     }
     const failures = lockfileFailures(before, after)
@@ -520,7 +520,7 @@ describe('lockfileFailures', () => {
     // resolution is never put to the fit check at all.
     const tree = {
       ...root({ a: '^1.0.0' }),
-      'node_modules/a': pkg('1.0.0', { foo: '>= 1.0.0 < 3' }),
+      'node_modules/a': pkg('1.0.0', { foo: '1.0 - 2.9' }),
       'node_modules/foo': pkg('1.5.0'),
     }
     expect(lockfileFailures(tree, { ...tree })).toEqual([])
@@ -829,8 +829,9 @@ describe('lockfileFailures', () => {
     // Fail closed, as everywhere else here: a range this job cannot model
     // arriving over one it could is exactly where a silent pass would hide
     // the pin. `>=2.0.0` used to stand here and is modeled now, so it was
-    // asserting the definite-misfit branch under this name; a prerelease-
-    // carrying range is genuinely outside the grammar.
+    // asserting the definite-misfit branch under this name, and so are
+    // prerelease and partial comparators now; a hyphen range with partial
+    // bounds is still outside the grammar.
     const before = {
       ...root({ a: '^1.0.0' }),
       'node_modules/a': pkg('1.0.0', { foo: '^1.0.0' }),
@@ -838,7 +839,7 @@ describe('lockfileFailures', () => {
     }
     const after = {
       ...root({ a: '^1.0.0' }),
-      'node_modules/a': pkg('1.1.0', { foo: '^2.0.0-beta.1' }),
+      'node_modules/a': pkg('1.1.0', { foo: '2.0 - 2.9' }),
       'node_modules/foo': pkg('1.5.0'),
     }
     const failures = lockfileFailures(before, after)
@@ -3496,10 +3497,9 @@ describe('satisfiesRange', () => {
     expect(satisfiesRange('1.5.0+build.1', '^2.0.0')).toBe(false)
   })
 
-  it('answers a definite no for a prerelease, not a refusal', () => {
+  it('answers a definite no for a prerelease no comparator names', () => {
     // npm admits a prerelease only when some comparator carries one on the
-    // same numeric core, and `parseRange` accepts nothing but plain X.Y.Z
-    // forms — so no range reaching that code can ever admit one.
+    // same numeric core.
     expect(satisfiesRange('1.5.0-beta.1', '^1.0.0')).toBe(false)
     expect(satisfiesRange('1.5.0-beta.1', '1.5.0')).toBe(false)
   })
@@ -3507,9 +3507,8 @@ describe('satisfiesRange', () => {
   it('lets a union arm reject a prerelease without ending the range', () => {
     // An arm that contains the version numerically but carries no prerelease
     // comparator rejects it — that arm, not the range. npm takes the second
-    // arm of `^1 || ^1.2.3-beta.1` here; this job cannot model it, so the
-    // honest answer is a refusal, not a confident no.
-    expect(satisfiesRange('1.2.3-beta.2', '^1 || ^1.2.3-beta.1')).toBe(null)
+    // arm of `^1 || ^1.2.3-beta.1` here.
+    expect(satisfiesRange('1.2.3-beta.2', '^1 || ^1.2.3-beta.1')).toBe(true)
     // A range with no prerelease-carrying arm anywhere is still a definite no.
     expect(satisfiesRange('1.2.3-beta.2', '^1')).toBe(false)
     expect(satisfiesRange('1.5.0-beta.1', '*')).toBe(false)
@@ -3554,8 +3553,10 @@ describe('satisfiesRange', () => {
     // null is "cannot decide", never a pass — the caller is what turns it
     // into a refusal.
     expect(satisfiesRange('1.2.3', '1.0 - 2.0')).toBe(null)
-    expect(satisfiesRange('1.2.3', '>1.2')).toBe(null)
-    expect(satisfiesRange('1.2.3', '>=1.0.0-beta.1')).toBe(null)
+    expect(satisfiesRange('1.2.3', '1.0.0-rc.1 - 2.0.0')).toBe(null)
+    expect(satisfiesRange('1.2.3', 'v1.2.3')).toBe(null)
+    expect(satisfiesRange('1.2.3', '^1.2.3+build')).toBe(null)
+    expect(satisfiesRange('1.2.3', '>=1.2-beta')).toBe(null)
     expect(satisfiesRange('1.2.3', 'npm:other@^1.0.0')).toBe(null)
     expect(satisfiesRange('not-a-version', '^1.0.0')).toBe(null)
   })
@@ -3586,6 +3587,94 @@ describe('satisfiesRange', () => {
     expect(satisfiesRange('1.0.0', '1.0.0 - 2.0.0')).toBe(true)
     expect(satisfiesRange('2.0.0', '1.0.0 - 2.0.0')).toBe(true)
     expect(satisfiesRange('2.5.0', '1.0.0 - 2.0.0')).toBe(false)
+  })
+
+  it('reads a partial comparator the way npm desugars it', () => {
+    // `@testing-library/jest-dom` peers on `vitest >= 0.32`. Refusing it
+    // held every vitest release back, every week, in every consumer.
+    expect(satisfiesRange('5.1.0', '>= 0.32')).toBe(true)
+    expect(satisfiesRange('0.31.9', '>= 0.32')).toBe(false)
+    expect(satisfiesRange('0.32.0', '>= 0.32')).toBe(true)
+    // `>1.2` is `>=1.3.0`, not `>1.2.0`.
+    expect(satisfiesRange('1.2.5', '>1.2')).toBe(false)
+    expect(satisfiesRange('1.3.0', '>1.2')).toBe(true)
+    expect(satisfiesRange('2.0.0', '>1')).toBe(true)
+    expect(satisfiesRange('1.9.9', '>1')).toBe(false)
+    // `<1.2` is `<1.2.0-0`, and `<=1.2` is `<1.3.0-0`.
+    expect(satisfiesRange('1.1.9', '<1.2')).toBe(true)
+    expect(satisfiesRange('1.2.0', '<1.2')).toBe(false)
+    expect(satisfiesRange('1.2.9', '<=1.2')).toBe(true)
+    expect(satisfiesRange('1.3.0', '<=1.2')).toBe(false)
+    expect(satisfiesRange('1.2.9', '=1.2')).toBe(true)
+    expect(satisfiesRange('1.3.0', '=1.2')).toBe(false)
+    // A wildcard comparator: `<*` and `>*` admit nothing, `>=*` everything.
+    expect(satisfiesRange('1.0.0', '<*')).toBe(false)
+    expect(satisfiesRange('1.0.0', '>*')).toBe(false)
+    expect(satisfiesRange('1.0.0', '>=*')).toBe(true)
+  })
+
+  it('reads a range that names a prerelease the way npm does', () => {
+    // `@rolldown/plugin-babel` peers on `rolldown ^1.0.0-rc.5`, written
+    // before 1.0.0 shipped. It is `>=1.0.0-rc.5 <2.0.0-0`: every 1.x release
+    // fits, and refusing it held every rolldown release back.
+    expect(satisfiesRange('1.2.16', '^1.0.0-rc.5')).toBe(true)
+    expect(satisfiesRange('2.0.0', '^1.0.0-rc.5')).toBe(false)
+    expect(satisfiesRange('8.1.0', '^7.29.0 || ^8.0.0-rc.1')).toBe(true)
+    expect(satisfiesRange('9.0.0', '^7.29.0 || ^8.0.0-rc.1')).toBe(false)
+    expect(satisfiesRange('1.2.3', '>=1.0.0-beta.1')).toBe(true)
+    expect(satisfiesRange('0.9.0', '>=1.0.0-beta.1')).toBe(false)
+    expect(satisfiesRange('1.2.9', '~1.2.3-beta.2')).toBe(true)
+    expect(satisfiesRange('1.3.0', '~1.2.3-beta.2')).toBe(false)
+  })
+
+  it('admits a prerelease only on the core a comparator names', () => {
+    // npm hands out a prerelease only to someone who named one on that
+    // exact version: a later candidate of 1.0.0, never a 1.3.0 beta.
+    expect(satisfiesRange('1.0.0-rc.6', '^1.0.0-rc.5')).toBe(true)
+    expect(satisfiesRange('1.0.0-rc.5', '^1.0.0-rc.5')).toBe(true)
+    expect(satisfiesRange('1.0.0-rc.4', '^1.0.0-rc.5')).toBe(false)
+    expect(satisfiesRange('1.3.0-beta.1', '^1.0.0-rc.5')).toBe(false)
+    expect(satisfiesRange('1.0.0-rc.1', '1.0.0-rc.1')).toBe(true)
+    expect(satisfiesRange('1.0.0-rc.2', '1.0.0-rc.1')).toBe(false)
+    // The core may come from any comparator in the disjunct.
+    expect(satisfiesRange('1.2.3-beta.2', '>=1.2.3-beta.1 <2.0.0')).toBe(true)
+  })
+
+  it('orders prerelease identifiers by semver precedence', () => {
+    // Numeric identifiers compare as numbers (rc.10 after rc.5, not before),
+    // rank below alphanumeric ones, and a shorter list ranks first.
+    expect(satisfiesRange('1.0.0-rc.10', '>=1.0.0-rc.5')).toBe(true)
+    expect(satisfiesRange('1.0.0-rc.5', '>=1.0.0-rc.10')).toBe(false)
+    expect(satisfiesRange('1.0.0-1', '>=1.0.0-alpha')).toBe(false)
+    expect(satisfiesRange('1.0.0-alpha', '>=1.0.0-1')).toBe(true)
+    expect(satisfiesRange('1.0.0-beta', '>=1.0.0-beta.1')).toBe(false)
+    expect(satisfiesRange('1.0.0-beta.1', '>=1.0.0-beta')).toBe(true)
+    expect(satisfiesRange('1.0.0-beta.11', '>=1.0.0-beta.2')).toBe(true)
+    // A release outranks every prerelease of its core.
+    expect(satisfiesRange('1.0.0', '>1.0.0-rc.5')).toBe(true)
+    expect(satisfiesRange('1.0.0-rc.9', '<1.0.0')).toBe(false)
+    expect(satisfiesRange('1.0.0-rc.9', '>=1.0.0-rc.1 <1.0.0')).toBe(true)
+  })
+
+  it('collapses a range to * when any disjunct admits every release', () => {
+    // npm's own quirk, and the dangerous direction to miss: `* || >=1.2.3-
+    // beta` admits no prerelease at all, so the named arm must not pass one.
+    expect(satisfiesRange('1.2.3-beta.2', '* || >=1.2.3-beta')).toBe(false)
+    expect(satisfiesRange('1.2.3-beta.2', '>=1.2.3-beta || >=0')).toBe(false)
+    expect(satisfiesRange('1.2.3', '>=1.2.3-beta || x.x')).toBe(true)
+    // An arm naming a 0.0.0 prerelease is not a match-all one.
+    expect(satisfiesRange('0.0.0-rc.1', '>=0.0.0-0')).toBe(true)
+  })
+
+  it('drops a prerelease written after a wildcard, as npm does', () => {
+    // `*.*.*-beta` is `*` and `1.x.x-beta` is `1.x`. Refusing them hid a
+    // match-all arm from the collapse above, so the named arm beside it
+    // passed a prerelease npm rejects.
+    expect(satisfiesRange('1.2.3-beta.2', '*.*.*-beta || >=1.2.3-beta.1')).toBe(false)
+    expect(satisfiesRange('1.2.3', '*.*.*-beta')).toBe(true)
+    expect(satisfiesRange('1.5.0', '1.x.x-beta')).toBe(true)
+    expect(satisfiesRange('2.0.0', '1.x.x-beta')).toBe(false)
+    expect(satisfiesRange('1.2.0-beta', '1.2.x-beta')).toBe(false)
   })
 
   it('lets one modelable disjunct answer past one it cannot model', () => {

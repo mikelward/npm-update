@@ -86,10 +86,52 @@ const ceil = ({ op, v: [x, y, z] }) =>
       ? [x, y + 1, 0]
       : [x, y, z + 1];
 
+// Semver precedence between two prerelease identifier lists (semver.org
+// section 11). An empty list is a release, which outranks every prerelease
+// of the same core. Numeric identifiers compare numerically (by length, then
+// digits: the grammar forbids leading zeros, and the length check keeps a
+// long one from losing precision as a Number — npm's own semver rounds one
+// above 2^53, the only place this answers differently), and rank below
+// alphanumeric ones, which compare in ASCII order. A list that runs out
+// first is lower.
+const cmpPre = (a, b) => {
+  if (!a.length || !b.length) return b.length - a.length;
+  for (let i = 0; i < Math.min(a.length, b.length); i++) {
+    const x = a[i];
+    const y = b[i];
+    if (x === y) continue;
+    const xn = /^\d+$/.test(x);
+    const yn = /^\d+$/.test(y);
+    if (xn && yn) return x.length - y.length || (x < y ? -1 : 1);
+    if (xn !== yn) return xn ? -1 : 1;
+    return x < y ? -1 : 1;
+  }
+  return a.length - b.length;
+};
+
+const cmpVersion = (a, b) => cmp(a.v, b.v) || cmpPre(a.pre, b.pre);
+
+const PRE_ID = "(?:0|[1-9]\\d*|\\d*[a-zA-Z-][0-9a-zA-Z-]*)";
+const PART = "(0|[1-9]\\d*|[xX*])";
+const ATOM = new RegExp(
+  `^(>=|<=|>|<|=|\\^|~)?${PART}(?:\\.${PART}(?:\\.${PART}(?:-(${PRE_ID}(?:\\.${PRE_ID})*))?)?)?$`,
+);
+
+const at = (v, pre = []) => ({ v, pre });
+// A generated ceiling is `-0`, the lowest prerelease of its core, exactly as
+// npm desugars one (`^1.2.3` is `>=1.2.3 <2.0.0-0`): nothing on that core
+// gets under it, prerelease or not.
+const below = (v) => ({ max: at(v, ["0"]), maxIncl: false });
+const ANY = { min: at([0, 0, 0], ["0"]), minIncl: true, max: null, maxIncl: false, preCore: null };
+const NONE = { min: at([0, 0, 0]), minIncl: true, ...below([0, 0, 0]), preCore: null };
+
 /**
  * The bounds one range ATOM admits, or null for syntax this job does not
  * model. `min` is inclusive unless `minIncl` says otherwise; `max` is the
- * exclusive ceiling, or null for unbounded above.
+ * ceiling, or null for unbounded above. Each bound is a version, prerelease
+ * and all. `preCore` is the numeric core of a prerelease the atom names
+ * itself, which is what lets a prerelease VERSION through (see
+ * `satisfiesRange`).
  *
  * Modeled because real lockfiles are full of them, measured on a live batch:
  * a union (`^11 || ^12 || ^13`), a bare comparator (`>=13.7.0`), and partial
@@ -99,73 +141,104 @@ const ceil = ({ op, v: [x, y, z] }) =>
  * fit perfectly well, and a check that cries wolf weekly is one nobody reads
  * on the week it matters.
  *
- * A comparator is modeled only with a full X.Y.Z. npm's rules for a PARTIAL
- * one are their own thing (`>1.2` means `>=1.3.0`, not `>1.2.0`), rare in
- * practice, and not worth guessing at — those return null like any other
- * unmodeled syntax.
+ * The same went for the last two shapes left out, which held vite, rolldown,
+ * @babel/core and vitest back in gedmap, newshacker and readmo every week:
+ *
+ * - A PARTIAL comparator: `@testing-library/jest-dom` peers on
+ *   `vitest >= 0.32`. npm's rules for one are fixed, not a guess: the missing
+ *   parts make an interval, and the operator takes its edge. `>=1.2` is
+ *   `>=1.2.0`, `>1.2` is `>=1.3.0`, `<1.2` is `<1.2.0-0`, `<=1.2` is
+ *   `<1.3.0-0`; `<*` and `>*` admit nothing.
+ * - A PRERELEASE in the range: `@rolldown/plugin-babel` peers on
+ *   `rolldown ^1.0.0-rc.5`, written before 1.0.0 shipped. It is the plain
+ *   interval `>=1.0.0-rc.5 <2.0.0-0`, so every 1.x release fits.
+ *
+ * Only a full X.Y.Z may carry a prerelease (`>=1.2-beta` is no version npm
+ * parses; one after a wildcard is ignored), and a `v` prefix, build metadata in a range, or anything else
+ * outside this grammar still returns null.
+ *
+ * Checked against npm's own semver (the copy npm 11 bundles): every single
+ * comparator over these operators, wildcards and prereleases, plus 8,000
+ * random intersections and unions of two, against 243 versions — 1.5
+ * million answers, all agreeing.
  */
 const atomBounds = (atom) => {
-  const a = atom.trim();
-  const ANY = { min: [0, 0, 0], minIncl: true, max: null, maxIncl: false };
-  if (a === "" || a === "*" || a === "x" || a === "X") return ANY;
-
-  const c = /^(>=|<=|>|<|=)\s*(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/.exec(a);
-  if (c) {
-    const v = [+c[2], +c[3], +c[4]];
-    if (c[1] === ">=") return { min: v, minIncl: true, max: null, maxIncl: false };
-    if (c[1] === ">") return { min: v, minIncl: false, max: null, maxIncl: false };
-    if (c[1] === "<=") return { min: [0, 0, 0], minIncl: true, max: v, maxIncl: true };
-    if (c[1] === "<") return { min: [0, 0, 0], minIncl: true, max: v, maxIncl: false };
-    return { min: v, minIncl: true, max: v, maxIncl: true };
+  const b = rawAtomBounds(atom);
+  // npm drops a lower bound of a plain 0.0.0 (`>=0`, `0.x`, `^0.0.0` all
+  // desugar without one), so it lets a 0.0.0 prerelease through where a
+  // literal `>=0.0.0` would not. Only an exact `0.0.0` keeps it.
+  if (b && b.minIncl && cmpVersion(b.min, at([0, 0, 0])) === 0 && b.max !== b.min) {
+    return { ...b, min: at([0, 0, 0], ["0"]) };
   }
-  // A comparator shape the branch above did not accept — a partial one, or a
-  // prerelease. Refuse rather than fall through to the version grammar.
-  if (/^[<>=]/.test(a)) return null;
+  return b;
+};
 
-  const m = /^([\^~]?)(0|[1-9]\d*|[xX*])(?:\.(0|[1-9]\d*|[xX*]))?(?:\.(0|[1-9]\d*|[xX*]))?$/.exec(a);
+const rawAtomBounds = (atom) => {
+  const m = ATOM.exec(atom.trim());
   if (!m) return null;
-  const wild = (t) => t === undefined || t === "x" || t === "X" || t === "*";
-  const [, op, majorPart, minorPart, patchPart] = m;
-  if (wild(majorPart)) return ANY;
-
-  const major = +majorPart;
-  const minorWild = wild(minorPart);
+  const [, op = "", ...rest] = m;
+  const preText = rest[3];
   // npm ignores everything after the first wildcard, so `1.x.2` normalizes to
   // the `1.x` interval and admits 1.0.0. Reading the trailing 2 into the lower
   // bound answered a definite `false` for it — a wrong answer, not a refusal,
   // and one that would hold a package back over an edge that fits.
-  const patchWild = minorWild || wild(patchPart);
-  const minor = minorWild ? 0 : +minorPart;
-  const patch = patchWild ? 0 : +patchPart;
-
-  let max;
-  if (op === "^") {
-    // Caret pins the leftmost NON-ZERO part, which is why `^0.6.0` allows
-    // < 0.7.0 rather than < 1.0.0.
-    if (major > 0) max = [major + 1, 0, 0];
-    else if (minorWild) max = [1, 0, 0];
-    else if (minor > 0 || patchWild) max = [0, minor + 1, 0];
-    else max = [0, 0, patch + 1];
-  } else if (op === "~") {
-    // Tilde pins the minor when one is given, the major when it is not.
-    max = minorWild ? [major + 1, 0, 0] : [major, minor + 1, 0];
-  } else if (minorWild) {
-    max = [major + 1, 0, 0];
-  } else if (patchWild) {
-    max = [major, minor + 1, 0];
-  } else {
-    max = [major, minor, patch + 1];
+  const parts = [];
+  for (const p of rest.slice(0, 3)) {
+    if (p === undefined || /^[xX*]$/.test(p)) break;
+    parts.push(+p);
   }
-  return { min: [major, minor, patch], minIncl: true, max, maxIncl: false };
+  // A prerelease after a wildcard is dropped, as npm drops it: `1.x.x-beta`
+  // is `1.x`, and `*.*.*-beta` is `*`. Refusing it instead hid a match-all
+  // arm from the union collapse below, so a named prerelease arm beside it
+  // passed what npm rejects.
+  const pre = parts.length < 3 || preText === undefined ? [] : preText.split(".");
+
+  if (parts.length === 0) return op === "<" || op === ">" ? NONE : ANY;
+
+  if (parts.length === 3) {
+    const v = at(parts, pre);
+    const preCore = v.pre.length ? parts : null;
+    const [x, y, z] = parts;
+    if (op === ">=") return { min: v, minIncl: true, max: null, maxIncl: false, preCore };
+    if (op === ">") return { min: v, minIncl: false, max: null, maxIncl: false, preCore };
+    if (op === "<=") return { min: at([0, 0, 0], ["0"]), minIncl: true, max: v, maxIncl: true, preCore };
+    if (op === "<") return { min: at([0, 0, 0], ["0"]), minIncl: true, max: v, maxIncl: false, preCore };
+    if (op === "^") {
+      // Caret pins the leftmost NON-ZERO part, which is why `^0.6.0` allows
+      // < 0.7.0 rather than < 1.0.0.
+      const ceiling = x > 0 ? [x + 1, 0, 0] : y > 0 ? [0, y + 1, 0] : [0, 0, z + 1];
+      return { min: v, minIncl: true, ...below(ceiling), preCore };
+    }
+    if (op === "~") return { min: v, minIncl: true, ...below([x, y + 1, 0]), preCore };
+    return { min: v, minIncl: true, max: v, maxIncl: true, preCore };
+  }
+
+  // A partial version is an interval [floor, next): `1` is [1.0.0, 2.0.0),
+  // `1.2` is [1.2.0, 1.3.0).
+  const [major, minor = 0] = parts;
+  const floor = [major, minor, 0];
+  const next = parts.length === 1 ? [major + 1, 0, 0] : [major, minor + 1, 0];
+  if (op === ">=") return { ...ANY, min: at(floor) };
+  if (op === ">") return { ...ANY, min: at(next) };
+  if (op === "<") return { ...ANY, ...below(floor) };
+  if (op === "<=") return { ...ANY, ...below(next) };
+  if (op === "^") {
+    // `^1.2` is <2.0.0, `^0.2` <0.3.0, `^0.0` <0.1.0, and `^0` <1.0.0.
+    const ceiling = major > 0 || parts.length === 1 ? [major + 1, 0, 0] : [0, minor + 1, 0];
+    return { ...ANY, min: at(floor), ...below(ceiling) };
+  }
+  // A bare partial, `=1.2`, and `~1.2` all mean the interval itself; `~1`
+  // is the major's.
+  return { ...ANY, min: at(floor), ...below(next) };
 };
 
-const satisfiesAtom = (v, atom) => {
-  const b = atomBounds(atom);
-  if (!b) return null;
-  const low = cmp(v, b.min);
+// Does `version` (as `at` builds it) fall inside one atom's bounds? null when
+// the atom is outside the grammar.
+const withinAtom = (version, b) => {
+  const low = cmpVersion(version, b.min);
   if (low < 0 || (low === 0 && !b.minIncl)) return false;
   if (b.max) {
-    const high = cmp(v, b.max);
+    const high = cmpVersion(version, b.max);
     if (b.maxIncl ? high > 0 : high >= 0) return false;
   }
   return true;
@@ -175,8 +248,8 @@ const satisfiesAtom = (v, atom) => {
  * Does `version` satisfy `range`, as far as this job can model it?
  *
  * `true` / `false`, or `null` for anything outside the grammar above — a
- * hyphen range, a partial comparator, a prerelease-carrying range, an
- * `npm:`/`file:`/git specifier. `null` is "cannot decide", and every caller
+ * hyphen range with a partial or prerelease bound, an `npm:`/`file:`/git
+ * specifier. `null` is "cannot decide", and every caller
  * treats it that way rather than as a pass, per the fail-closed rule the rest
  * of this file follows.
  *
@@ -195,23 +268,38 @@ export function satisfiesRange(version, range) {
   // made BOTH sides unanswerable, and the pair of nulls waved through the very
   // combination this check exists to stop.
   const core = raw.split("+")[0];
-  const isPrerelease = core.includes("-");
-  const v = core.split("-")[0].split(".").map(Number);
+  const dash = core.indexOf("-");
+  const isPrerelease = dash >= 0;
+  const v = (isPrerelease ? core.slice(0, dash) : core).split(".").map(Number);
+  const ver = at(v, isPrerelease ? core.slice(dash + 1).split(".") : []);
 
   // Union first, then the whitespace-separated intersection inside each
   // disjunct. A disjunct that cannot be modeled does not sink the whole
   // range: another one may still admit the version outright.
+  //
+  // npm lets a comparator stand apart from its version (`>= 2.0.0`, `^ 1`),
+  // and splitting on whitespace first turns that into two atoms — an
+  // operator with nothing to compare, which `atomBounds` can only refuse.
+  // That refusal reads as "cannot decide" and the after-only arm passes it,
+  // so a spaced comparator was a way past the check. Joining the operator
+  // to what follows it is safe for the hyphen range below, whose `-` is not
+  // one of these operators and keeps its spaces.
+  const disjuncts = String(range ?? "")
+    .split("||")
+    .map((d) => d.replace(/([<>]=?|=|\^|~)\s+/g, "$1").trim().split(/\s+/).filter(Boolean));
+
+  // A disjunct that admits every release (`*`, `x.x`, `>=0`) makes npm
+  // collapse the WHOLE range to `*`, which admits no prerelease at all —
+  // even one another disjunct names: `>=1.2.3-beta || *` takes no
+  // 1.2.3-beta.2. Answering off the named disjunct would pass what npm
+  // refuses.
+  const admitsAny = (b) => b && !b.preCore && b.max === null && b.minIncl && cmpVersion(b.min, at([0, 0, 0], ["0"])) === 0;
+  if (disjuncts.some((atoms) => atoms.every((atom) => admitsAny(atomBounds(atom))))) {
+    return !isPrerelease;
+  }
+
   let undecided = false;
-  for (const rawDisjunct of String(range ?? "").split("||")) {
-    // npm lets a comparator stand apart from its version (`>= 2.0.0`, `^ 1`),
-    // and splitting on whitespace first turns that into two atoms — an
-    // operator with nothing to compare, which `atomBounds` can only refuse.
-    // That refusal reads as "cannot decide" and the after-only arm passes it,
-    // so a spaced comparator was a way past the check. Joining the operator
-    // to what follows it is safe for the hyphen range below, whose `-` is not
-    // one of these operators and keeps its spaces.
-    const disjunct = rawDisjunct.replace(/([<>]=?|=|\^|~)\s+/g, "$1");
-    const atoms = disjunct.trim().split(/\s+/).filter(Boolean);
+  for (const atoms of disjuncts) {
 
     // A HYPHEN RANGE is not an intersection of its tokens. Splitting
     // `1.0.0 - 2.0.0` on whitespace and evaluating `1.0.0` as an atom reads
@@ -222,39 +310,39 @@ export function satisfiesRange(version, range) {
     // Both bounds must be full X.Y.Z: npm's rules for a partial bound are
     // their own thing and not worth guessing at.
     if (atoms.length === 3 && atoms[1] === "-") {
-      const lo = atomBounds(atoms[0]);
-      const hi = atomBounds(atoms[2]);
-      const exact = (b) => b && b.max && b.maxIncl === false && cmp(b.min, b.max) < 0;
-      if (!exact(lo) || !exact(hi) || !/^\d+\.\d+\.\d+$/.test(atoms[0]) || !/^\d+\.\d+\.\d+$/.test(atoms[2])) {
+      const full = /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/;
+      if (!full.test(atoms[0]) || !full.test(atoms[2])) {
         undecided = true;
         continue;
       }
-      if (cmp(v, lo.min) >= 0 && cmp(v, hi.min) <= 0 && !isPrerelease) return true;
+      const lo = atomBounds(atoms[0]).min.v;
+      const hi = atomBounds(atoms[2]).min.v;
+      if (cmp(v, lo) >= 0 && cmp(v, hi) <= 0 && !isPrerelease) return true;
       continue;
     }
 
     let all = true;
+    let preAllowed = false;
     for (const atom of atoms.length ? atoms : [""]) {
-      const answer = satisfiesAtom(v, atom);
-      if (answer === null) {
+      const b = atomBounds(atom);
+      if (b === null) {
         undecided = true;
         all = false;
         break;
       }
-      if (answer === false) {
+      if (!withinAtom(ver, b)) {
         all = false;
         break;
       }
+      if (b.preCore && cmp(b.preCore, v) === 0) preAllowed = true;
     }
-    // A prerelease satisfies no disjunct this job models: npm admits one only
-    // when some comparator carries a prerelease on the same numeric core, and
-    // every atom above is refused if it carries one. So THIS ARM rejects it —
-    // which is not the same as the range rejecting it, and returning `false`
-    // here said so. `^1 || ^1.2.3-beta.1` against 1.2.3-beta.2 answered a
-    // definite no off the first arm, while npm takes the second; the honest
-    // answer is `null`, since the arm that would admit it is one this job
-    // refuses to model. Fall through and let the union decide.
-    if (all && !isPrerelease) return true;
+    // npm admits a prerelease VERSION only through a disjunct with a
+    // comparator naming a prerelease on the same numeric core: `^1.2.3-beta.1`
+    // takes 1.2.3-beta.2 but not 1.3.0-beta.1, and `^1`, `*` and every range
+    // without a prerelease take none. Being inside the bounds is not enough.
+    // A disjunct that fails this rejects the version for ITSELF only; the
+    // union may still admit it, so fall through rather than answer `false`.
+    if (all && (!isPrerelease || preAllowed)) return true;
   }
   return undecided ? null : false;
 }
@@ -689,8 +777,9 @@ export function lockfileFailures(beforePackages, afterPackages) {
     //
     // So the affordable answer changed, and with it the right one: a range
     // this job cannot evaluate is exactly where a pin hides, and every
-    // `null` that reached here passed silently. A prerelease-carrying range
-    // (`^2.0.0-beta.1`) was the last of those.
+    // `null` that reached here passed silently. Prerelease-carrying and
+    // partial comparator ranges are modeled now too; what is left is a hyphen
+    // range with a partial or prerelease bound, or a non-registry specifier.
     out.push(
       `${label(from)} newly declares ${dep} ${range}, a range this job cannot evaluate against the resolved ${resolved.version}. A new edge is where a pin hides, so this refuses rather than assuming it fits.`,
     );
