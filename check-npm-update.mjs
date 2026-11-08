@@ -24,8 +24,9 @@
 // the machine that ran the batch chose to report.
 
 import { execFileSync } from "node:child_process";
-import { readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
+import { parsePnpmLockYaml, pnpmImporters, pnpmLockToPackages } from "./pnpm-lock.mjs";
 
 export const DEP_SECTIONS = [
   "dependencies",
@@ -432,10 +433,35 @@ export function manifestFailures(before, after) {
       // Deliberately conservative: a prerelease or exotic range this validator
       // cannot model stops the run rather than being waved through on the
       // assumption that it is fine.
-      if (!from || !to) {
+      if (!to) {
         out.push(
           `${section}.${name}: ${a[name]} -> ${b[name]} is not a plain X.Y.Z registry range this job can validate.`,
         );
+        continue;
+      }
+      if (!from) {
+        // A PARTIAL range (`^22`, `~1.2`) is what a save writes out in full:
+        // npm and pnpm both replace it with the operator and the whole
+        // version they chose, so `^22` -> `^22.20.5` is the ordinary shape
+        // of a batch on such a declaration, not an exotic one. The operator
+        // must survive, and the new floor must be a version the old range
+        // admitted — asked of the range grammar below, which models partial
+        // comparators, rather than of the plain X.Y.Z parser, which does
+        // not. Anything else about the old range (a prerelease, a union, a
+        // hyphen range) still stops the run.
+        const op = /^[\^~]?/.exec(a[name])[0];
+        if (op !== to.op) {
+          out.push(`${section}.${name} changed its range operator: ${a[name]} -> ${b[name]}.`);
+          continue;
+        }
+        const fits = satisfiesRange(to.v.join("."), a[name]);
+        if (fits !== true || !/^[\^~]?\d+(\.\d+)?$/.test(a[name])) {
+          out.push(
+            fits === false
+              ? `${section}.${name} moved outside its existing range: ${a[name]} -> ${b[name]}. npm update only bumps the floor to a version the declared range already allowed.`
+              : `${section}.${name}: ${a[name]} -> ${b[name]} is not a plain X.Y.Z registry range this job can validate.`,
+          );
+        }
         continue;
       }
       if (from.op !== to.op) {
@@ -497,6 +523,14 @@ const RESOLVED_COPY = /(^|\/)node_modules\//;
  * Resolve one dependency edge the way npm does: from the dependent directory,
  * walk up through each ancestor node_modules until one holds the name. That is
  * the copy the consumer actually gets.
+ *
+ * A `link` record (`link: true`, `resolved` naming another record) is the
+ * lockfile's symlink: npm writes one under node_modules for each workspace,
+ * and the pnpm mapping (pnpm-lock.mjs) writes one wherever pnpm puts a
+ * symlink, which is every edge. It is followed only to a record that exists
+ * and carries a version — the copy on the other end of the link — and is
+ * otherwise passed over as it always was, so a link to nothing resolves as
+ * nothing rather than as a guess.
  */
 export function resolveEdgeInstance(packages, fromPath, name) {
   let prefix = fromPath;
@@ -504,6 +538,15 @@ export function resolveEdgeInstance(packages, fromPath, name) {
     const candidate = (prefix ? prefix + "/" : "") + "node_modules/" + name;
     const entry = packages[candidate];
     if (entry && entry.version) return { path: candidate, name, version: entry.version, entry };
+    if (entry && entry.link && typeof entry.resolved === "string") {
+      const target = packages[entry.resolved];
+      // Named as the record names itself where it does (an alias links
+      // `other` to a copy of `util`, and the copy is what moved), else as
+      // the edge asked for it.
+      if (target && target.version) {
+        return { path: entry.resolved, name: typeof target.name === "string" && target.name ? target.name : name, version: target.version, entry: target };
+      }
+    }
     if (!prefix) return null;
     const cut = prefix.lastIndexOf("/node_modules/");
     prefix = cut === -1 ? "" : prefix.slice(0, cut);
@@ -1418,8 +1461,8 @@ export function installedVersions(packages) {
  * Paths are repo-relative to the npm tree's root, in the form the workflow
  * runs `git checkout` and `tar` against.
  */
-export function manifestPaths({ lockBefore, lockAfter }) {
-  const paths = ["package.json", "package-lock.json"];
+export function manifestPaths({ lockBefore, lockAfter, lockfile = "package-lock.json" }) {
+  const paths = ["package.json", lockfile];
   for (const dir of new Set([
     ...workspacePaths(lockBefore?.packages ?? {}),
     ...workspacePaths(lockAfter?.packages ?? {}),
@@ -2381,18 +2424,67 @@ export function updateSummary({ manifestBefore, manifestAfter, lockBefore, lockA
   return lines.join("\n") + "\n";
 }
 
+// Which package manager wrote the tree: pnpm when its lockfile is present,
+// npm otherwise. Decided by the file on disk rather than by an argument, so
+// the checker and the workflow that calls it cannot disagree about which
+// lockfile a batch is validated against; a tree holding both lockfiles is
+// refused, since the two could then describe different installs.
+export function packageManagerOf({ pnpmLock, npmLock }) {
+  if (pnpmLock && npmLock) {
+    throw new Error("Both package-lock.json and pnpm-lock.yaml are present; this checker validates one package manager's tree, so remove the lockfile that is not in use.");
+  }
+  return pnpmLock ? "pnpm" : "npm";
+}
+
+export const LOCKFILE_OF = { npm: "package-lock.json", pnpm: "pnpm-lock.yaml" };
+
 function gatherInputs() {
   // The `./` prefix makes the pathspec relative to the working directory,
   // so the same script serves a repository whose npm tree lives in a
   // subdirectory (a Cloud Functions backend, say) — run it from that
   // directory. At the repository root, `HEAD:./x` names the same object
   // as `HEAD:x`, so nothing changes for the existing consumers.
-  const show = (path) =>
-    JSON.parse(execFileSync("git", ["show", `HEAD:./${path}`], { encoding: "utf8" }));
+  const showText = (path) => execFileSync("git", ["show", `HEAD:./${path}`], { encoding: "utf8" });
+  const show = (path) => JSON.parse(showText(path));
   const read = (path) => JSON.parse(readFileSync(path, "utf8"));
 
-  const lockBefore = show("package-lock.json");
-  const lockAfter = read("package-lock.json");
+  const packageManager = packageManagerOf({ pnpmLock: existsSync("pnpm-lock.yaml"), npmLock: existsSync("package-lock.json") });
+  const lockfile = LOCKFILE_OF[packageManager];
+
+  if (packageManager === "pnpm") {
+    // The pnpm lockfile names its importers (the root and every workspace)
+    // outright (a version 6 file for a single package writes the root's
+    // sections at the top level, which `pnpmImporters` gathers), and the
+    // mapping needs their manifests to fill in what it does not record, so
+    // both sides' manifests are read first and the `packages` map the walk
+    // sees is built from the pair.
+    const lockBefore = parsePnpmLockYaml(showText(lockfile));
+    const lockAfter = parsePnpmLockYaml(readFileSync(lockfile, "utf8"));
+    const importers = new Set([...Object.keys(pnpmImporters(lockBefore)), ...Object.keys(pnpmImporters(lockAfter))]);
+    const before = {};
+    const after = {};
+    for (const importer of importers) {
+      const file = importer === "." ? "package.json" : `${importer}/package.json`;
+      before[importer] = show(file);
+      after[importer] = read(file);
+    }
+    const workspaces = {};
+    for (const importer of importers) {
+      if (importer !== ".") workspaces[importer] = { manifestBefore: before[importer], manifestAfter: after[importer] };
+    }
+    return {
+      manifestBefore: before["."],
+      manifestAfter: after["."],
+      lockBefore: { packages: pnpmLockToPackages(lockBefore, before) },
+      lockAfter: { packages: pnpmLockToPackages(lockAfter, after) },
+      workspaces,
+      lockfile,
+      packageManager,
+    };
+  }
+
+  const lockBefore = show(lockfile);
+  const lockAfter = read(lockfile);
 
   // Workspace manifests, discovered from the lockfiles rather than from the
   // root manifest's `workspaces` globs: the lockfile names the paths
@@ -2417,6 +2509,8 @@ function gatherInputs() {
     lockBefore,
     lockAfter,
     workspaces,
+    lockfile,
+    packageManager,
   };
 }
 
@@ -2439,6 +2533,30 @@ function main() {
     process.stdout.write(updateSummary(gatherInputs()));
     return;
   }
+
+  // Two of the hold-back pass's modes rewrite or name package-lock.json
+  // records by path, for the group re-apply that only npm's pass makes;
+  // pnpm's pass re-applies a group by naming its members to `pnpm update`
+  // instead and never asks for a record. A call that reaches here on a pnpm
+  // tree is a workflow bug, refused by name rather than answered from a
+  // lockfile the mode would misread.
+  const NPM_ONLY = ["unresolve", "lockstep-partners"];
+  if (NPM_ONLY.includes(mode) && packageManagerOf({ pnpmLock: existsSync("pnpm-lock.yaml"), npmLock: existsSync("package-lock.json") }) === "pnpm") {
+    console.error(`The "${mode}" mode names package-lock.json records and has no pnpm form.`);
+    process.exit(2);
+  }
+
+  // The bulk resolve's lockfile the workflow kept aside, in the shape the
+  // walk reads. A pnpm one is mapped with the manifests on disk now: the
+  // mapping takes only an importer's name, version and peer dependencies
+  // from them, none of which a batch changes, while the specifiers it
+  // records come from the bulk lockfile itself.
+  const readBulk = (path, inputs) => {
+    if (inputs.packageManager !== "pnpm") return JSON.parse(readFileSync(path, "utf8"));
+    const manifests = { ".": inputs.manifestAfter };
+    for (const [ws, pair] of Object.entries(inputs.workspaces)) manifests[ws] = pair.manifestAfter;
+    return { packages: pnpmLockToPackages(parsePnpmLockYaml(readFileSync(path, "utf8")), manifests) };
+  };
 
   // One name per line, for the workflow's hold-back pass. Read from the same
   // pair of lockfiles the validation walks, so the list cannot disagree with
@@ -2478,10 +2596,10 @@ function main() {
       console.error('The "dropped" mode needs the bulk resolve\'s lockfile path, then any held-back names.');
       process.exit(2);
     }
-    const lockBulk = JSON.parse(readFileSync(bulkPath, "utf8"));
+    const inputs = gatherInputs();
     const { direct, transitive, moved } = droppedByRebuild({
-      ...gatherInputs(),
-      lockBulk,
+      ...inputs,
+      lockBulk: readBulk(bulkPath, inputs),
       heldBack: process.argv.slice(4),
     });
     const lines = [
@@ -2506,8 +2624,8 @@ function main() {
       console.error(`The "${mode}" mode needs the bulk resolve's lockfile path.`);
       process.exit(2);
     }
-    const lockBulk = JSON.parse(readFileSync(bulkPath, "utf8"));
-    const inputs = { ...gatherInputs(), lockBulk };
+    const gathered = gatherInputs();
+    const inputs = { ...gathered, lockBulk: readBulk(bulkPath, gathered) };
     const lines = mode === "lockstep" ? lockstepSplits(inputs) : lockstepMembers(inputs);
     process.stdout.write(lines.length ? lines.join("\n") + "\n" : "");
     if (mode === "lockstep" && lines.length) process.exit(1);

@@ -51,17 +51,23 @@ Deferred work, recorded here so it isn't lost.
       set — but a consumer that supplies one no longer needs its declared
       list, and leaving it means two mechanisms for one problem.
 
-- [ ] **Support a consumer with npm workspaces end to end.** The checker
-      validates workspace manifests and the hold-back pass now snapshots and
-      restores them, but the surrounding workflow still assumes the root pair
-      is the whole batch: the update job's tree check allowlists only
-      `package.json`/`package-lock.json`, and publish stages those two by
-      name — so a batch that legitimately moved a range declared by a
-      workspace aborts on the tree check, and would drop that manifest from
-      the commit if it did not. None of gedmap, newshacker or readmo uses
-      workspaces, which is why it has never fired. Raised by Codex on #28
-      while reviewing the hold-back pass; deliberately not fixed there,
-      since it is a different change from the one that PR makes.
+- [x] **Support a consumer with npm workspaces end to end.** The hold-back
+      step names every manifest the batch can rewrite before any dependency
+      code runs; the tree checks allow them, the change step fingerprints
+      the workspace ones, they travel to publish as `manifests-handoff.tar`
+      and are verified and committed there. Done with pnpm support, whose
+      consumer (travelmo) declares everything in workspaces.
+- [ ] **Per-peer-set fallback for pnpm's group re-apply.** npm's pass
+      retries each peer-linked set on its own when the whole group fails;
+      pnpm's re-applies the whole group with one `pnpm update -r` and
+      names every member when that fails. The checker's `dropped` mode
+      already numbers the sets, so the fallback is a loop over them with
+      `pnpm update -r` per set.
+- [ ] **A cooldown floor for pnpm.** The npm path raises the runner's npm
+      to the version `.npmrc`'s `min-release-age` needs; the pnpm path
+      runs whatever `packageManager` pins and says nothing if that
+      predates `minimum-release-age` (pnpm 10.16). A check against
+      `engines.pnpm`, or against the setting's presence, would close it.
 
 - [ ] **Add the clean-context registry re-check** — the `--verify-upstream`
       class the Gradle and Rust siblings run in their publish jobs, which

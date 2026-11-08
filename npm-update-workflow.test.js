@@ -152,13 +152,17 @@ describe("npm-update reusable workflow", () => {
     expect(runTitle("true", "")).not.toMatch(/\$today/);
   });
 
-  it("takes the Node major from .nvmrc rather than naming one", () => {
+  it("takes the Node major from .nvmrc (or .node-version) rather than naming one", () => {
     // .nvmrc lives in the CONSUMER's repo — this job checks out the caller,
     // not the hub, so reading it here still reads the consumer's own pin.
-    // Prefixed with the working-directory layout output rather than a bare
-    // ".nvmrc" — empty for every existing consumer, so this still resolves
-    // to exactly ".nvmrc" for them (see the working-directory tests below).
-    expect(update).toContain("node-version-file: ${{ steps.layout.outputs.prefix }}.nvmrc");
+    // The layout step names the file, prefixed with the working directory
+    // (empty for every existing consumer, so it still resolves to exactly
+    // ".nvmrc" for them) and falling back to .node-version, the other
+    // spelling setup-node reads, when that is the one present.
+    expect(update).toContain("node-version-file: ${{ steps.layout.outputs.node_version_file }}");
+    const layout = doc.jobs.update.steps.find((s) => s.id === "layout");
+    expect(layout.run).toContain('echo "node_version_file=${prefix}.nvmrc"');
+    expect(layout.run).toContain('echo "node_version_file=${prefix}.node-version"');
     expect(update).not.toMatch(/node-version:\s*['"]?\d/);
   });
 
@@ -225,7 +229,7 @@ describe("npm-update reusable workflow", () => {
 
   it("fingerprints the manifests somewhere dependency code cannot reach", () => {
     expect(workflow).not.toContain("/tmp/dep-snapshot");
-    expect(update).toMatch(/sha256sum package-lock\.json/);
+    expect(update).toMatch(/sha256sum "\$LOCKFILE"/);
     expect(update).toContain('"lock_sha=');
     expect(publish).toContain("needs.update.outputs.lock_sha");
   });
@@ -261,7 +265,7 @@ describe("npm-update reusable workflow", () => {
   });
 
   it("fingerprints checks.md and deps-stat.txt only after every check has finished, not before", () => {
-    const lastCheckIdx = update.lastIndexOf("check 'npm run build'");
+    const lastCheckIdx = update.lastIndexOf('check "$PACKAGE_MANAGER run build"');
     const checksShaIdx = update.indexOf("checks_sha=$(sha256sum");
     const depsStatShaIdx = update.indexOf("deps_stat_sha=$(sha256sum");
     expect(lastCheckIdx).toBeGreaterThan(-1);
@@ -337,7 +341,7 @@ describe("npm-update reusable workflow", () => {
     // The install is its own step now (it runs before the regenerate
     // hook, which runs before the rest of the checks), so this looks for
     // the install itself rather than the check() call it used to be.
-    const installIdx = workflow.indexOf("npm ci\n");
+    const installIdx = workflow.indexOf("install='npm ci'\n");
     expect(resolveIdx).toBeGreaterThan(-1);
     expect(fingerprintIdx).toBeGreaterThan(resolveIdx);
     expect(installIdx).toBeGreaterThan(fingerprintIdx);
@@ -350,8 +354,13 @@ describe("npm-update reusable workflow", () => {
     // broke, rather than dying before the artifact exists.
     const install = doc.jobs.update.steps.find((s) => s.id === "install");
     expect(install.run).toContain("set +e");
-    expect(install.run).toMatch(/npm ci\n\s*rc=\$\?/);
-    expect(install.run).toContain("- ❌ \\`npm ci\\` (exit $rc)");
+    // The install command is the manager's own, named in the report
+    // exactly as it ran: `npm ci` for an npm tree, `pnpm install
+    // --frozen-lockfile` for a pnpm one.
+    expect(install.run).toContain("install='npm ci'");
+    expect(install.run).toContain("install='pnpm install --frozen-lockfile'");
+    expect(install.run).toMatch(/\$install\n\s*rc=\$\?/);
+    expect(install.run).toContain("- ❌ \\`$install\\` (exit $rc)");
     expect(install.run).not.toMatch(/exit 1/);
     expect(update).not.toContain("Install the resolved tree");
   });
@@ -372,8 +381,9 @@ describe("npm-update reusable workflow", () => {
     expect(checksIdx).toBeGreaterThan(regenIdx);
     // And the checks that read a derived file are the ones AFTER the hook.
     const checks = doc.jobs.update.steps[checksIdx].run;
-    expect(checks).toContain("check 'npm test'");
+    expect(checks).toContain('check "$PACKAGE_MANAGER test"');
     expect(checks).not.toContain("check 'npm ci'");
+    expect(checks).not.toContain('check "$PACKAGE_MANAGER ci"');
   });
 
   it("still reports all four checks, once each, in the order they ran", () => {
@@ -385,10 +395,10 @@ describe("npm-update reusable workflow", () => {
     expect(install.run).toContain("report<<INSTALL_REPORT_EOF");
     expect(checks.env.INSTALL_REPORT).toBe("${{ steps.install.outputs.report }}");
     expect(checks.run).toMatch(/report="\$INSTALL_REPORT"\$'\\n'/);
-    const order = ["npm run lint", "npm test", "npm run build"];
+    const order = ["run lint", "test", "run build"];
     let at = -1;
     for (const c of order) {
-      const idx = checks.run.indexOf(`check '${c}'`);
+      const idx = checks.run.indexOf(`check "$PACKAGE_MANAGER ${c}"`);
       expect(idx).toBeGreaterThan(at);
       at = idx;
     }
@@ -429,7 +439,13 @@ describe("npm-update reusable workflow", () => {
 
   it("commits only the dependency files, with hooks disabled", () => {
     expect(publish).toContain("core.hooksPath /dev/null");
-    expect(publish).toMatch(/git add -- [\w./-]*package\.json/);
+    // Every manifest the update job named before any dependency code ran
+    // (the root pair, and each workspace manifest), one `git add` each,
+    // from the trusted step output and never from a glob.
+    const open = doc.jobs.publish.steps.find((s) => s.name === "Open the pull request");
+    expect(open.env.MANIFESTS).toBe("${{ needs.update.outputs.manifests }}");
+    expect(open.run).toMatch(/while IFS= read -r m; do\n\s*\[ -z "\$m" \] && continue\n\s*git add -- "\$m"\n\s*done <<< "\$MANIFESTS"/);
+    expect(publish).not.toMatch(/git add -- \*/);
     expect(publish).not.toMatch(/git commit[^\n]*-[a-z]*a/);
   });
 
@@ -467,7 +483,7 @@ describe("npm-update reusable workflow", () => {
     // output BEFORE any check runs and rewritten from that trusted value at
     // the same point, not left as the plain file a script could reach.
     expect(update).not.toContain(">> checks.md");
-    const lastCheckIdx = update.lastIndexOf("check 'npm run build'");
+    const lastCheckIdx = update.lastIndexOf('check "$PACKAGE_MANAGER run build"');
     const checksWriteIdx = update.indexOf('printf \'%s\' "$report" > checks.md');
     const statWriteIdx = update.indexOf('printf \'%s\\n\' "$DEPS_STAT" > deps-stat.txt');
     expect(lastCheckIdx).toBeGreaterThan(-1);
@@ -1217,15 +1233,21 @@ describe("the regenerate hook", () => {
       const run = stripComments(step.run);
       const redirects = [...run.matchAll(/>\s*"?(\$RUNNER_TEMP\/[\w.$/-]+|[\w.-]+\.(?:tar|nul))"?/g)]
         .map((m) => m[1])
-        .filter((path) => path !== "$regen_tmp");
+        .filter((path) => path !== "$regen_tmp" && path !== "$manifests_tmp");
       expect(redirects, `${step.name}: unexpected fixed-path redirect(s)`).toEqual([]);
       const tarCreates = [...run.matchAll(/tar -cf "?([\w.$-]+)"?/g)]
         .map((m) => m[1])
         // $snapshot is the hold-back pass's own `mktemp -d`, asserted
         // below so the exemption cannot be satisfied by a fixed name that
         // merely happens to be spelled with a $.
-        .filter((path) => path !== "$regen_tmp" && path !== "$snapshot");
+        .filter((path) => path !== "$regen_tmp" && path !== "$manifests_tmp" && path !== "$snapshot");
       expect(tarCreates, `${step.name}: unexpected fixed-path tar create(s)`).toEqual([]);
+      // The two handoff tars come from mktemp, like $snapshot.
+      for (const v of ["regen_tmp", "manifests_tmp"]) {
+        if (run.includes(`$${v}`)) {
+          expect(run, `${step.name}: $${v} must come from mktemp`).toMatch(new RegExp(`${v}=\\$\\(mktemp `));
+        }
+      }
       if (run.includes("$snapshot")) {
         expect(run, `${step.name}: $snapshot must come from mktemp`).toMatch(
           /snapshot=\$\(mktemp -d\)/,
@@ -1894,7 +1916,7 @@ describe("the working-directory input", () => {
     const layoutStep = doc.jobs.update.steps.find((s) => s.id === "layout");
     expect(!!layoutStep).toBe(true);
     expect(layoutStep.run).toContain("git rev-parse --show-prefix");
-    expect(update).toContain("node-version-file: ${{ steps.layout.outputs.prefix }}.nvmrc");
+    expect(update).toContain("node-version-file: ${{ steps.layout.outputs.node_version_file }}");
     // No cache-dependency-path: the update job configures no npm cache at
     // all (see "never saves the npm cache" below), so the only setup-node
     // field the prefix has to reach is the .nvmrc one above.
@@ -1918,10 +1940,15 @@ describe("the working-directory input", () => {
       const functionsDir = join(scratch, "functions");
       mkdirSync(functionsDir);
       writeFileSync(join(scratch, "seed"), "");
+      // The lockfile and the Node pin the step also names, at both levels.
+      for (const dir of [scratch, functionsDir]) {
+        writeFileSync(join(dir, "package-lock.json"), "{}\n");
+        writeFileSync(join(dir, ".nvmrc"), "22\n");
+      }
       execFileSync("git", ["-C", scratch, "add", "-A"]);
       execFileSync("git", ["-C", scratch, "commit", "-qm", "seed"]);
 
-      expect(run(scratch, join(scratch, "root.txt"))).toBe("prefix=\ndir=\n");
+      expect(run(scratch, join(scratch, "root.txt"))).toBe("prefix=\ndir=\nlockfile=package-lock.json\nnode_version_file=.nvmrc\n");
 
       // The three equivalent-but-noncanonical ways a caller could spell
       // `working-directory: functions` in their own workflow file -- the
@@ -1931,7 +1958,7 @@ describe("the working-directory input", () => {
       for (const spelling of ["functions", "./functions", "functions/", "functions/."]) {
         const cwd = join(scratch, spelling);
         const out = join(scratch, `out-${spelling.replace(/[^a-z]/gi, "_")}.txt`);
-        expect(run(cwd, out)).toBe("prefix=functions/\ndir=functions\n");
+        expect(run(cwd, out)).toBe("prefix=functions/\ndir=functions\nlockfile=package-lock.json\nnode_version_file=functions/.nvmrc\n");
       }
     } finally {
       rmSync(scratch, { recursive: true, force: true });
@@ -2503,7 +2530,7 @@ describe("holding back only what a breaking transitive blocks", () => {
     // the only record of the versions to ask for, so it has to survive the
     // restore to HEAD.
     const run = step.run;
-    const keep = run.indexOf('cp package-lock.json "$snapshot/bulk-lock.json"');
+    const keep = run.indexOf('cp "$LOCKFILE" "$snapshot/bulk-lock.json"');
     const restore = run.indexOf('git checkout HEAD -- "${manifests[@]}"');
     expect(keep).toBeGreaterThan(-1);
     expect(keep).toBeLessThan(restore);

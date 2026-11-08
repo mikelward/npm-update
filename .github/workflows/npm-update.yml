@@ -121,6 +121,25 @@ on:
           Pair it with `secrets: inherit` on the caller; see README.md.
         type: string
         default: npm-update
+      package-manager:
+        description: >-
+          Which package manager wrote the tree. `npm` (the default) is the
+          package-lock.json tree every existing consumer has: `npm ci`,
+          `npm update --save`, the checks as `npm run …`. `pnpm` is a
+          pnpm-lock.yaml tree, workspaces included: `pnpm install
+          --frozen-lockfile`, `pnpm update -r`, the checks as `pnpm run …`,
+          with pnpm installed at the exact version the root package.json's
+          `packageManager` field pins (`pnpm@X.Y.Z`; refused without one).
+          The lockfile is read by the same checker through pnpm-lock.mjs,
+          which lays it out as the tree pnpm installs, so the no-majors
+          rules are the same; the hold-back pass re-applies a group it
+          dropped by naming the members to `pnpm update` rather than by
+          rewriting lockfile records, so it has no peer-linked-set fallback
+          (README.md "pnpm"). A release-age cooldown is pnpm's own
+          `minimum-release-age` setting (pnpm 10.16 or later), which the
+          batch honors by running pnpm.
+        type: string
+        default: npm
     # Passing a secret through this block is the LEGACY route — see the
     # `environment` input above: a secret handed to the workflow this way
     # reaches every job's runner, the untrusted update job included. Kept so
@@ -193,6 +212,9 @@ jobs:
       base: ${{ steps.base.outputs.sha }}
       pkg_sha: ${{ steps.changed.outputs.pkg_sha }}
       lock_sha: ${{ steps.changed.outputs.lock_sha }}
+      ws_sha: ${{ steps.changed.outputs.ws_sha }}
+      manifests: ${{ steps.holdback.outputs.manifests }}
+      lockfile: ${{ steps.layout.outputs.lockfile }}
       checks_sha: ${{ steps.checks.outputs.checks_sha }}
       deps_stat_sha: ${{ steps.checks.outputs.deps_stat_sha }}
       holdback_sha: ${{ steps.checks.outputs.holdback_sha }}
@@ -243,13 +265,37 @@ jobs:
       # default already put this step, reports exactly that canonical form
       # regardless of which spelling got it there (verified directly against
       # all three).
+      #
+      # The same step names the package manager's lockfile and the file the
+      # Node version comes from, so each later use reads one output rather
+      # than repeating the choice: `.nvmrc` as every existing consumer has,
+      # or `.node-version` (the other spelling setup-node reads) when that
+      # is the one present.
       - name: Resolve the working-directory prefix
         id: layout
+        env:
+          PACKAGE_MANAGER: ${{ inputs.package-manager }}
         run: |
           set -euo pipefail
+          PACKAGE_MANAGER=${PACKAGE_MANAGER:-npm}
           prefix=$(git rev-parse --show-prefix)
           echo "prefix=$prefix" >> "$GITHUB_OUTPUT"
           echo "dir=${prefix%/}" >> "$GITHUB_OUTPUT"
+          case "$PACKAGE_MANAGER" in
+            npm) lockfile=package-lock.json ;;
+            pnpm) lockfile=pnpm-lock.yaml ;;
+            *) echo "::error::package-manager must be npm or pnpm, not '$PACKAGE_MANAGER'."; exit 1 ;;
+          esac
+          [ -f "$lockfile" ] || { echo "::error::$lockfile is not here, and package-manager is $PACKAGE_MANAGER."; exit 1; }
+          echo "lockfile=$lockfile" >> "$GITHUB_OUTPUT"
+          if [ -f .nvmrc ]; then
+            echo "node_version_file=${prefix}.nvmrc" >> "$GITHUB_OUTPUT"
+          elif [ -f .node-version ]; then
+            echo "node_version_file=${prefix}.node-version" >> "$GITHUB_OUTPUT"
+          else
+            echo '::error::Neither .nvmrc nor .node-version names the Node version to build with.'
+            exit 1
+          fi
 
       # The canonical checker, from THIS repository — the same one the publish
       # job uses, at the same `job.workflow_sha` pin (so the workflow and the
@@ -307,7 +353,7 @@ jobs:
           # single-source rule the consumer's own ci.yml follows — inside
           # working-directory when set, alongside the package.json it
           # governs the engines.npm floor for below.
-          node-version-file: ${{ steps.layout.outputs.prefix }}.nvmrc
+          node-version-file: ${{ steps.layout.outputs.node_version_file }}
           # No `cache: npm`, deliberately. This job checks out the default
           # branch, so a cache it saved would be scoped to that branch and
           # restorable by every workflow in the repository — the consumer's
@@ -345,6 +391,31 @@ jobs:
             npm install -g --ignore-scripts "npm@$floor"
           fi
           npm -v
+        # An npm tree's concern alone; a pnpm tree's cooldown is pnpm's own
+        # setting, honored by the pnpm the next step installs.
+        if: inputs.package-manager == 'npm'
+
+      # A pnpm tree builds with the pnpm its root manifest pins, installed by
+      # the runner's npm at exactly that version (the `+sha512-…` integrity
+      # suffix a `packageManager` field may carry is not part of a version
+      # npm can ask for, so it is dropped; the registry serves the one
+      # tarball for that version either way). Corepack is not used: it is
+      # being removed from Node, and what it would do is this install.
+      - name: Install the pnpm the manifest pins
+        if: inputs.package-manager == 'pnpm'
+        # zizmor: ignore[adhoc-packages] deliberate: the tool the consumer's
+        # own manifest pins, at that version, not a dependency of the project
+        # under test; --ignore-scripts is applied as everywhere in this window.
+        run: |
+          set -euo pipefail
+          pin=$(node -p "String(require('./package.json').packageManager ?? '')")
+          pin=${pin%%+*}
+          case "$pin" in
+            pnpm@[0-9]*) ;;
+            *) echo "::error::package.json's packageManager field must pin pnpm (pnpm@X.Y.Z) for a pnpm batch; it is '${pin:-absent}'."; exit 1 ;;
+          esac
+          npm install -g --ignore-scripts "$pin"
+          pnpm -v
 
       # Truncating $GITHUB_PATH/$GITHUB_ENV is what keeps a lifecycle script's
       # reach inside the step that ran it: the runner applies those files to
@@ -354,8 +425,11 @@ jobs:
       # checks trustworthy in general (see check-npm-update.mjs's own comments),
       # since the same package code is loaded into the test process either way.
       - name: Install from the lockfile
+        env:
+          PACKAGE_MANAGER: ${{ inputs.package-manager }}
         run: |
           set -euo pipefail
+          PACKAGE_MANAGER=${PACKAGE_MANAGER:-npm}
           # `--ignore-scripts` here too, and for the same reason the resolve
           # step below has it: this runs BEFORE the fingerprints exist, so a
           # postinstall from a package already in the lockfile could rewrite a
@@ -364,7 +438,11 @@ jobs:
           # untouched, so neither the range check nor the major check would see
           # it. The real install, with scripts, is the first reported check —
           # after the manifests are pinned.
-          npm ci --ignore-scripts
+          if [ "$PACKAGE_MANAGER" = pnpm ]; then
+            pnpm install --frozen-lockfile --ignore-scripts
+          else
+            npm ci --ignore-scripts
+          fi
           : > "$GITHUB_PATH"
           : > "$GITHUB_ENV"
 
@@ -374,8 +452,20 @@ jobs:
       # this step and that rewrite would become the trusted snapshot — the
       # comparison after the checks would compare a poisoned file to itself.
       # The real install happens below, once there is something to snapshot.
+      # `pnpm update -r` is pnpm's spelling of the same move: every package
+      # to the newest its declared range admits, in every workspace, with the
+      # ranges written out as `npm update --save` writes them.
       - name: Resolve updates within their declared ranges
-        run: npm update --save --ignore-scripts
+        env:
+          PACKAGE_MANAGER: ${{ inputs.package-manager }}
+        run: |
+          set -euo pipefail
+          PACKAGE_MANAGER=${PACKAGE_MANAGER:-npm}
+          if [ "$PACKAGE_MANAGER" = pnpm ]; then
+            pnpm update -r --ignore-scripts
+          else
+            npm update --save --ignore-scripts
+          fi
 
       # A single package's breaking transitive move used to sink the whole
       # batch: the publish job re-validates the diff, finds a subdependency
@@ -427,9 +517,46 @@ jobs:
         env:
           # The clone step's own output, not a path spelled twice.
           CHECKER: ${{ steps.checker.outputs.path }}
+          PACKAGE_MANAGER: ${{ inputs.package-manager }}
+          LOCKFILE: ${{ steps.layout.outputs.lockfile }}
         run: |
           set -euo pipefail
           : > holdback.md
+          # Each of these falls back to what this workflow did before the value
+          # existed, so a step run on its own behaves as it always has.
+          PACKAGE_MANAGER=${PACKAGE_MANAGER:-npm}
+          LOCKFILE=${LOCKFILE:-package-lock.json}
+
+          # EVERY manifest the batch can rewrite, not just the root pair:
+          # `npm update --save` writes the new range into whichever
+          # manifest declares the dependency, which for a workspace's
+          # dependency is that workspace's own package.json, and `pnpm
+          # update -r` does the same in every workspace. Read now, before
+          # any dependency code has run, and handed to every later step as
+          # a step OUTPUT: the tree checks allowlist exactly these paths,
+          # the fingerprints cover them, and the publish job commits them.
+          #
+          # Read into an array rather than word-split: a workspace
+          # directory is a repository path and can contain a space.
+          manifests=()
+          while IFS= read -r m; do
+            [ -n "$m" ] && manifests+=("$m")
+          done <<< "$(node "$CHECKER" manifests)"
+          {
+            echo 'manifests<<MANIFESTS_EOF'
+            printf '%s\n' "${manifests[@]}"
+            echo 'MANIFESTS_EOF'
+          } >> "$GITHUB_OUTPUT"
+
+          # One package's re-resolve, in the manager's own spelling; the
+          # names after `--` are data, never options.
+          resolve_names() {
+            if [ "$PACKAGE_MANAGER" = pnpm ]; then
+              pnpm update -r --ignore-scripts -- "$@"
+            else
+              npm update --save --ignore-scripts -- "$@"
+            fi
+          }
 
           rebuilt=false
           # Captured, not printed: the checker reports through `::error::`
@@ -451,19 +578,9 @@ jobs:
             # yields an empty list and the loop silently does nothing.
             candidates=$(node "$CHECKER" candidates)
 
-            # EVERY manifest the batch can rewrite, not just the root pair:
-            # `npm update --save` writes the new range into whichever
-            # manifest declares the dependency, which for a workspace's
-            # dependency is that workspace's own package.json. Restoring two
-            # files would leave a workspace range change behind and the
-            # rebuild would not actually start from HEAD (Codex).
-            #
-            # Read into an array rather than word-split: a workspace
-            # directory is a repository path and can contain a space.
-            manifests=()
-            while IFS= read -r m; do
-              [ -n "$m" ] && manifests+=("$m")
-            done <<< "$(node "$CHECKER" manifests)"
+            # Restoring the root pair alone would leave a workspace range
+            # change behind and the rebuild would not actually start from
+            # HEAD (Codex): the restore covers every manifest named above.
             # A temp directory is safe here specifically because no dependency
             # code has run in this job yet. It holds the byte-exact copy each
             # rejected step rolls back to (below), and, first, the bulk
@@ -472,7 +589,7 @@ jobs:
             # re-apply after the loop asks `npm install` for. Taken BEFORE
             # the restore, for the same reason `candidates` is read before it.
             snapshot=$(mktemp -d)
-            cp package-lock.json "$snapshot/bulk-lock.json"
+            cp "$LOCKFILE" "$snapshot/bulk-lock.json"
             git checkout HEAD -- "${manifests[@]}"
             # The names the loop rejects, so the group re-apply below neither
             # retries them nor reports them twice.
@@ -502,7 +619,7 @@ jobs:
               # its own. tar rather than cp, so a workspace manifest comes
               # back at its own path rather than flattened into one directory.
               tar -cf "$snapshot/manifests.tar" -- "${manifests[@]}"
-              if ! attempt=$(npm update --save --ignore-scripts -- "$name" 2>&1); then
+              if ! attempt=$(resolve_names "$name" 2>&1); then
                 # `|| true` on both extractions below, and only there: the
                 # failure that matters — npm's — is already caught by the
                 # `if` above, and what follows is only the wording for it.
@@ -595,6 +712,21 @@ jobs:
               local -a records=()
               rejected=""
               tar -cf "$snapshot/manifests.tar" -- "${manifests[@]}"
+              # pnpm has no record to remove and no range to write by hand:
+              # `pnpm update -r` naming every member re-resolves them
+              # together, at the newest each range admits, and writes the
+              # ranges itself — which is what the bulk resolve did for them.
+              # No partner records either: pnpm places a peer with the
+              # package that asks for it in the same resolve.
+              if [ "$PACKAGE_MANAGER" = pnpm ]; then
+                local -a member_names=()
+                for key in "$@"; do member_names+=("${name_of[$key]}"); done
+                if ! attempt=$(resolve_names "${member_names[@]}" 2>&1); then
+                  rejected=$(printf '%s\n' "$attempt" | grep -v '^$' | tail -n 1 || true)
+                  rejected="pnpm could not resolve it: ${rejected:-no output}"
+                fi
+              fi
+              if [ "$PACKAGE_MANAGER" != pnpm ]; then
               # Every range change lands in its manifest FIRST, then ONE
               # resolve covers them all. Installing per manifest would
               # resolve the root's members while a workspace still pinned
@@ -664,6 +796,7 @@ jobs:
                 # caught, what follows only phrases it.
                 rejected=$(printf '%s\n' "$attempt" | grep -v '^$' | tail -n 1 || true)
                 rejected="npm could not resolve it: ${rejected:-no output}"
+              fi
               fi
               if [ -z "$rejected" ] && ! attempt=$(node "$CHECKER" 2>&1 >/dev/null); then
                 rejected=$(printf '%s\n' "$attempt" | sed -n 's/^::error:://p' | head -n 1 || true)
@@ -808,7 +941,7 @@ jobs:
           # rebuild that somehow held nothing back and still moved nothing —
           # a repository declaring no dependencies at all, say — is not the
           # one shape that slips through silently.
-          if [ "$rebuilt" = true ] && git diff --quiet -- package.json package-lock.json; then
+          if [ "$rebuilt" = true ] && git diff --quiet -- "${manifests[@]}"; then
             echo '::error::Nothing survived the rebuild, so there is nothing left to publish. Whatever is named below needs a deliberate migration:'
             sed 's/^- //' holdback.md
             exit 1
@@ -828,8 +961,28 @@ jobs:
 
       - name: Stop early if nothing moved
         id: changed
+        env:
+          # The hold-back step's own output, read before any dependency code
+          # ran: every manifest the batch can rewrite, one per line.
+          MANIFESTS: ${{ steps.holdback.outputs.manifests }}
+          LOCKFILE: ${{ steps.layout.outputs.lockfile }}
         run: |
-          if git diff --quiet -- package.json package-lock.json; then
+          set -euo pipefail
+          # Each of these falls back to what this workflow did before the value
+          # existed, so a step run on its own behaves as it always has.
+          LOCKFILE=${LOCKFILE:-package-lock.json}
+          MANIFESTS=${MANIFESTS:-$'package.json\n'"$LOCKFILE"}
+          manifests=()
+          while IFS= read -r m; do
+            [ -n "$m" ] && manifests+=("$m")
+          done <<< "$MANIFESTS"
+          # The manifests a reader diffs: every one but the lockfile, whose
+          # churn the PR body tells them not to read.
+          declared=()
+          for m in "${manifests[@]}"; do
+            [ "$m" = "$LOCKFILE" ] || declared+=("$m")
+          done
+          if git diff --quiet -- "${manifests[@]}"; then
             echo 'changed=false' >> "$GITHUB_OUTPUT"
             echo 'No dependency updates available this run.' >> "$GITHUB_STEP_SUMMARY"
           else
@@ -837,7 +990,7 @@ jobs:
             # Captured now, while the change is still uncommitted. The clone is
             # shallow, so after committing there is no reliable second commit to
             # diff against.
-            git diff --stat -- package.json > deps-stat.txt
+            git diff --stat -- "${declared[@]}" > deps-stat.txt
             # Fingerprint now, before any check runs. The checks execute
             # dependency code, which could rewrite these files afterwards —
             # widening a range, repointing a lockfile `resolved` URL — and the
@@ -851,7 +1004,18 @@ jobs:
             # value to later steps and to the publish job; nothing that runs
             # afterwards can reach back and change it.
             echo "pkg_sha=$(sha256sum package.json | cut -d" " -f1)" >> "$GITHUB_OUTPUT"
-            echo "lock_sha=$(sha256sum package-lock.json | cut -d" " -f1)" >> "$GITHUB_OUTPUT"
+            echo "lock_sha=$(sha256sum "$LOCKFILE" | cut -d" " -f1)" >> "$GITHUB_OUTPUT"
+            # The workspace manifests, the same way, as sha256sum's own
+            # "hash  path" lines so one `sha256sum -c` verifies the set —
+            # empty for a tree without workspaces, which is every consumer
+            # before this output existed.
+            {
+              echo 'ws_sha<<WS_SHA_EOF'
+              for m in "${declared[@]}"; do
+                [ "$m" = package.json ] || sha256sum -- "$m"
+              done
+              echo 'WS_SHA_EOF'
+            } >> "$GITHUB_OUTPUT"
             # deps-stat.txt itself gets the SAME treatment below, one step
             # output at a time: the file above is a predictable, allowlisted
             # path (the tree-verification step has to accept it, since this
@@ -865,7 +1029,7 @@ jobs:
               cat deps-stat.txt
               echo 'DEPS_STAT_EOF'
             } >> "$GITHUB_OUTPUT"
-            git diff --stat -- package.json package-lock.json >> "$GITHUB_STEP_SUMMARY"
+            git diff --stat -- "${manifests[@]}" >> "$GITHUB_STEP_SUMMARY"
           fi
 
       # The PR this job opens is authored by GITHUB_TOKEN, and GitHub
@@ -893,19 +1057,29 @@ jobs:
       - name: Install with lifecycle scripts, as the first reported check
         if: steps.changed.outputs.changed == 'true'
         id: install
+        env:
+          PACKAGE_MANAGER: ${{ inputs.package-manager }}
         run: |
           set +e
+          PACKAGE_MANAGER=${PACKAGE_MANAGER:-npm}
           # The real install, with lifecycle scripts, so everything below runs
           # against the tree a consumer of this lockfile would get. This is
-          # where dependency code starts executing in this job.
-          echo '::group::npm ci'
-          npm ci
+          # where dependency code starts executing in this job. Named in
+          # the report exactly as it ran, which is what the publish job's
+          # verdict step expects to find.
+          if [ "$PACKAGE_MANAGER" = pnpm ]; then
+            install='pnpm install --frozen-lockfile'
+          else
+            install='npm ci'
+          fi
+          echo "::group::$install"
+          $install
           rc=$?
           echo '::endgroup::'
           if [ $rc -eq 0 ]; then
-            report="- ✅ \`npm ci\`"
+            report="- ✅ \`$install\`"
           else
-            report="- ❌ \`npm ci\` (exit $rc)"
+            report="- ❌ \`$install\` (exit $rc)"
           fi
           # Handed to the check step below as a step OUTPUT rather than
           # written to checks.md here: that file is written ONCE, at the end
@@ -944,6 +1118,9 @@ jobs:
           # The canonical form the layout step already derived from git, not
           # the raw input — see that step's comment for why.
           WORKING_DIRECTORY: ${{ steps.layout.outputs.dir }}
+          # The manifests the batch may change, from the hold-back step's
+          # read before any dependency code ran.
+          MANIFESTS: ${{ steps.holdback.outputs.manifests }}
           # A declared path is consumer configuration, not something to
           # trust as a literal filename by default: `git ls-files` and
           # `git diff` below both read their pathspec argument for MAGIC
@@ -953,6 +1130,7 @@ jobs:
           # since every git call here takes one of these paths.
           GIT_LITERAL_PATHSPECS: '1'
         run: |
+          shopt -s lastpipe
           set -euo pipefail
           # The declaration is load-bearing — it is the commit allowlist —
           # so an empty one is a configuration error, not a default.
@@ -989,7 +1167,7 @@ jobs:
               exit 1
             fi
             case "$f" in
-              package.json|package-lock.json|checks.md|deps-stat.txt|holdback.md|regen-handoff.tar|regen-stat.txt)
+              package.json|package-lock.json|pnpm-lock.yaml|checks.md|deps-stat.txt|holdback.md|regen-handoff.tar|regen-stat.txt|manifests-handoff.tar)
                 echo "::error::regenerated-files must not name a file the workflow itself owns: $f"
                 exit 1 ;;
               npm-update-hub|npm-update-hub/*)
@@ -1026,27 +1204,54 @@ jobs:
           # from the single-pipe form) — a corrupted git state read as
           # "nothing dirty" would let this pre-check silently pass instead
           # of catching exactly what it exists to catch.
-          pretree_status=$(git status --porcelain --untracked-files=all)
-          pretree=$(printf '%s\n' "$pretree_status" \
-            | sed 's/^...//' \
-            | while IFS= read -r p; do
-                case "$p" in
-                  "${WORKING_DIRECTORY:-}"/*) printf '%s\n' "${p#"${WORKING_DIRECTORY:-}"/}" ;;
-                  *)
-                    # Outside the working directory — unexpected on its
-                    # own, same reasoning as the verify step's own tree
-                    # check further down (which this pretree check
-                    # mirrors, ahead of it, before any regenerate command
-                    # runs). A no-op when working-directory is unset.
-                    if [ -n "${WORKING_DIRECTORY:-}" ]; then
-                      printf '%s\t\n' "$p"
-                    else
-                      printf '%s\n' "$p"
-                    fi ;;
-                esac
-              done \
-            | grep -Ev '^(package\.json|package-lock\.json|checks\.md|deps-stat\.txt|holdback\.md)$' || true)
-          pretree=$(printf '%s\n' "$pretree" | sed 's/\t$//')
+          # The manifests the batch rewrote are expected to differ; they
+          # are compared as whole records, in a loop, for the same reason
+          # the tree check further down compares its allowlist that way.
+          MANIFESTS=${MANIFESTS:-$'package.json\npackage-lock.json'}
+          manifests=()
+          while IFS= read -r m; do
+            [ -n "$m" ] && manifests+=("$m")
+          done <<< "$MANIFESTS"
+          # -z and a NUL-delimited read, as the verify step's tree check
+          # does and for the same reason: a workspace manifest's path is
+          # repository data, and git's default porcelain quotes a path with
+          # a space, which would never equal the raw path the hold-back
+          # step named, aborting every batch that moved such a manifest.
+          # Piped straight into the loop, with lastpipe keeping the loop in
+          # this shell so $pretree survives it, and pipefail still turning
+          # a git-status failure into a stop rather than "nothing dirty".
+          pretree=""
+          git status --porcelain -z --untracked-files=all | while IFS= read -r -d '' entry; do
+            p=${entry:3}
+            case "$p" in
+              "${WORKING_DIRECTORY:-}"/*) p=${p#"${WORKING_DIRECTORY:-}"/} ;;
+              *)
+                # Outside the working directory — unexpected on its own,
+                # same reasoning as the verify step's own tree check
+                # further down (which this pretree check mirrors, ahead of
+                # it, before any regenerate command runs). A no-op when
+                # working-directory is unset.
+                if [ -n "${WORKING_DIRECTORY:-}" ]; then
+                  pretree="$pretree$p"$'\n'
+                  continue
+                fi
+                ;;
+            esac
+            case "$p" in
+              package.json|checks.md|deps-stat.txt|holdback.md) continue ;;
+            esac
+            keep=1
+            for m in "${manifests[@]}"; do
+              if [ "$p" = "$m" ]; then
+                keep=0
+                break
+              fi
+            done
+            if [ "$keep" -eq 1 ]; then
+              pretree="$pretree$p"$'\n'
+            fi
+          done
+          pretree=${pretree%$'\n'}
           if [ -n "$pretree" ]; then
             echo '::error::The checks changed the tree outside the dependency manifests before regeneration ran. Not opening a PR — inspect these first:'
             echo "$pretree"
@@ -1135,8 +1340,10 @@ jobs:
           # the way checks.md is (see that step) and routed through env: like
           # every other expression in this file.
           INSTALL_REPORT: ${{ steps.install.outputs.report }}
+          PACKAGE_MANAGER: ${{ inputs.package-manager }}
         run: |
           set +e
+          PACKAGE_MANAGER=${PACKAGE_MANAGER:-npm}
           # Accumulated in a shell variable, not appended to checks.md as
           # each check finishes. checks.md is a predictable, allowlisted
           # path (the tree-verification step below has to accept it, since
@@ -1163,9 +1370,9 @@ jobs:
               report="${report}- ❌ \`$1\` (exit $rc)"$'\n'
             fi
           }
-          check 'npm run lint'
-          check 'npm test'
-          check 'npm run build'
+          check "$PACKAGE_MANAGER run lint"
+          check "$PACKAGE_MANAGER test"
+          check "$PACKAGE_MANAGER run build"
           # Both report files written for the first time HERE, now that every
           # check has run — checks.md from the in-memory report above,
           # deps-stat.txt from the step output captured before any dependency
@@ -1225,6 +1432,9 @@ jobs:
           # than only where the blast radius differs.
           PKG_SHA: ${{ steps.changed.outputs.pkg_sha }}
           LOCK_SHA: ${{ steps.changed.outputs.lock_sha }}
+          WS_SHA: ${{ steps.changed.outputs.ws_sha }}
+          MANIFESTS: ${{ steps.holdback.outputs.manifests }}
+          LOCKFILE: ${{ steps.layout.outputs.lockfile }}
           REGENERATED_FILES: ${{ inputs.regenerated-files }}
           # Empty unless the regenerate step ran and fingerprinted the
           # declared files — every regenerated-file exemption below keys
@@ -1251,6 +1461,18 @@ jobs:
               derived+=("$f")
             done <<< "$REGENERATED_FILES"
           fi
+          # The manifests the batch rewrote: the root pair and every
+          # workspace manifest, each named by the checker before any
+          # dependency code ran and fingerprinted below.
+          # Each of these falls back to what this workflow did before the value
+          # existed, so a step run on its own behaves as it always has.
+          LOCKFILE=${LOCKFILE:-package-lock.json}
+          MANIFESTS=${MANIFESTS:-$'package.json\n'"$LOCKFILE"}
+          WS_SHA=${WS_SHA:-}
+          manifests=()
+          while IFS= read -r m; do
+            [ -n "$m" ] && manifests+=("$m")
+          done <<< "$MANIFESTS"
 
           # `git status`, not `git diff`: diff only sees TRACKED changes, so an
           # untracked file a lifecycle script drops into the tree — one that
@@ -1325,7 +1547,7 @@ jobs:
                 ;;
             esac
             case "$path" in
-              package.json|package-lock.json|checks.md|deps-stat.txt|holdback.md)
+              package.json|checks.md|deps-stat.txt|holdback.md)
                 continue ;;
             esac
             # Checked against the regenerated-files declaration as whole
@@ -1336,9 +1558,11 @@ jobs:
             # a b` errors "b: No such file or directory" rather than
             # excluding both) — so a `regenerated-files` declaration of
             # two or more paths would silently stop filtering after the
-            # first. This loop has no such arity limit.
+            # first. This loop has no such arity limit. The manifests
+            # (the lockfile and the workspace manifests among them) are
+            # matched the same way.
             keep=1
-            for d in "${derived[@]}"; do
+            for d in "${derived[@]}" "${manifests[@]}"; do
               if [ "$path" = "$d" ]; then
                 keep=0
                 break
@@ -1466,9 +1690,14 @@ jobs:
           # outputs — values that live outside this filesystem, so unlike a
           # snapshot file they cannot be rewritten alongside what they guard.
           if [ "$(sha256sum package.json | cut -d" " -f1)" != "$PKG_SHA" ] \
-             || [ "$(sha256sum package-lock.json | cut -d" " -f1)" != "$LOCK_SHA" ]; then
+             || [ "$(sha256sum "$LOCKFILE" | cut -d" " -f1)" != "$LOCK_SHA" ]; then
             echo '::error::A dependency file changed AFTER npm resolved it — something in the check run rewrote it. Not opening a PR.'
             exit 1
+          fi
+          # And the workspace manifests, against the same kind of fingerprint.
+          if [ -n "$WS_SHA" ]; then
+            printf '%s\n' "$WS_SHA" | sha256sum -c --strict --quiet \
+              || { echo '::error::A workspace manifest changed AFTER the resolve — something in the check run rewrote it. Not opening a PR.'; exit 1; }
           fi
 
           # Nor the regenerated files since the regenerate step fingerprinted
@@ -1527,6 +1756,25 @@ jobs:
           fi
           mv -T -- "$regen_tmp" regen-handoff.tar
 
+          # The workspace manifests travel the same way, for the same
+          # reasons: their paths are repository data, and the artifact's
+          # own path list stays fixed. The root pair goes by name as it
+          # always has.
+          workspace_manifests=()
+          for m in "${manifests[@]}"; do
+            case "$m" in
+              package.json|"$LOCKFILE") ;;
+              *) workspace_manifests+=("$m") ;;
+            esac
+          done
+          manifests_tmp=$(mktemp "$RUNNER_TEMP/npm-update-manifests-handoff-XXXXXX.tar")
+          if [ "${#workspace_manifests[@]}" -gt 0 ]; then
+            printf '%s\0' "${workspace_manifests[@]}" | tar -cf "$manifests_tmp" --null --verbatim-files-from -T -
+          else
+            tar -cf "$manifests_tmp" -T /dev/null
+          fi
+          mv -T -- "$manifests_tmp" manifests-handoff.tar
+
           # The manifest CONTENT check does not live here — see the publish
           # job's "Re-validate the dependency diff from a clean context". This
           # job has run the updated packages' own code, so an assertion made
@@ -1555,11 +1803,12 @@ jobs:
           # restores them at the matching location either way.
           path: |
             ${{ steps.layout.outputs.prefix }}package.json
-            ${{ steps.layout.outputs.prefix }}package-lock.json
+            ${{ steps.layout.outputs.prefix }}${{ steps.layout.outputs.lockfile }}
             ${{ steps.layout.outputs.prefix }}checks.md
             ${{ steps.layout.outputs.prefix }}deps-stat.txt
             ${{ steps.layout.outputs.prefix }}holdback.md
             ${{ steps.layout.outputs.prefix }}regen-handoff.tar
+            ${{ steps.layout.outputs.prefix }}manifests-handoff.tar
           retention-days: 1
           if-no-files-found: error
 
@@ -1702,12 +1951,18 @@ jobs:
           CHECKS_SHA: ${{ needs.update.outputs.checks_sha }}
           DEPS_STAT_SHA: ${{ needs.update.outputs.deps_stat_sha }}
           HOLDBACK_SHA: ${{ needs.update.outputs.holdback_sha }}
+          LOCKFILE: ${{ needs.update.outputs.lockfile }}
         run: |
           set -euo pipefail
+          LOCKFILE=${LOCKFILE:-package-lock.json}
+          case "$LOCKFILE" in
+            package-lock.json|pnpm-lock.yaml) ;;
+            *) echo "::error::The update job named an unexpected lockfile: '$LOCKFILE'."; exit 1 ;;
+          esac
           [ "$(sha256sum package.json | cut -d" " -f1)" = "$PKG_SHA" ] \
             || { echo '::error::package.json does not match what the update job resolved.'; exit 1; }
-          [ "$(sha256sum package-lock.json | cut -d" " -f1)" = "$LOCK_SHA" ] \
-            || { echo '::error::package-lock.json does not match what the update job resolved.'; exit 1; }
+          [ "$(sha256sum "$LOCKFILE" | cut -d" " -f1)" = "$LOCK_SHA" ] \
+            || { echo "::error::$LOCKFILE does not match what the update job resolved."; exit 1; }
           # checks.md and deps-stat.txt get the same treatment: both are
           # written into the PR body below, unread, and both crossed through
           # the same machine that ran dependency code before reaching this
@@ -1725,6 +1980,61 @@ jobs:
           # everything when it did not.
           [ "$(sha256sum holdback.md | cut -d" " -f1)" = "$HOLDBACK_SHA" ] \
             || { echo '::error::holdback.md does not match what the update job wrote.'; exit 1; }
+
+      # The workspace manifests travel as manifests-handoff.tar, through the
+      # same machine that ran dependency code, so each is restored by the
+      # name the update job recorded before that code ran and checked
+      # against the fingerprint it took then — the same treatment the
+      # regenerated files get below. A tree without workspaces has an
+      # empty list and an empty tar.
+      - name: Restore and verify the workspace manifests
+        env:
+          MANIFESTS: ${{ needs.update.outputs.manifests }}
+          WS_SHA: ${{ needs.update.outputs.ws_sha }}
+          LOCKFILE: ${{ needs.update.outputs.lockfile }}
+          GIT_LITERAL_PATHSPECS: '1'
+        run: |
+          set -euo pipefail
+          LOCKFILE=${LOCKFILE:-package-lock.json}
+          MANIFESTS=${MANIFESTS:-}
+          WS_SHA=${WS_SHA:-}
+          files=()
+          while IFS= read -r m; do
+            [ -z "$m" ] && continue
+            case "$m" in
+              package.json|"$LOCKFILE") continue ;;
+              ..|../*|*/../*|/*) echo "::error::The update job named a manifest outside the tree: $m"; exit 1 ;;
+            esac
+            files+=("$m")
+          done <<< "$MANIFESTS"
+          mkdir -- "$RUNNER_TEMP/manifests"
+          tar -xf manifests-handoff.tar -C "$RUNNER_TEMP/manifests"
+          for f in "${files[@]}"; do
+            [ -f "$RUNNER_TEMP/manifests/$f" ] \
+              || { echo "::error::The artifact is missing workspace manifest: $f"; exit 1; }
+            if [ -L "$RUNNER_TEMP/manifests/$f" ]; then
+              echo "::error::The manifests artifact carries a symlink, not a regular file: $f"
+              exit 1
+            fi
+            git ls-files --error-unmatch -- "$f" >/dev/null 2>&1 || {
+              echo "::error::The update job named a manifest git does not track: $f"
+              exit 1
+            }
+            rm -f -- "$f"
+            cp -- "$RUNNER_TEMP/manifests/$f" "$f"
+            rm -- "$RUNNER_TEMP/manifests/$f"
+          done
+          leftover=$(find "$RUNNER_TEMP/manifests" -type f -o -type l | head -n 1)
+          if [ -n "$leftover" ]; then
+            echo "::error::The manifests artifact carried an undeclared file: $leftover"
+            exit 1
+          fi
+          rm -rf -- "$RUNNER_TEMP/manifests"
+          if [ "${#files[@]}" -gt 0 ]; then
+            [ -n "$WS_SHA" ] || { echo '::error::The update job named workspace manifests but fingerprinted none.'; exit 1; }
+            printf '%s\n' "$WS_SHA" | sha256sum -c --strict --quiet \
+              || { echo '::error::A workspace manifest does not match what the update job resolved.'; exit 1; }
+          fi
 
       # regen-handoff.tar travels through the same machine that ran
       # dependency code, so nothing in it is trusted by name: it is
@@ -1821,8 +2131,11 @@ jobs:
       # one (four copies of "- ✅ `npm ci`" passes a bare count check).
       - name: Derive the check verdict from checks.md, not the untrusted job's own report
         id: verdict
+        env:
+          PACKAGE_MANAGER: ${{ inputs.package-manager }}
         run: |
           set -euo pipefail
+          PACKAGE_MANAGER=${PACKAGE_MANAGER:-npm}
           if [ ! -s checks.md ]; then
             echo '::error::checks.md is empty — cannot verify checks.'
             echo 'passed=false' >> "$GITHUB_OUTPUT"
@@ -1834,7 +2147,11 @@ jobs:
           # unrecognized identity below fails closed (a clear, if noisy,
           # error) rather than silently accepting a report that doesn't
           # match what actually ran.
-          EXPECTED_CHECKS=('npm ci' 'npm run lint' 'npm test' 'npm run build')
+          if [ "$PACKAGE_MANAGER" = pnpm ]; then
+            EXPECTED_CHECKS=('pnpm install --frozen-lockfile' 'pnpm run lint' 'pnpm test' 'pnpm run build')
+          else
+            EXPECTED_CHECKS=('npm ci' 'npm run lint' 'npm test' 'npm run build')
+          fi
           declare -A seen_count
           for c in "${EXPECTED_CHECKS[@]}"; do seen_count["$c"]=0; done
           failed=0
@@ -1964,12 +2281,19 @@ jobs:
           # fingerprinted the declared files — names the rebuilt content in
           # the verdict below. See AGENTS.md "Trust model".
           REGEN_SHA: ${{ needs.update.outputs.regen_sha }}
+          # The manifests the batch rewrote, as the update job named them
+          # before any dependency code ran, and which package manager's
+          # command moved them; both go into the commit and the body.
+          MANIFESTS: ${{ needs.update.outputs.manifests }}
+          PACKAGE_MANAGER: ${{ inputs.package-manager }}
           # See the regenerate step's own comment: `git add -- "$f"` below
           # reads $f as a pathspec, and pathspec magic in a declared path
           # would otherwise stage more than the one file it names.
           GIT_LITERAL_PATHSPECS: '1'
         run: |
           set -euo pipefail
+          PACKAGE_MANAGER=${PACKAGE_MANAGER:-npm}
+          MANIFESTS=${MANIFESTS:-$'package.json\npackage-lock.json'}
           case "$PASSED" in
             true|false) ;;
             *) echo "::error::unexpected 'passed' output: $PASSED"; exit 1 ;;
@@ -2050,9 +2374,13 @@ jobs:
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git switch -c "$branch"
-          # Stage by name. The artifact only carries these files, but naming them
-          # keeps that true even if it ever carries more.
-          git add -- package.json package-lock.json
+          # Stage by name: every manifest the update job named before any
+          # dependency code ran, and nothing else, so a planted edit cannot
+          # ride along.
+          while IFS= read -r m; do
+            [ -z "$m" ] && continue
+            git add -- "$m"
+          done <<< "$MANIFESTS"
           if [ -n "$REGENERATED_FILES" ]; then
             while IFS= read -r f; do
               [ -z "$f" ] && continue
@@ -2155,8 +2483,13 @@ jobs:
           else
             scope='every dependency'
           fi
+          if [ "$PACKAGE_MANAGER" = pnpm ]; then
+            resolve='`pnpm update -r`'
+          else
+            resolve='`npm update --save`'
+          fi
           {
-            echo "\`npm update --save\` — $scope moved to the newest version its"
+            echo "$resolve — $scope moved to the newest version its"
             echo 'existing range in `package.json` allows. **No majors**: those need a'
             echo 'deliberate migration and this job cannot produce one.'
             echo
