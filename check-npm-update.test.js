@@ -134,6 +134,29 @@ describe('manifestFailures', () => {
       expect.stringContaining('not a plain X.Y.Z registry range'),
     ])
   })
+
+  // A save writes a partial range out in full, with the operator kept and
+  // the version it chose: `^22` becomes `^22.20.5` under npm and pnpm
+  // alike, and pnpm does it for every such declaration in a workspace.
+  it('accepts a partial range written out in full, within what it admitted', () => {
+    const before = { ...base, dependencies: { alpha: '^22', beta: '~1.2', gamma: '3' } }
+    const after = { ...base, dependencies: { alpha: '^22.20.5', beta: '~1.2.9', gamma: '3.4.5' } }
+    expect(manifestFailures(before, after)).toEqual([])
+  })
+
+  it('rejects a partial range written out past what it admitted, or under another operator', () => {
+    const before = { ...base, dependencies: { alpha: '^22', beta: '~1.2' } }
+    expect(manifestFailures(before, { ...base, dependencies: { alpha: '^23.0.0', beta: '~1.2.9' } })).toEqual([
+      expect.stringContaining('alpha moved outside its existing range'),
+    ])
+    expect(manifestFailures(before, { ...base, dependencies: { alpha: '^22.20.5', beta: '^1.2.9' } })).toEqual([
+      expect.stringContaining('beta changed its range operator'),
+    ])
+    // A union or a prerelease on the old side is still outside the model.
+    expect(manifestFailures({ ...base, dependencies: { alpha: '^1 || ^2' } }, { ...base, dependencies: { alpha: '^2.0.0' } })).toEqual([
+      expect.stringContaining('not a plain X.Y.Z registry range'),
+    ])
+  })
 })
 
 describe('resolveEdge', () => {

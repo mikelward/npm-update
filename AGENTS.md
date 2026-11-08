@@ -1,7 +1,7 @@
 ---
 trigger: always_on
 alwaysApply: true
-last_modified: 2026-10-26
+last_modified: 2026-11-08
 ---
 
 # npm-update
@@ -112,7 +112,11 @@ Shared by every mikelward repo and the user-level agent config; canonical in mik
 - **Guards**. One that fires on every run is broken: make it declarable.
 - **Who opens the PR**. A real collaborator, where a credential exists, so normal CI
   runs; its body says which checks actually ran.
-- **Dependencies**. None, and no build step; YAML parsing uses mikelward/yaml-lite.
+- **Dependencies**. None, and no build step; YAML parsing uses mikelward/yaml-lite,
+  except `pnpm-lock.mjs`, which reads pnpm's lockfile subset itself (flow mappings
+  included) and maps it onto the `packages` shape the checker walks.
+- **Package managers**. npm and pnpm (`package-manager` input); the checker tells
+  them apart by the lockfile present. A workflow change is made for both or says why not.
 - **Consumers**. Change one first, never all three at once.
 - **Tests**. `node --test *.test.js`, with mikelward/yaml-lite cloned beside this repo.
 - **Prefixes**. `build:` is this repo's own CI; bare means a consumer could notice.

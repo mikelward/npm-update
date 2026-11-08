@@ -303,6 +303,55 @@ just now scoped to the working directory), the same as at the repository
 root for an existing consumer. Empty (the default) means the repository
 root — no change for gedmap, newshacker, or readmo, none of which sets this.
 
+## pnpm
+
+A consumer whose tree pnpm wrote — `pnpm-lock.yaml`, workspaces or not —
+says so, and nothing else changes in its caller:
+
+```yaml
+jobs:
+  npm-update:
+    uses: mikelward/npm-update/.github/workflows/npm-update.yml@main
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: write
+    with:
+      package-manager: pnpm
+```
+
+The batch then installs pnpm at the exact version the root `package.json`'s
+`packageManager` field pins (`pnpm@X.Y.Z`; a tree without that field is
+refused), reads the Node version from `.nvmrc` or `.node-version`, installs
+with `pnpm install --frozen-lockfile`, resolves with `pnpm update -r` (every
+package in every workspace to the newest its declared range admits, the
+ranges written out as `npm update --save` writes them), and reports the
+checks as `pnpm install --frozen-lockfile`, `pnpm run lint`, `pnpm test`
+and `pnpm run build`. Every manifest the resolve rewrote — the root pair and
+each workspace's `package.json` — is fingerprinted before any dependency
+code runs, allowed by the tree checks, carried to the publish job and
+committed; the same handling covers npm workspaces.
+
+The checker reads `pnpm-lock.yaml` through `pnpm-lock.mjs`, a reader for
+exactly the YAML subset pnpm writes (anything else is refused by line) and a
+mapping of the lockfile's importers and snapshots onto the tree pnpm
+installs — one copy per version under `node_modules/.pnpm`, a link wherever
+pnpm puts a symlink — in the shape npm's lockfile records it. The walk that
+polices majors is then the same walk, with the same rules and tests. One
+honest difference: a pnpm lockfile records each transitive edge's resolved
+version but not the range its dependent declared, so the crossing rules see
+every edge while the fit rules (the guard against an `overrides` pin) see
+only the edges whose range is recorded — the importers' own dependencies
+and peer dependencies.
+
+The hold-back pass runs for a pnpm tree too, re-resolving one name at a
+time with `pnpm update -r <name>`. What the loop drops is re-applied by
+naming every member to one `pnpm update -r`, which places a peer-pinned
+pair together; there is no per-peer-set fallback and no lockfile-record
+surgery, since pnpm has no record to remove. A release-age cooldown is
+pnpm's own `minimum-release-age` setting (pnpm 10.16 or later), honored by
+running pnpm; the npm floor step is skipped.
+
 ## Auto-merge needs "up to date" required, or a merge queue
 
 Once the producer job's own checks pass, the workflow arms `gh pr merge
